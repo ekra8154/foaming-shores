@@ -81,6 +81,9 @@ public final class FoamRenderer {
 	private RegionTexture output;
 	private MappableRingBuffer ubo;
 	private long lastBakeStep = Long.MIN_VALUE;
+	/** Frames drawn so far, and the frame of the last bake: the bake's uniform buffer is a ring of 3
+	 *  fenced per frame (like vanilla's lightmap), so it may be rotated at most once per frame. */
+	private long frames, lastBakeFrame = -1;
 	private boolean bakeFailed;
 	private int waterColor = 0x3F76E4;
 
@@ -128,8 +131,10 @@ public final class FoamRenderer {
 		waterColor = BiomeColors.getAverageWaterColor(lvl, mc.player.blockPosition());
 
 		long step = lvl.getGameTime() / 2; // the animation moves in 2-tick steps, like vanilla water
-		if (region != null && step != lastBakeStep) {
+		// Several ticks can run in one frame (catching up after a join or a hitch); bake once per frame.
+		if (region != null && step != lastBakeStep && frames != lastBakeFrame) {
 			lastBakeStep = step;
+			lastBakeFrame = frames;
 			bake(step * 2);
 		}
 	}
@@ -263,6 +268,7 @@ public final class FoamRenderer {
 	// ---- Frame: draw the quads ---------------------------------------------------------------------
 
 	public void submit(LevelRenderContext context) {
+		frames++;
 		if (region == null || quads.isEmpty() || output == null || bakeFailed) return;
 		Vec3 cam = context.levelState().cameraRenderState.pos;
 		PoseStack poseStack = context.poseStack();
