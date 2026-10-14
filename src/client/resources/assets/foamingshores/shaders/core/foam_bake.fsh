@@ -281,6 +281,15 @@ vec4 bakeTop(vec2 texel) {
                     s = wt - ivec2(round(g / gl * D));
                 }
             }
+            if (isDip) {
+                // Unfold the step into the dip: its face reads the lace pattern 1..16 texels past the
+                // edge, so the floor reads it 15 further downstream (down the arrival field, the way
+                // the water came in) and the pattern runs on from the face without a break.
+                vec2 g = vec2(arrivalAt(texel + vec2(1.0, 0.0)) - arrivalAt(texel - vec2(1.0, 0.0)),
+                              arrivalAt(texel + vec2(0.0, 1.0)) - arrivalAt(texel - vec2(0.0, 1.0)));
+                float gl = length(g);
+                if (gl > 0.0 && gl < 100.0) s = wt - ivec2(round(g / gl * 15.0));
+            }
             lv = noiseAt(2, s + w.lace);
             tDep = tLeave;
         }
