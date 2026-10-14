@@ -29,6 +29,7 @@ import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.phys.Vec3;
@@ -38,6 +39,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -82,6 +84,8 @@ public final class FoamRenderer {
 	private ShoreRegion region;
 	private List<Quad> quads = List.of();
 	private CompletableFuture<Built> building;
+	/** Chunks missing from the snapshot behind the current region, and behind the one being built. */
+	private Set<Long> missing = Set.of(), buildingMissing = Set.of();
 
 	private GpuTexture fieldTexture, noiseTexture, faceDataTexture;
 	private GpuTextureView fieldView, noiseView, faceDataView;
@@ -124,6 +128,13 @@ public final class FoamRenderer {
 		lastBakeStep = Long.MIN_VALUE;
 	}
 
+	/** A chunk the current (or pending) region had to treat as open water has arrived: rebuild with it. */
+	public void chunkLoaded(ClientLevel lvl, ChunkPos pos) {
+		if (lvl != level) return;
+		long key = pos.pack();
+		if (missing.contains(key) || buildingMissing.contains(key)) wantRebuild = true;
+	}
+
 	public void tick(Minecraft mc) {
 		ClientLevel lvl = mc.level;
 		if (lvl != level) {
@@ -139,7 +150,10 @@ public final class FoamRenderer {
 		if (building != null && building.isDone()) {
 			Built built = building.join();
 			building = null;
-			if (built != null) install(lvl, built);
+			if (built != null) {
+				install(lvl, built);
+				missing = buildingMissing;
+			}
 		}
 		int px = mc.player.getBlockX(), pz = mc.player.getBlockZ();
 		boolean stale = region == null || wantRebuild
@@ -148,6 +162,7 @@ public final class FoamRenderer {
 		if (stale && building == null) {
 			wantRebuild = false;
 			ShoreSnapshot snap = ShoreSnapshot.capture(lvl, px - REGION / 2, pz - REGION / 2, REGION);
+			buildingMissing = snap.missingChunks;
 			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing);
 			building = CompletableFuture.supplyAsync(() -> {
 				try {

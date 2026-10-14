@@ -3,6 +3,7 @@ package dev.ekra.foamingshores;
 import dev.ekra.foamingshores.render.FoamPipelines;
 import dev.ekra.foamingshores.render.FoamRenderer;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import org.slf4j.Logger;
@@ -22,6 +23,7 @@ public class FoamingShoresClient implements ClientModInitializer {
 		FoamPipelines.init();
 		renderer = new FoamRenderer();
 		ClientTickEvents.END_CLIENT_TICK.register(renderer::tick);
+		ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> renderer.chunkLoaded(level, chunk.getPos()));
 		LevelRenderEvents.COLLECT_SUBMITS.register(renderer::submit);
 		LOGGER.info("Foaming Shores loaded");
 	}
