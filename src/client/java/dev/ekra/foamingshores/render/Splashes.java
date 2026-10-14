@@ -4,6 +4,7 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.ekra.foamingshores.FoamSettings;
 import dev.ekra.foamingshores.shore.ShoreRegion;
+import dev.ekra.foamingshores.wave.WaveMath;
 import dev.ekra.foamingshores.wave.WaveSchedule;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.texture.OverlayTexture;
@@ -108,21 +109,14 @@ final class Splashes {
 
 	/** Splashes from every wall foot whose wave front arrived during (from, to]. */
 	private void spawn(ShoreRegion r, double from, double to, List<WaveSchedule.Wave> waves, FoamSettings s) {
-		float runup = s.runup * 16, speed = s.speed * 16, approach = s.approach * 16;
 		for (Foot f : feet) {
-			float[] fv = fieldsAt(r, f.tx(), f.tz());
+			float[] fv = WaveMath.fieldsAt(r, f.tx(), f.tz());
 			if (fv == null) continue;
-			float dp = fv[0], e = 1 + (fv[1] - 1) * s.shelter;
-			int wx = Math.floorMod(r.originX * 16 + f.tx(), 256), wz = Math.floorMod(r.originZ * 16 + f.tz(), 256);
+			int wx = r.originX * 16 + f.tx(), wz = r.originZ * 16 + f.tz();
 			for (WaveSchedule.Wave w : waves) {
-				float jv = ((noise[(((wz + w.oy()) & 255) * 256 + ((wx + w.ox()) & 255)) * 4] & 255) / 255f - 0.5f) * 2 * s.jag;
-				float Re = runup * w.amp() * e;
-				double Ta = approach / speed, Tu = 2 * runup * w.amp() / speed, TuE = Tu * Math.min(1, e);
-				double tR0 = w.t0() + Ta;
-				float uR = (jv - dp) / Re;
-				if (uR > 1) continue;
-				double tCross = uR <= 0 ? tR0 : tR0 + TuE * (1 - Math.sqrt(1 - uR));
-				if (tCross > from && tCross <= to) splash(f, r, Math.sqrt(Math.max(0, Math.min(1, (dp + Re) / Re))), s);
+				WaveMath.Times t = WaveMath.times(w, wx, wz, fv[0], fv[1], s, noise);
+				if (t != null && t.tCross() > from && t.tCross() <= to)
+					splash(f, r, Math.sqrt(Math.max(0, Math.min(1, (fv[0] + t.Re()) / t.Re()))), s);
 			}
 		}
 	}
@@ -142,25 +136,6 @@ final class Splashes {
 			d.vy = up;
 			drops.add(d);
 		}
-	}
-
-	/** Arrival and exposure at a region texel, blended between field samples like the shader does. */
-	private static float[] fieldsAt(ShoreRegion r, int tx, int tz) {
-		float per = ShoreRegion.TEXELS_PER_SAMPLE;
-		float sx = (tx + 0.5f) / per - 0.5f, sz = (tz + 0.5f) / per - 0.5f;
-		int S = r.samples;
-		int ix = Math.max(0, Math.min(S - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(S - 2, (int) Math.floor(sz)));
-		float fx = Math.max(0, Math.min(1, sx - ix)), fz = Math.max(0, Math.min(1, sz - iz));
-		float arr = 0, exp = 0, wsum = 0;
-		for (int k = 0; k < 4; k++) {
-			int ox = k & 1, oz = k >> 1, p = (iz + oz) * S + ix + ox;
-			float w = (ox == 1 ? fx : 1 - fx) * (oz == 1 ? fz : 1 - fz);
-			if (r.arrival[p] <= -900) continue;
-			arr += r.arrival[p] * w;
-			exp += r.exposure[p] * w;
-			wsum += w;
-		}
-		return wsum > 0 ? new float[] {arr / wsum, exp / wsum} : null;
 	}
 
 	// ---- Drawing (frames) ---------------------------------------------------------------------------

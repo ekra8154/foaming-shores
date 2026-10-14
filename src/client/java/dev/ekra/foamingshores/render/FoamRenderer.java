@@ -18,6 +18,7 @@ import dev.ekra.foamingshores.FoamSettings;
 import dev.ekra.foamingshores.FoamingShoresClient;
 import dev.ekra.foamingshores.shore.ShoreRegion;
 import dev.ekra.foamingshores.shore.ShoreSnapshot;
+import dev.ekra.foamingshores.wave.WaveMath;
 import dev.ekra.foamingshores.wave.WaveSchedule;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
@@ -60,6 +61,8 @@ public final class FoamRenderer {
 	public static final int REGION = 96;
 	private static final int TEXELS = REGION * 16;
 	private static final int MAX_WAVES = 12;
+	/** Dips whose puddles the shader can show per region (two per vec4 in the bake's uniforms). */
+	private static final int MAX_DIPS = 64;
 	/** Rebuild once the player is this far (blocks) from the region's centre. */
 	private static final int REBUILD_DISTANCE = 24;
 	public static final Identifier TEXTURE_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_region");
@@ -71,7 +74,7 @@ public final class FoamRenderer {
 	private static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
 	private static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
-		.get() + 16 * 2 * MAX_WAVES;
+		.get() + 16 * 2 * MAX_WAVES + 16 * (MAX_DIPS / 2);
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "Foaming Shores fields");
@@ -92,8 +95,16 @@ public final class FoamRenderer {
 	/** Chunks missing from the snapshot behind the current region, and behind the one being built. */
 	private Set<Long> missing = Set.of(), buildingMissing = Set.of();
 
-	private GpuTexture fieldTexture, noiseTexture, faceDataTexture;
-	private GpuTextureView fieldView, noiseView, faceDataView;
+	private GpuTexture fieldTexture, noiseTexture, faceDataTexture, dipTexture;
+	private GpuTextureView fieldView, noiseView, faceDataView, dipView;
+	private byte[] noiseBytes;
+	/**
+	 * Puddles: one water volume per dip (in texels of area), the only simulation state besides the
+	 * droplets, and the game time each dip was last wet. Water runs in while a wave covers part of a
+	 * dip; with nothing running in it soaks away, slower as it shrinks.
+	 */
+	private float[] dipVolume = new float[0];
+	private double[] dipWetUntil = new double[0];
 	private RegionTexture output, faceOutput;
 	private MappableRingBuffer ubo, faceUbo;
 	private List<Quad> faceQuads = List.of();
@@ -203,7 +214,12 @@ public final class FoamRenderer {
 			noiseDirty = false;
 			uploadNoise(RenderSystem.getDevice());
 		}
-		if (region != null) splashes.tick(lvl.getGameTime() / 20.0, WaveSchedule.recent(lvl.getGameTime() / 20.0, settings, MAX_WAVES), settings);
+		if (region != null) {
+			double now = lvl.getGameTime() / 20.0;
+			List<WaveSchedule.Wave> recent = WaveSchedule.recent(now, settings, MAX_WAVES);
+			splashes.tick(now, recent, settings);
+			updatePuddles(region, now, recent);
+		}
 
 		// The animation moves in steps of `ticks` game ticks (vanilla water uses 2).
 		int every = Math.max(1, settings.ticks);
@@ -213,6 +229,34 @@ public final class FoamRenderer {
 			lastBakeStep = step;
 			lastBakeFrame = frames;
 			bake(step * every);
+		}
+	}
+
+	/** One tick of puddle bookkeeping: inflow from covered dip samples, otherwise soaking away. */
+	private void updatePuddles(ShoreRegion r, double now, List<WaveSchedule.Wave> waves) {
+		if (noiseBytes == null || r.dipSamples.length != dipVolume.length) return;
+		final double dt = 0.05;
+		int S = r.samples;
+		float per = ShoreRegion.TEXELS_PER_SAMPLE;
+		for (int id = 0; id < dipVolume.length; id++) {
+			int[] samples = r.dipSamples[id];
+			float area = samples.length * per * per;
+			int covered = 0;
+			for (int p : samples) {
+				float tx = (p % S) * per + per / 2 - 0.5f, tz = (p / S) * per + per / 2 - 0.5f;
+				float[] fv = WaveMath.fieldsAt(r, tx, tz);
+				if (fv == null) continue;
+				int wx = r.originX * 16 + (int) tx, wz = r.originZ * 16 + (int) tz;
+				for (WaveSchedule.Wave w : waves) {
+					WaveMath.Times t = WaveMath.times(w, wx, wz, fv[0], fv[1], settings, noiseBytes);
+					if (t != null && now >= t.tCross() && now < t.tUnc()) { covered++; break; }
+				}
+			}
+			float v = dipVolume[id];
+			if (covered > 0) v = Math.min(area, v + covered * per * per * (float) dt * 1.5f);
+			else v = Math.max(0, v - area * (float) (dt / settings.soak) * (0.3f + 0.7f * v / area));
+			dipVolume[id] = v;
+			if (v > 0) dipWetUntil[id] = now;
 		}
 	}
 
@@ -249,6 +293,17 @@ public final class FoamRenderer {
 			}
 			buf.flip();
 			RenderSystem.getDevice().createCommandEncoder().writeToTexture(fieldTexture, buf, 0, 0, 0, 0, S, S);
+			// Dips: rank from the rim and dip id per sample.
+			buf.clear();
+			for (int sz = 0; sz < S; sz++) for (int sx = 0; sx < S; sx++) {
+				int bi = (sz / ShoreRegion.RES) * r.size + sx / ShoreRegion.RES;
+				buf.putFloat(r.dipRank[sz * S + sx]).putFloat(r.dipId[bi]).putFloat(0).putFloat(0);
+			}
+			buf.flip();
+			RenderSystem.getDevice().createCommandEncoder().writeToTexture(dipTexture, buf, 0, 0, 0, 0, S, S);
+			dipVolume = new float[r.dipSamples.length];
+			dipWetUntil = new double[r.dipSamples.length];
+			java.util.Arrays.fill(dipWetUntil, -1e6);
 		} finally {
 			MemoryUtil.memFree(buf);
 		}
@@ -426,6 +481,8 @@ public final class FoamRenderer {
 		int S = REGION * ShoreRegion.RES;
 		fieldTexture = device.createTexture("Foaming Shores fields", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, S, S, 1, 1);
 		fieldView = device.createTextureView(fieldTexture);
+		dipTexture = device.createTexture("Foaming Shores dips", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, S, S, 1, 1);
+		dipView = device.createTextureView(dipTexture);
 		noiseTexture = device.createTexture("Foaming Shores noise", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM, FoamNoise.SIZE, FoamNoise.SIZE, 1, 1);
 		noiseView = device.createTextureView(noiseTexture);
 		uploadNoise(device);
@@ -449,6 +506,7 @@ public final class FoamRenderer {
 
 	private void uploadNoise(GpuDevice device) {
 		byte[] noise = FoamNoise.build(settings.jagScale, settings.laceCell);
+		noiseBytes = noise;
 		splashes.setNoise(noise);
 		ByteBuffer nb = MemoryUtil.memAlloc(noise.length);
 		try {
@@ -473,6 +531,16 @@ public final class FoamRenderer {
 		}
 		pass(pipeline, ubo, output, waves, now, epoch, 0);
 		if (faceCount > 0) pass(pipeline, faceUbo, faceOutput, waves, now, epoch, 1);
+	}
+
+	private float dipFill(ShoreRegion r, int id) {
+		if (id >= dipVolume.length || r == null || id >= r.dipSamples.length) return 0;
+		float per = ShoreRegion.TEXELS_PER_SAMPLE;
+		return dipVolume[id] / Math.max(1f, r.dipSamples[id].length * per * per);
+	}
+
+	private double dipWetTime(int id) {
+		return id < dipWetUntil.length ? dipWetUntil[id] : -1e6;
 	}
 
 	/** One bake pass: mode 0 draws block tops into the region texture, mode 1 draws faces. */
@@ -500,6 +568,10 @@ public final class FoamRenderer {
 					b.putVec4(0, 0, 0, 0).putVec4(0, 0, 0, 0);
 				}
 			}
+			ShoreRegion r = region;
+			for (int i = 0; i < MAX_DIPS; i += 2) {
+				b.putVec4(dipFill(r, i), (float) (dipWetTime(i) - epoch), dipFill(r, i + 1), (float) (dipWetTime(i + 1) - epoch));
+			}
 		}
 		CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
 		GpuSampler nearest = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST);
@@ -509,6 +581,7 @@ public final class FoamRenderer {
 			pass.setUniform("FieldSampler", fieldView, nearest);
 			pass.setUniform("NoiseSampler", noiseView, RenderSystem.getSamplerCache().getRepeat(FilterMode.NEAREST));
 			pass.setUniform("FaceSampler", faceDataView, nearest);
+			pass.setUniform("DipSampler", dipView, nearest);
 			pass.draw(3, 1, 0, 0);
 		}
 		buffer.rotate();

@@ -16,6 +16,8 @@ uniform sampler2D NoiseSampler;
 // Per face, two texels: (edge texel x, z, step x, z) in region texels, (out x, z, kind, height).
 // Kind 1 = drop (edge texel on top), 2 = wall (edge texel is the one at its foot).
 uniform sampler2D FaceSampler;
+// Per field sample: (rank from the dip's rim 0..1, dip id or -1, -, -).
+uniform sampler2D DipSampler;
 
 layout(std140) uniform FoamBake {
     vec4 Region;   // region size in texels, field samples per block, field size in samples, -
@@ -29,6 +31,7 @@ layout(std140) uniform FoamBake {
     vec4 Terrain;  // spill over drops, falling foam reach (texels), splash height (texels), foam piling
     vec4 Mode;     // mode, face count, face texture width, face texture height
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
+    vec4 Dips[32];  // per dip, two per vec4: (puddle fill 0..1, time the dip was last wet)
 };
 
 layout(location = 0) in vec2 texCoord;
@@ -86,6 +89,23 @@ float levelAt(vec2 texel) {
 
 float arrivalAt(vec2 texel) {
     return fieldsAt(texel).x;
+}
+
+// A dip's rank at a texel (0 at the rim, 1 in the middle), blended between samples.
+float dipRankAt(vec2 texel) {
+    float perSample = 16.0 / Region.y;
+    vec2 s = (texel + 0.5) / perSample - 0.5;
+    int n = int(Region.z);
+    ivec2 i = clamp(ivec2(floor(s)), ivec2(0), ivec2(n - 2));
+    vec2 f = clamp(s - vec2(i), 0.0, 1.0);
+    vec4 a = texelFetch(DipSampler, i, 0), b = texelFetch(DipSampler, i + ivec2(1, 0), 0);
+    vec4 c = texelFetch(DipSampler, i + ivec2(0, 1), 0), d = texelFetch(DipSampler, i + ivec2(1, 1), 0);
+    return mix(mix(a.x, b.x, f.x), mix(c.x, d.x, f.x), f.y);
+}
+
+vec2 dipState(int id) {
+    vec4 v = Dips[id / 2];
+    return (id % 2 == 0) ? v.xy : v.zw;
 }
 
 vec4 over(vec4 src, vec4 dst) {
@@ -270,10 +290,23 @@ vec4 bakeTop(vec2 texel) {
         pile = bay < pressure * Terrain.w;
     }
 
+    // Dips keep what flows in: a puddle that fills from the middle out and soaks away from the rim in.
+    bool puddle = false;
+    float dipWet = 0.0;
+    if (!isWater && abs(level + 1.0) < 0.5) {
+        int id = int(floor(texelFetch(DipSampler, ivec2(floor((texel + 0.5) / perSample)), 0).y + 0.5));
+        if (id >= 0 && id < 64) {
+            vec2 st = dipState(id);
+            puddle = !cov && st.x > 0.0 && dipRankAt(texel) > 1.0 - st.x + (bay - 0.5) * 0.08;
+            dipWet = max(0.0, 1.0 - (T - st.y) / Look.x);
+        }
+    }
+
     vec4 color = vec4(0.0);
     if (!isWater) {
         // Wet sand: a dark film, so it darkens whatever block is underneath.
-        float wv = (cov || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
+        float wv = (cov || puddle || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
+        wv = max(wv, dipWet);
         if (wv > 0.0) {
             float q = wv + (bay - 0.5) * 0.34;
             color = over(vec4(0.0, 0.0, 0.0, Look.y * (q > 0.66 ? 1.0 : q > 0.2 ? 0.5 : 0.0)), color);
@@ -285,6 +318,7 @@ vec4 bakeTop(vec2 texel) {
             float a = Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.7 : 0.45);
             color = over(vec4(shallowWater(), a), color);
         }
+        if (puddle) color = over(vec4(shallowWater(), Look.z), color);
         if (edge) color = over(vec4(mix(Water.rgb, vec3(1.0), 0.62), 0.6), color);
     } else if (swell) {
         color = over(vec4(1.0, 1.0, 1.0, 0.08), color);

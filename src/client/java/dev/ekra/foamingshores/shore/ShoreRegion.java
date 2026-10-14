@@ -35,6 +35,15 @@ public final class ShoreRegion {
 	public final boolean[] water;
 	/** Whether each block column is water that belongs to a body big enough to have waves. */
 	public final boolean[] sea;
+	/**
+	 * Dips: connected land one block below beach level, where water that runs in stays as a puddle.
+	 * {@code dipId} per block (-1 for none); per sample, {@code dipRank} is the distance from the
+	 * dip's rim relative to its deepest point (0 at the rim, 1 in the middle), so a puddle fills from
+	 * the middle out; {@code dipSamples} lists each dip's samples.
+	 */
+	public final short[] dipId;
+	public final float[] dipRank;
+	public int[][] dipSamples = new int[0][];
 
 	private ShoreRegion(ShoreSnapshot snap, int waterY) {
 		this.originX = snap.originX;
@@ -50,6 +59,8 @@ public final class ShoreRegion {
 		this.topY = snap.topY.clone();
 		this.water = new boolean[size * size];
 		this.sea = new boolean[size * size];
+		this.dipId = new short[size * size];
+		this.dipRank = new float[samples * samples];
 	}
 
 	public record Settings(int minBodyBlocks, float openWaterBlocks, float downhill, int smoothingTexels) {
@@ -72,6 +83,7 @@ public final class ShoreRegion {
 		}
 		markBodies(r, surfaceWater, settings.minBodyBlocks());
 		buildFields(r, settings);
+		markDips(r);
 		return r;
 	}
 
@@ -99,6 +111,51 @@ public final class ShoreRegion {
 			}
 			if (edge || comp.size() >= minBody) for (int i : comp) r.sea[i] = true;
 		}
+	}
+
+	private static void markDips(ShoreRegion r) {
+		int size = r.size, S = r.samples;
+		java.util.Arrays.fill(r.dipId, (short) -1);
+		boolean[] dip = new boolean[size * size];
+		for (int i = 0; i < size * size; i++) dip[i] = !r.water[i] && r.level[i] == -1;
+		java.util.List<java.util.List<Integer>> comps = new java.util.ArrayList<>();
+		ArrayDeque<Integer> queue = new ArrayDeque<>();
+		for (int s = 0; s < size * size; s++) {
+			if (!dip[s] || r.dipId[s] >= 0 || comps.size() >= Short.MAX_VALUE) continue;
+			short id = (short) comps.size();
+			java.util.List<Integer> comp = new java.util.ArrayList<>();
+			comps.add(comp);
+			r.dipId[s] = id;
+			queue.add(s);
+			while (!queue.isEmpty()) {
+				int i = queue.poll();
+				comp.add(i);
+				int x = i % size, z = i / size;
+				int[] nb = {x > 0 ? i - 1 : -1, x < size - 1 ? i + 1 : -1, z > 0 ? i - size : -1, z < size - 1 ? i + size : -1};
+				for (int j : nb) if (j >= 0 && dip[j] && r.dipId[j] < 0) { r.dipId[j] = id; queue.add(j); }
+			}
+		}
+		// Distance from the rim per sample, relative to each dip's deepest point.
+		boolean[] notDip = new boolean[S * S];
+		for (int sz = 0; sz < S; sz++) for (int sx = 0; sx < S; sx++)
+			notDip[sz * S + sx] = r.dipId[(sz / RES) * size + sx / RES] < 0;
+		float[] toRim = Fields.distanceTo(notDip, S, S);
+		float[] rimMax = new float[comps.size()];
+		java.util.List<java.util.List<Integer>> samplesOf = new java.util.ArrayList<>();
+		for (int i = 0; i < comps.size(); i++) samplesOf.add(new java.util.ArrayList<>());
+		for (int p = 0; p < S * S; p++) {
+			if (notDip[p]) continue;
+			int id = r.dipId[((p / S) / RES) * size + (p % S) / RES];
+			rimMax[id] = Math.max(rimMax[id], toRim[p]);
+			samplesOf.get(id).add(p);
+		}
+		for (int p = 0; p < S * S; p++) {
+			if (notDip[p]) continue;
+			int id = r.dipId[((p / S) / RES) * size + (p % S) / RES];
+			r.dipRank[p] = toRim[p] / Math.max(1f, rimMax[id]);
+		}
+		r.dipSamples = new int[comps.size()][];
+		for (int i = 0; i < comps.size(); i++) r.dipSamples[i] = samplesOf.get(i).stream().mapToInt(Integer::intValue).toArray();
 	}
 
 	private static void visit(int j, boolean[] water, boolean[] seen, ArrayDeque<Integer> queue) {
