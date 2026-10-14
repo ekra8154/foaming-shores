@@ -370,15 +370,48 @@ vec4 bakeFace(vec2 pixel) {
     float flow = 0.0, age = 1e9, faceFoam = 0.0;
     bool streak = false, faceLip = false;
     int waveCount = int(Origin.w);
-    // A ledge or step continues the beach over its edge: row r reads the texel r + 1 past the edge.
+    // A ledge or step continues the beach over its edge: row r reads the texel r + 1 past the edge,
+    // and its front times blend from the edge texel (top row) to the first texel beyond the face
+    // (bottom row: the dip floor, or the sea below a ledge), so the face joins both without a break.
     ivec2 past = wt + ivec2(d1.xy * float(row + 1));
+    vec2 lowTexel = texel + d1.xy;
+    vec4 lowFields = fieldsAt(lowTexel);
+    bool lowOk = lowFields.x > UNREACHABLE;
+    ivec2 wtLow = ivec2(Origin.xy) + ivec2(lowTexel);
+    float eLow = 1.0 + (lowFields.z - 1.0) * Look.w;
+    float rowFrac = float(row + 1) / float(max(1, h));
 
     for (int i = 0; i < waveCount; i++) {
         Wave w = waveAt(i);
         if (T < w.tR0) continue;
         float Re, tCross, tLeave, tUnc;
         bool laid;
-        if (!waveTimes(w, wt, dp, e, Re, tCross, tLeave, tUnc, laid) || T < tCross) continue;
+        bool reached = waveTimes(w, wt, dp, e, Re, tCross, tLeave, tUnc, laid);
+        if (kind >= 3) {
+            // Ledge or step: this row's front times, between the edge's and the low side's.
+            float ReL, tCrossL, tLeaveL, tUncL;
+            bool laidL;
+            bool reachedL = lowOk && waveTimes(w, wtLow, lowFields.x, eLow, ReL, tCrossL, tLeaveL, tUncL, laidL);
+            if (!reached && !reachedL) continue;
+            float tC = reached && reachedL ? mix(tCross, tCrossL, rowFrac) : reached ? tCross : tCrossL;
+            float tL = reached && reachedL ? mix(tLeave, tLeaveL, rowFrac) : reached ? tLeave : tLeaveL;
+            // Water leaves the face when it leaves the edge above (a step) or the sea side (a ledge).
+            float tU = reached ? tUnc : tUncL;
+            if (T < tC) continue; // the front has not come this far down (or up) the face yet
+            if (T < tU) flow = 1.0;
+            else age = min(age, T - tU);
+            // The lace pattern carries on over the edge, laid and fading on this row's schedule.
+            if (laid || laidL) {
+                float lv = noiseAt(2, past + w.lace);
+                float t0d = min(T, tL), tu = max(t0d, tU);
+                float k = (min(T, tu) - t0d) * 0.6931 / Lace.x + max(0.0, T - tu) * 0.6931 / Lace.y;
+                faceFoam = max(faceFoam, lv * exp(-k));
+            }
+            // The foam lip is on this row while the front passes it.
+            if (T < w.tB0 && T < tC + 0.6 * max(0.0, tL - tC)) faceLip = true;
+            continue;
+        }
+        if (!reached || T < tCross) continue;
         if (kind == 1) {
             // Drop: water pours over from the moment the front reaches the edge until the wave stops
             // pushing. What is at this row now left the edge fallTime(row) ago. Not every column pours,
@@ -393,20 +426,6 @@ vec4 bakeFace(vec2 pixel) {
                 if (fract(te * 5.0 + hash3(wt.x, wt.y, 83 + w.lace.x)) < 0.3) streak = true;
             }
             if (T >= tCross + ft) age = min(age, max(0.0, T - min(T, w.tB0 + ft)));
-        } else if (kind >= 3) {
-            // Ledge or step: water runs down it for as long as the sheet covers the sand at its edge.
-            if (T < tUnc) flow = 1.0;
-            else age = min(age, T - tUnc);
-            // The lace pattern carries on over the edge, laid and fading on the edge's schedule.
-            if (laid) {
-                float lv = noiseAt(2, past + w.lace);
-                float t0d = min(T, tLeave), tu = max(t0d, tUnc);
-                float k = (min(T, tu) - t0d) * 0.6931 / Lace.x + max(0.0, T - tu) * 0.6931 / Lace.y;
-                faceFoam = max(faceFoam, lv * exp(-k));
-            }
-            // The front's foam lip sweeps down the face as it pours over the edge.
-            float r0 = (T - tCross) * Motion.z;
-            if (T < w.tB0 && float(row) <= r0 && float(row) > r0 - Shape.x * 1.4) faceLip = true;
         } else {
             // Wall: the wash runs up when a front hits the foot, then slides back down.
             float energy = sqrt(clamp((dp + Re) / Re, 0.0, 1.0));
