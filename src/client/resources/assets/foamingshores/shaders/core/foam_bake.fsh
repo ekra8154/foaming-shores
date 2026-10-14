@@ -14,12 +14,15 @@ uniform sampler2D FieldSampler;
 // 256x256 tiling noise: r = front raggedness, g = lip width, b = foam lace.
 uniform sampler2D NoiseSampler;
 // Per face, two texels: (edge texel x, z, step x, z) in region texels, (out x, z, kind, height).
-// Kind 1 = drop (edge texel on top), 2 = wall (edge texel is the one at its foot).
+// Kind 1 = drop, 3 = ledge over the sea, 4 = step down into a dip (edge texel on top of each);
+// 2 = wall (edge texel is the one at its foot).
 uniform sampler2D FaceSampler;
 // Per field sample in a dip: (arrival at the dip's entry, 1, -, -); (-, 0, -, -) elsewhere.
 uniform sampler2D DipSampler;
 // Vanilla's block atlas: the sheet is drawn with the water textures, animated by vanilla.
 uniform sampler2D AtlasSampler;
+// In the face pass, the tops just baked: a ledge or step carries foam on its edge over its top row.
+uniform sampler2D RegionSampler;
 
 layout(std140) uniform FoamBake {
     vec4 Region;   // region size in texels, field samples per block, field size in samples, -
@@ -379,6 +382,10 @@ vec4 bakeFace(vec2 pixel) {
                 if (fract(te * 5.0 + hash3(wt.x, wt.y, 83 + w.lace.x)) < 0.3) streak = true;
             }
             if (T >= tCross + ft) age = min(age, max(0.0, T - min(T, w.tB0 + ft)));
+        } else if (kind >= 3) {
+            // Ledge or step: water runs down it for as long as the sheet covers the sand at its edge.
+            if (T < tUnc) flow = 1.0;
+            else age = min(age, T - tUnc);
         } else {
             // Wall: the wash runs up when a front hits the foot, then slides back down.
             float energy = sqrt(clamp((dp + Re) / Re, 0.0, 1.0));
@@ -394,6 +401,7 @@ vec4 bakeFace(vec2 pixel) {
         }
     }
 
+    if (kind == 3) age = 0.0; // a ledge right at the waterline is always wet
     vec4 color = vec4(0.0);
     // A face dries from the top down.
     float wv = age < 1e8 ? max(0.0, 1.0 - age * (0.6 + 1.2 * fromBottom) / Look.x) : 0.0;
@@ -407,6 +415,10 @@ vec4 bakeFace(vec2 pixel) {
         color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.6 : 0.0)), color);
     }
     if (streak && flow > bay) color = vec4(foamBright(), 1.0);
+    if (kind >= 3 && row == 0) {
+        vec4 top = texelFetch(RegionSampler, ivec2(texel), 0);
+        if (top.a > 0.99) color = top; // foam is opaque; the sheet and wet sand are not
+    }
     return color;
 }
 

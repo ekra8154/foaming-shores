@@ -84,7 +84,7 @@ public final class FoamRenderer {
 			.useLightmap()
 			.createRenderSetup());
 	/** Face texture: tiles of 16 x TILE_H texels, FACE_COLS per row. */
-	private static final int FACE_COLS = 128, TILE_H = 80, MAX_FACES = 1024;
+	private static final int FACE_COLS = 128, TILE_H = 80, MAX_FACES = 2048;
 	private static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
 	private static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
@@ -290,7 +290,7 @@ public final class FoamRenderer {
 			int bx = b[0], bz = b[1], bi = bz * r.size + bx;
 			int wx = r.originX + bx, wz = r.originZ + bz;
 			boolean water = isWaterColumn(r, bi);
-			if (!water && r.level[bi] > 0) continue; // walls: tops get no foam (faces come later)
+			if (!water && r.level[bi] > 0) continue; // walls: their tops get no foam; their faces are in buildFaces
 			float top = water ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[bi];
 			float y = top + (water ? 0.01f : 0.002f);
 			pos.set(wx, water ? r.waterY : r.waterY + 1 + r.level[bi], wz);
@@ -305,39 +305,6 @@ public final class FoamRenderer {
 			qs.add(new Quad(
 				new float[] {xa, y, za, xa, y, zb, xb, y, zb, xb, y, za},
 				new float[] {u0, v0, u0, v1, u1, v1, u1, v0}, 0, 1, 0, light));
-			if (water) continue;
-
-			// Faces down to a lower neighbour: the waterline ledge (sand side above the water surface)
-			// and one-block steps into a dip take the sheet whenever it covers the sand at their edge.
-			// Drops (falling water) and walls (splash wash) are in buildFaces.
-			for (int dir = 0; dir < 4; dir++) {
-				int dx = dir == 2 ? -1 : dir == 3 ? 1 : 0, dz = dir == 0 ? -1 : dir == 1 ? 1 : 0;
-				int nx = bx + dx, nz = bz + dz;
-				if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) continue;
-				int ni = nz * r.size + nx;
-				float bottom = isWaterColumn(r, ni) ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[ni];
-				if (bottom >= top - 0.01f || top - bottom > 1.01f) continue;
-				// The edge strip of texels inside this block, along the shared side.
-				float eu0, ev0, eu1, ev1;
-				float[] xyz;
-				final float out = SIDE_NUDGE;
-				if (dz != 0) {
-					float ez = dz < 0 ? wz - out : wz + 1 + out;
-					float row = (bz * 16 + (dz < 0 ? 0 : 15) + 0.5f) * t;
-					eu0 = u0; eu1 = u1; ev0 = row; ev1 = row;
-					xyz = new float[] {wx, y, ez, wx + 1, y, ez, wx + 1, bottom, ez, wx, bottom, ez};
-				} else {
-					float ex = dx < 0 ? wx - out : wx + 1 + out;
-					float col = (bx * 16 + (dx < 0 ? 0 : 15) + 0.5f) * t;
-					eu0 = col; eu1 = col; ev0 = v0; ev1 = v1;
-					xyz = new float[] {ex, y, wz, ex, y, wz + 1, ex, bottom, wz + 1, ex, bottom, wz};
-				}
-				float[] uv = dz != 0
-					? new float[] {eu0, ev0, eu1, ev0, eu1, ev1, eu0, ev1}
-					: new float[] {eu0, ev0, eu0, ev1, eu1, ev1, eu1, ev0};
-				pos.set(r.originX + nx, isWaterColumn(r, ni) ? r.waterY : r.waterY + 1 + r.level[ni], r.originZ + nz);
-				qs.add(new Quad(xyz, uv, dx, 0, dz, LightCoordsUtil.getLightCoords(lvl, pos)));
-			}
 		}
 		buildFaces(lvl, r, built.bandBlocks());
 		region = r;
@@ -384,6 +351,10 @@ public final class FoamRenderer {
 						kind = 1; // drop
 						h = Math.min(fallPx, Math.round((top - nTop) * 16));
 						yTop = top + 0.002f; // level with the top quad, which reaches over this side
+					} else if (!water && top - nTop > 0.01f) {
+						kind = nWater ? 3 : 4; // the ledge over the sea, or a step down into a dip
+						h = Math.min(TILE_H, Math.max(1, Math.round((top - nTop) * 16)));
+						yTop = top + 0.002f;
 					} else continue;
 					if (h <= 0) continue;
 
@@ -403,7 +374,7 @@ public final class FoamRenderer {
 					// The quad on the shared side, nudged off the block face it overlays: a drop's out
 					// over the drop, a wall's back toward the shore.
 					int wx = r.originX + bx, wz = r.originZ + bz;
-					float nudge = kind == 1 ? SIDE_NUDGE : -SIDE_NUDGE;
+					float nudge = kind == 2 ? -SIDE_NUDGE : SIDE_NUDGE;
 					float yBot = yTop - h / 16f;
 					float u0 = col * 16f / FACE_TEX_W, u1 = (col + 1) * 16f / FACE_TEX_W;
 					float vT = row * (float) TILE_H / FACE_TEX_H, vB = (row * TILE_H + h) / (float) FACE_TEX_H;
@@ -417,9 +388,9 @@ public final class FoamRenderer {
 					}
 					float[] uv = {u0, vT, u1, vT, u1, vB, u0, vB};
 					// Light from the open block in front of the face.
-					int lx = kind == 1 ? r.originX + nx : wx, lz = kind == 1 ? r.originZ + nz : wz;
+					int lx = kind != 2 ? r.originX + nx : wx, lz = kind != 2 ? r.originZ + nz : wz;
 					pos.set(lx, (int) Math.floor(yTop - 0.5f), lz);
-					float sign = kind == 1 ? 1 : -1;
+					float sign = kind != 2 ? 1 : -1;
 					qs.add(new Quad(xyz, uv, dx * sign, 0, dz * sign, LightCoordsUtil.getLightCoords(lvl, pos)));
 					n++;
 				}
@@ -563,6 +534,7 @@ public final class FoamRenderer {
 			pass.setUniform("FaceSampler", faceDataView, nearest);
 			pass.setUniform("DipSampler", dipView, nearest);
 			pass.setUniform("AtlasSampler", water.atlas(), nearest);
+			pass.setUniform("RegionSampler", mode == 1 ? output.getTextureView() : noiseView, nearest);
 			pass.draw(3, 1, 0, 0);
 		}
 		buffer.rotate();
