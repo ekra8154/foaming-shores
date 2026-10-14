@@ -16,7 +16,7 @@ uniform sampler2D NoiseSampler;
 // Per face, two texels: (edge texel x, z, step x, z) in region texels, (out x, z, kind, height).
 // Kind 1 = drop (edge texel on top), 2 = wall (edge texel is the one at its foot).
 uniform sampler2D FaceSampler;
-// Per field sample: (rank from the dip's rim 0..1, dip id or -1, -, -).
+// Per field sample in a dip: (arrival at the dip's entry, 1, -, -); (-, 0, -, -) elsewhere.
 uniform sampler2D DipSampler;
 // Vanilla's block atlas: the sheet is drawn with the water textures, animated by vanilla.
 uniform sampler2D AtlasSampler;
@@ -28,13 +28,12 @@ layout(std140) uniform FoamBake {
     vec4 Lace;     // lace half-life under the sheet, on sand, at sea; backwash pull (texels/s)
     vec4 Look;     // drying time, wet darkness, sheet opacity, calmer in coves
     vec4 Motion;   // approach distance (texels), run-up distance (texels), approach speed (texels/s), pause (s)
-    vec4 Motion2;  // backwash time (s), foam tint, -, -
+    vec4 Motion2;  // backwash time (s), foam tint, puddle soak time (s), -
     vec4 Water;    // biome water colour
     vec4 Terrain;  // spill over drops, falling foam reach (texels), splash height (texels), foam piling
     vec4 Mode;     // mode, face count, face texture width, face texture height
     vec4 Sprites;  // atlas texel origin of water_still (x, y) and of water_flow (x, y)
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
-    vec4 Dips[32];  // per dip, two per vec4: (puddle fill 0..1, time the dip was last wet)
 };
 
 layout(location = 0) in vec2 texCoord;
@@ -92,23 +91,6 @@ float levelAt(vec2 texel) {
 
 float arrivalAt(vec2 texel) {
     return fieldsAt(texel).x;
-}
-
-// A dip's rank at a texel (0 at the rim, 1 in the middle), blended between samples.
-float dipRankAt(vec2 texel) {
-    float perSample = 16.0 / Region.y;
-    vec2 s = (texel + 0.5) / perSample - 0.5;
-    int n = int(Region.z);
-    ivec2 i = clamp(ivec2(floor(s)), ivec2(0), ivec2(n - 2));
-    vec2 f = clamp(s - vec2(i), 0.0, 1.0);
-    vec4 a = texelFetch(DipSampler, i, 0), b = texelFetch(DipSampler, i + ivec2(1, 0), 0);
-    vec4 c = texelFetch(DipSampler, i + ivec2(0, 1), 0), d = texelFetch(DipSampler, i + ivec2(1, 1), 0);
-    return mix(mix(a.x, b.x, f.x), mix(c.x, d.x, f.x), f.y);
-}
-
-vec2 dipState(int id) {
-    vec4 v = Dips[id / 2];
-    return (id % 2 == 0) ? v.xy : v.zw;
 }
 
 vec4 over(vec4 src, vec4 dst) {
@@ -203,7 +185,14 @@ vec4 bakeTop(vec2 texel) {
         }
     }
 
-    bool cov = false, edge = false, swell = false, pushing = false;
+    // In a dip, water that ran in cannot drain back uphill over the rim. Its backwash is the puddle:
+    // the water stays where the wave reached and recedes slowly back toward the dip's entry (the
+    // rim it came in over), over the soak time, never climbing out.
+    vec4 dipInfo = texelFetch(DipSampler, ivec2(floor((texel + 0.5) / perSample)), 0);
+    bool isDip = !isWater && abs(level + 1.0) < 0.5 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
+    float dipEntry = dipInfo.x, soak = max(0.1, Motion2.z);
+
+    bool cov = false, edge = false, swell = false, pushing = false, covPuddle = false;
     float covF = 0.0, foam = 0.0, lastUnc = -1e9;
     int lip = 0;
     int waveCount = int(Origin.w);
@@ -248,9 +237,10 @@ vec4 bakeTop(vec2 texel) {
                 F = -Re + (Re + 6.0) * k * k + jv * 0.7;
                 ph = 3;
             }
-            if (dp >= F) {
+            if (dp >= F && !(isDip && ph == 3)) {
                 cov = true;
                 covF = F;
+                covPuddle = false;
                 if (ph < 3) {
                     pushing = true;
                     float lw2 = lw * lipScale;
@@ -262,6 +252,17 @@ vec4 bakeTop(vec2 texel) {
         float ReT, tCross, tLeave, tUnc;
         bool laid;
         if (!waveTimes(w, wt, dp, e, ReT, tCross, tLeave, tUnc, laid) || T < tCross) continue;
+        if (isDip) {
+            // The puddle's edge rises from the wave's furthest reach to the entry over the soak time.
+            float Fmin = -ReT + jv, span = max(1.0, dipEntry - Fmin);
+            tUnc = w.tB0 + soak * clamp((dp - Fmin) / span, 0.0, 1.0);
+            if (T >= w.tB0 && T < tUnc) {
+                cov = true;
+                covF = Fmin + span * (T - w.tB0) / soak;
+                covPuddle = true;
+                if (dp - covF < 1.5) edge = true;
+            }
+        }
         if (T >= tUnc) lastUnc = max(lastUnc, tUnc);
         float lv = 0.0, tDep = 0.0;
         if (dp < 10.0 && laid) {
@@ -303,37 +304,21 @@ vec4 bakeTop(vec2 texel) {
         pile = bay < pressure * Terrain.w;
     }
 
-    // Dips keep what flows in: a puddle that fills from the middle out and soaks away from the rim in.
-    bool puddle = false;
-    float dipWet = 0.0;
-    if (!isWater && abs(level + 1.0) < 0.5) {
-        int id = int(floor(texelFetch(DipSampler, ivec2(floor((texel + 0.5) / perSample)), 0).y + 0.5));
-        if (id >= 0 && id < 64) {
-            vec2 st = dipState(id);
-            puddle = !cov && st.x > 0.0 && dipRankAt(texel) > 1.0 - st.x + (bay - 0.5) * 0.08;
-            dipWet = max(0.0, 1.0 - (T - st.y) / Look.x);
-        }
-    }
-
     vec4 color = vec4(0.0);
     if (!isWater) {
         // Wet sand: a dark film, so it darkens whatever block is underneath.
-        float wv = (cov || puddle || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
-        wv = max(wv, dipWet);
+        float wv = (cov || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
         if (wv > 0.0) {
             float q = wv + (bay - 0.5) * 0.34;
             color = over(vec4(0.0, 0.0, 0.0, Look.y * (q > 0.66 ? 1.0 : q > 0.2 ? 0.5 : 0.0)), color);
         }
         if (cov) {
-            // The sheet: shallow water, nearly opaque where it leaves the sea, thinning in dithered steps.
-            float th = (dp - covF) / max(1.0, -covF);
+            // The sheet: shallow water, nearly opaque where it leaves the sea, thinning in dithered
+            // steps toward its edge. A puddle is deepest toward the entry it is receding to.
+            float th = covPuddle ? (dp - covF) / max(1.0, dipEntry - covF) : (dp - covF) / max(1.0, -covF);
             float q = th + (bay - 0.5) * 0.3;
             vec4 w = waterStill(wt);
             color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.7 : 0.45)), color);
-        }
-        if (puddle) {
-            vec4 w = waterStill(wt);
-            color = over(vec4(w.rgb, w.a * Look.z), color);
         }
         if (edge) color = over(vec4(mix(Water.rgb, vec3(1.0), 0.62), 0.6), color);
     } else if (swell) {

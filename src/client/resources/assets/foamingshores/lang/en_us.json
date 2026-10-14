@@ -74,7 +74,7 @@
 	"option.foamingshores.fallFade": "Falling foam fades within",
 	"tooltip.foamingshores.fallFade": "Average distance water falls down a drop before it has dissolved. Each streak varies.",
 	"option.foamingshores.soak": "Puddle soaks away in",
-	"tooltip.foamingshores.soak": "How long a full puddle in a dip takes to soak into the ground. Small puddles linger longer.",
+	"tooltip.foamingshores.soak": "Water that runs into a dip cannot drain back out. It stays where the wave left it and soaks away over this time, receding toward the side it came in from.",
 	"option.foamingshores.downhill": "Run-out downhill",
 	"tooltip.foamingshores.downhill": "How much further water runs when it flows down into a dip.",
 

@@ -7,7 +7,6 @@ import dev.ekra.foamingshores.shore.ShoreRegion;
 import dev.ekra.foamingshores.wave.WaveMath;
 import dev.ekra.foamingshores.wave.WaveSchedule;
 import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.RandomSource;
@@ -181,6 +180,7 @@ final class Splashes {
 
 	private static void vertex(VertexConsumer buffer, PoseStack.Pose pose, float x, float y, float z, float u, float v,
 		int r, int g, int b, int a, int light) {
-		buffer.addVertex(pose, x, y, z).setColor(r, g, b, a).setUv(u, v).setOverlay(OverlayTexture.NO_OVERLAY).setLight(light).setNormal(pose, 0, 1, 0);
+		// The particle vertex format: position, uv, colour, light.
+		buffer.addVertex(pose, x, y, z).setUv(u, v).setColor(r, g, b, a).setLight(light);
 	}
 }
