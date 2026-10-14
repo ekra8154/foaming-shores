@@ -352,7 +352,8 @@ vec4 bakeFace(vec2 pixel) {
             float hNow = tau < 0.15 ? Hh * tau / 0.15 : Hh * max(0.0, 1.0 - (tau - 0.15) / 0.6);
             float up = float(h - 1 - row);
             if (up > Hh) continue;
-            if (up <= hNow) flow = 1.0;
+            // Strictly below the wash: once it has drained (hNow = 0) no row is under water.
+            if (up < hNow) flow = 1.0;
             float left = tCross + 0.15 + 0.6 * (1.0 - up / Hh);
             age = min(age, max(0.0, T - left));
         }

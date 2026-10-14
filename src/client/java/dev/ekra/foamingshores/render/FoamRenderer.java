@@ -79,6 +79,8 @@ public final class FoamRenderer {
 	/** The settings as of the last apply, to tell what a save changed. */
 	private FoamSettings applied = settings.copy();
 	private boolean noiseDirty, wantRebuild;
+	/** Game time at which a block-change rebuild is due, or MAX_VALUE for none. */
+	private long rebuildAt = Long.MAX_VALUE;
 
 	private ClientLevel level;
 	private ShoreRegion region;
@@ -128,6 +130,18 @@ public final class FoamRenderer {
 		lastBakeStep = Long.MIN_VALUE;
 	}
 
+	/**
+	 * A block changed. Changes near the water's height inside the region rebuild it, a few ticks later
+	 * so a burst of changes (an explosion, a fill) costs one rebuild.
+	 */
+	public void blockChanged(ClientLevel lvl, BlockPos pos) {
+		ShoreRegion r = region;
+		if (lvl != level || r == null) return;
+		if (pos.getX() < r.originX || pos.getZ() < r.originZ || pos.getX() >= r.originX + REGION || pos.getZ() >= r.originZ + REGION) return;
+		if (Math.abs(pos.getY() - r.waterY) > 6) return;
+		rebuildAt = lvl.getGameTime() + 5;
+	}
+
 	/** A chunk the current (or pending) region had to treat as open water has arrived: rebuild with it. */
 	public void chunkLoaded(ClientLevel lvl, ChunkPos pos) {
 		if (lvl != level) return;
@@ -154,6 +168,10 @@ public final class FoamRenderer {
 				install(lvl, built);
 				missing = buildingMissing;
 			}
+		}
+		if (lvl.getGameTime() >= rebuildAt) {
+			rebuildAt = Long.MAX_VALUE;
+			wantRebuild = true;
 		}
 		int px = mc.player.getBlockX(), pz = mc.player.getBlockZ();
 		boolean stale = region == null || wantRebuild
@@ -241,8 +259,14 @@ public final class FoamRenderer {
 			pos.set(wx, water ? r.waterY : r.waterY + 1 + r.level[bi], wz);
 			int light = LightCoordsUtil.getLightCoords(lvl, pos);
 			float u0 = bx * 16 * t, v0 = bz * 16 * t, u1 = (bx + 1) * 16 * t, v1 = (bz + 1) * 16 * t;
+			// Side quads stand SIDE_NUDGE off the block's sides and start at the top quad's height, so
+			// reach the top that far over every side that drops to a lower neighbour: no slit between.
+			float xa = wx - (water || !lowerSide(r, bx, bz, -1, 0, top) ? 0 : SIDE_NUDGE);
+			float xb = wx + 1 + (water || !lowerSide(r, bx, bz, 1, 0, top) ? 0 : SIDE_NUDGE);
+			float za = wz - (water || !lowerSide(r, bx, bz, 0, -1, top) ? 0 : SIDE_NUDGE);
+			float zb = wz + 1 + (water || !lowerSide(r, bx, bz, 0, 1, top) ? 0 : SIDE_NUDGE);
 			qs.add(new Quad(
-				new float[] {wx, y, wz, wx, y, wz + 1, wx + 1, y, wz + 1, wx + 1, y, wz},
+				new float[] {xa, y, za, xa, y, zb, xb, y, zb, xb, y, za},
 				new float[] {u0, v0, u0, v1, u1, v1, u1, v0}, 0, 1, 0, light));
 			if (water) continue;
 
@@ -259,17 +283,17 @@ public final class FoamRenderer {
 				// The edge strip of texels inside this block, along the shared side.
 				float eu0, ev0, eu1, ev1;
 				float[] xyz;
-				final float out = 0.002f;
+				final float out = SIDE_NUDGE;
 				if (dz != 0) {
 					float ez = dz < 0 ? wz - out : wz + 1 + out;
 					float row = (bz * 16 + (dz < 0 ? 0 : 15) + 0.5f) * t;
 					eu0 = u0; eu1 = u1; ev0 = row; ev1 = row;
-					xyz = new float[] {wx, top, ez, wx + 1, top, ez, wx + 1, bottom, ez, wx, bottom, ez};
+					xyz = new float[] {wx, y, ez, wx + 1, y, ez, wx + 1, bottom, ez, wx, bottom, ez};
 				} else {
 					float ex = dx < 0 ? wx - out : wx + 1 + out;
 					float col = (bx * 16 + (dx < 0 ? 0 : 15) + 0.5f) * t;
 					eu0 = col; eu1 = col; ev0 = v0; ev1 = v1;
-					xyz = new float[] {ex, top, wz, ex, top, wz + 1, ex, bottom, wz + 1, ex, bottom, wz};
+					xyz = new float[] {ex, y, wz, ex, y, wz + 1, ex, bottom, wz + 1, ex, bottom, wz};
 				}
 				float[] uv = dz != 0
 					? new float[] {eu0, ev0, eu1, ev0, eu1, ev1, eu0, ev1}
@@ -321,7 +345,7 @@ public final class FoamRenderer {
 					} else if (!water && top - nTop >= 2 - 0.01f) {
 						kind = 1; // drop
 						h = Math.min(fallPx, Math.round((top - nTop) * 16));
-						yTop = top;
+						yTop = top + 0.002f; // level with the top quad, which reaches over this side
 					} else continue;
 					if (h <= 0) continue;
 
@@ -337,7 +361,7 @@ public final class FoamRenderer {
 					// The quad on the shared side, nudged off the block face it overlays: a drop's out
 					// over the drop, a wall's back toward the shore.
 					int wx = r.originX + bx, wz = r.originZ + bz;
-					float nudge = kind == 1 ? 0.002f : -0.002f;
+					float nudge = kind == 1 ? SIDE_NUDGE : -SIDE_NUDGE;
 					float yBot = yTop - h / 16f;
 					float u0 = col * 16f / FACE_TEX_W, u1 = (col + 1) * 16f / FACE_TEX_W;
 					float vT = row * (float) TILE_H / FACE_TEX_H, vB = (row * TILE_H + h) / (float) FACE_TEX_H;
@@ -365,6 +389,18 @@ public final class FoamRenderer {
 		} finally {
 			MemoryUtil.memFree(data);
 		}
+	}
+
+	/** How far side quads stand off the block faces they overlay. */
+	private static final float SIDE_NUDGE = 0.002f;
+
+	/** Whether the neighbour in direction (dx, dz) has a lower top than {@code top}, so this side gets a face. */
+	private static boolean lowerSide(ShoreRegion r, int bx, int bz, int dx, int dz, float top) {
+		int nx = bx + dx, nz = bz + dz;
+		if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) return false;
+		int ni = nz * r.size + nx;
+		float nTop = isWaterColumn(r, ni) ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[ni];
+		return nTop < top - 0.01f;
 	}
 
 	private static boolean isWaterColumn(ShoreRegion r, int bi) {
