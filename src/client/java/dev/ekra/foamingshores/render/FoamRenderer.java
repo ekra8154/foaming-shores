@@ -27,6 +27,7 @@ import net.minecraft.client.renderer.MappableRingBuffer;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
@@ -63,6 +64,8 @@ public final class FoamRenderer {
 	private static final int REBUILD_DISTANCE = 24;
 	public static final Identifier TEXTURE_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_region");
 	public static final Identifier FACES_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_faces");
+	/** A single white texel: droplets and flecks are coloured per vertex. */
+	public static final Identifier PIXEL_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_pixel");
 	/** Face texture: tiles of 16 x TILE_H texels, FACE_COLS per row. */
 	private static final int FACE_COLS = 128, TILE_H = 80, MAX_FACES = 1024;
 	private static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
@@ -95,6 +98,7 @@ public final class FoamRenderer {
 	private MappableRingBuffer ubo, faceUbo;
 	private List<Quad> faceQuads = List.of();
 	private int faceCount;
+	private final Splashes splashes = new Splashes();
 	private long lastBakeStep = Long.MIN_VALUE;
 	/** Frames drawn so far, and the frame of the last bake: the bake's uniform buffer is a ring of 3
 	 *  fenced per frame (like vanilla's lightmap), so it may be rotated at most once per frame. */
@@ -158,6 +162,7 @@ public final class FoamRenderer {
 			faceQuads = List.of();
 			faceCount = 0;
 			building = null;
+			splashes.clear();
 		}
 		if (lvl == null || mc.player == null) return;
 
@@ -198,6 +203,8 @@ public final class FoamRenderer {
 			noiseDirty = false;
 			uploadNoise(RenderSystem.getDevice());
 		}
+		if (region != null) splashes.tick(lvl.getGameTime() / 20.0, WaveSchedule.recent(lvl.getGameTime() / 20.0, settings, MAX_WAVES), settings);
+
 		// The animation moves in steps of `ticks` game ticks (vanilla water uses 2).
 		int every = Math.max(1, settings.ticks);
 		long step = lvl.getGameTime() / every;
@@ -319,6 +326,7 @@ public final class FoamRenderer {
 		int washPx = Math.min(TILE_H, Math.round(settings.splashHeight * 0.6f) + 1);
 		int fallPx = Math.min(TILE_H, (int) Math.ceil(settings.fallFade * 1.65f) + 1);
 		List<Quad> qs = new ArrayList<>();
+		List<Splashes.Foot> feet = new ArrayList<>();
 		ByteBuffer data = MemoryUtil.memAlloc(FACE_COLS * 2 * (MAX_FACES / FACE_COLS) * 16);
 		try {
 			MemoryUtil.memSet(data, 0);
@@ -357,6 +365,10 @@ public final class FoamRenderer {
 					data.position((row * FACE_COLS * 2 + col * 2) * 16);
 					data.putFloat(ex).putFloat(ez).putFloat(sx).putFloat(sz);
 					data.putFloat(dx).putFloat(dz).putFloat(kind).putFloat(h);
+					if (kind == 2) {
+						for (int u = 0; u < 16; u++)
+							feet.add(new Splashes.Foot((int) (ex + sx * u), (int) (ez + sz * u), dx, dz, top));
+					}
 
 					// The quad on the shared side, nudged off the block face it overlays: a drop's out
 					// over the drop, a wall's back toward the shore.
@@ -386,6 +398,7 @@ public final class FoamRenderer {
 			RenderSystem.getDevice().createCommandEncoder().writeToTexture(faceDataTexture, data, 0, 0, 0, 0, FACE_COLS * 2, MAX_FACES / FACE_COLS);
 			faceCount = n;
 			faceQuads = qs;
+			splashes.setRegion(r, feet);
 		} finally {
 			MemoryUtil.memFree(data);
 		}
@@ -427,10 +440,16 @@ public final class FoamRenderer {
 		faceOutput = new RegionTexture(faces, device.createTextureView(faces));
 		Minecraft.getInstance().getTextureManager().register(FACES_ID, faceOutput);
 		faceUbo = new MappableRingBuffer(() -> "Foaming Shores face bake UBO", 130, UBO_SIZE);
+
+		DynamicTexture pixel = new DynamicTexture(() -> "Foaming Shores pixel", 1, 1, false);
+		pixel.getPixels().setPixel(0, 0, 0xFFFFFFFF);
+		pixel.upload();
+		Minecraft.getInstance().getTextureManager().register(PIXEL_ID, pixel);
 	}
 
 	private void uploadNoise(GpuDevice device) {
 		byte[] noise = FoamNoise.build(settings.jagScale, settings.laceCell);
+		splashes.setNoise(noise);
 		ByteBuffer nb = MemoryUtil.memAlloc(noise.length);
 		try {
 			nb.put(noise).flip();
@@ -507,6 +526,16 @@ public final class FoamRenderer {
 		RenderType type = RenderTypes.entityTranslucent(TEXTURE_ID, false);
 		submitQuads(context, poseStack, type, quads);
 		if (!faceQuads.isEmpty()) submitQuads(context, poseStack, RenderTypes.entityTranslucent(FACES_ID, false), faceQuads);
+		if (!splashes.isEmpty() && level != null) {
+			var camState = context.levelState().cameraRenderState;
+			float ft = settings.foamTint;
+			int foam = ((int) (250 + (((waterColor >> 16) & 255) - 250) * ft) << 16)
+				| ((int) (252 + (((waterColor >> 8) & 255) - 252) * ft) << 8)
+				| (int) (250 + ((waterColor & 255) - 250) * ft);
+			ClientLevel lvl = level;
+			context.submitNodeCollector().submitCustomGeometry(poseStack, RenderTypes.entityTranslucent(PIXEL_ID, false),
+				(pose, buffer) -> splashes.render(pose, buffer, lvl, camState.orientation, camState.cameraEntityPartialTicks, foam));
+		}
 		poseStack.popPose();
 	}
 

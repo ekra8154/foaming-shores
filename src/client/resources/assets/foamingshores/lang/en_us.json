@@ -65,6 +65,8 @@
 
 	"option.foamingshores.pile": "Foam piling at walls",
 	"tooltip.foamingshores.pile": "How much foam bunches up at the foot of a wall while a wave pushes against it.",
+	"option.foamingshores.splash": "Splash amount",
+	"tooltip.foamingshores.splash": "How many droplets a wave throws when it hits a wall. Faster waves throw more.",
 	"option.foamingshores.splashHeight": "Splash height",
 	"tooltip.foamingshores.splashHeight": "How high water washes up a wall when a wave hits it at full speed.",
 	"option.foamingshores.spill": "Spill over drops",

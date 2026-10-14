@@ -52,6 +52,7 @@ public final class FoamConfigScreen {
 			new Opt("drift", 0, 30, 1, "texels_per_second"))),
 		new Group("terrain", List.of(
 			new Opt("pile", 0, 1, 0.05f, "none"),
+			new Opt("splash", 0, 3, 0.05f, "none"),
 			new Opt("splashHeight", 4, 48, 1, "texels"),
 			new Opt("downhill", 1, 3, 0.1f, "times"),
 			new Opt("spill", 0, 1, 0.05f, "none"),
