@@ -358,9 +358,11 @@ vec4 bakeFace(vec2 pixel) {
     float dp = fields.x, e = 1.0 + (fields.z - 1.0) * Look.w;
     float bay = bayerAt(ivec2(u, row));
     float fromBottom = float(h - 1 - row) / max(1.0, float(h - 1)); // 0 at the bottom, 1 at the top
-    float flow = 0.0, age = 1e9;
-    bool streak = false;
+    float flow = 0.0, age = 1e9, faceFoam = 0.0;
+    bool streak = false, faceLip = false;
     int waveCount = int(Origin.w);
+    // A ledge or step continues the beach over its edge: row r reads the texel r + 1 past the edge.
+    ivec2 past = wt + ivec2(d1.xy * float(row + 1));
 
     for (int i = 0; i < waveCount; i++) {
         Wave w = waveAt(i);
@@ -386,6 +388,16 @@ vec4 bakeFace(vec2 pixel) {
             // Ledge or step: water runs down it for as long as the sheet covers the sand at its edge.
             if (T < tUnc) flow = 1.0;
             else age = min(age, T - tUnc);
+            // The lace pattern carries on over the edge, laid and fading on the edge's schedule.
+            if (laid) {
+                float lv = noiseAt(2, past + w.lace);
+                float t0d = min(T, tLeave), tu = max(t0d, tUnc);
+                float k = (min(T, tu) - t0d) * 0.6931 / Lace.x + max(0.0, T - tu) * 0.6931 / Lace.y;
+                faceFoam = max(faceFoam, lv * exp(-k));
+            }
+            // The front's foam lip sweeps down the face as it pours over the edge.
+            float r0 = (T - tCross) * Motion.z;
+            if (T < w.tB0 && float(row) <= r0 && float(row) > r0 - Shape.x * 1.4) faceLip = true;
         } else {
             // Wall: the wash runs up when a front hits the foot, then slides back down.
             float energy = sqrt(clamp((dp + Re) / Re, 0.0, 1.0));
@@ -415,6 +427,11 @@ vec4 bakeFace(vec2 pixel) {
         color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.6 : 0.0)), color);
     }
     if (streak && flow > bay) color = vec4(foamBright(), 1.0);
+    if (kind >= 3) {
+        float thr = 1.0 - Shape.w, fv = faceFoam + (bay - 0.5) * 0.1;
+        if (faceFoam > 0.004 && fv > thr) color = vec4(fv > thr + (1.0 - thr) * 0.45 ? foamBright() : foamShadow(), 1.0);
+        if (faceLip) color = vec4(foamBright(), 1.0);
+    }
     if (kind >= 3 && row == 0) {
         vec4 top = texelFetch(RegionSampler, ivec2(texel), 0);
         if (top.a > 0.99) color = top; // foam is opaque; the sheet and wet sand are not
