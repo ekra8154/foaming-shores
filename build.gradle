@@ -1,0 +1,58 @@
+plugins {
+	id "net.fabricmc.fabric-loom" version "${loom_version}"
+	id "maven-publish"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"foamingshores" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+
+	// 26.3 dev clients die at random with exit 0xC0000005 and no hs_err:
+	// HotSpot's guard-page repair strips PAGE_GUARD from a worker stack and a
+	// later jvm!__chkstk walks off the committed part. Pre-touching every Java
+	// thread stack sidesteps it. Dev-only: players launch through Mojang's launcher.
+	runs {
+		client {
+			vmArgs("-XX:+UnlockDiagnosticVMOptions", "-XX:+AlwaysPreTouchStacks")
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+	inputs.property "version", project.version
+	inputs.property "minecraft_support_range", project.minecraft_support_range
+	filesMatching("fabric.mod.json") {
+		expand "version": inputs.properties.version,
+			"minecraft_support_range": inputs.properties.minecraft_support_range
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 25
+}
+
+java {
+	withSourcesJar()
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(25)
+	}
+}

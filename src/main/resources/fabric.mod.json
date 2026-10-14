@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"id": "foamingshores",
+	"version": "${version}",
+	"name": "Foaming Shores",
+	"description": "Pixel-art waves that wash up from oceans, lakes and rivers onto the shore, then recede and dissolve, drawn to look like vanilla water.",
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.ekra.foamingshores.FoamingShoresClient"
+		]
+	},
+	"mixins": [
+		{
+			"config": "foamingshores.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"fabric-api": "*",
+		"minecraft": "${minecraft_support_range}",
+		"java": ">=25"
+	}
+}
