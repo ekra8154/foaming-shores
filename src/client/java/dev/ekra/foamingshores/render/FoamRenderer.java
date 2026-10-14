@@ -87,8 +87,12 @@ public final class FoamRenderer {
 	private boolean bakeFailed;
 	private int waterColor = 0x3F76E4;
 
-	/** A quad over one block's top, with its light and its place in the region texture. */
-	private record Quad(float x, float y, float z, float u0, float v0, float u1, float v1, int light) {
+	/**
+	 * A quad sampling the region texture: four corners (x, y, z) with their (u, v), a normal and a
+	 * light value. Tops cover a block's 16x16 texels; faces stretch the 1-texel strip along the
+	 * block's edge down the face, so a face shows what the sand at its edge shows.
+	 */
+	private record Quad(float[] xyz, float[] uv, float nx, float ny, float nz, int light) {
 	}
 
 	private record Built(ShoreRegion region, List<int[]> bandBlocks) {
@@ -178,16 +182,53 @@ public final class FoamRenderer {
 
 		List<Quad> qs = new ArrayList<>();
 		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+		final float t = 1f / TEXELS;
 		for (int[] b : built.bandBlocks()) {
 			int bx = b[0], bz = b[1], bi = bz * r.size + bx;
 			int wx = r.originX + bx, wz = r.originZ + bz;
 			boolean water = isWaterColumn(r, bi);
-			float y = water ? r.waterY + 8f / 9f + 0.01f : r.waterY + 1 + r.level[bi] + 0.002f;
 			if (!water && r.level[bi] > 0) continue; // walls: tops get no foam (faces come later)
+			float top = water ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[bi];
+			float y = top + (water ? 0.01f : 0.002f);
 			pos.set(wx, water ? r.waterY : r.waterY + 1 + r.level[bi], wz);
 			int light = LightCoordsUtil.getLightCoords(lvl, pos);
-			qs.add(new Quad(wx, y, wz,
-				bx * 16f / TEXELS, bz * 16f / TEXELS, (bx + 1) * 16f / TEXELS, (bz + 1) * 16f / TEXELS, light));
+			float u0 = bx * 16 * t, v0 = bz * 16 * t, u1 = (bx + 1) * 16 * t, v1 = (bz + 1) * 16 * t;
+			qs.add(new Quad(
+				new float[] {wx, y, wz, wx, y, wz + 1, wx + 1, y, wz + 1, wx + 1, y, wz},
+				new float[] {u0, v0, u0, v1, u1, v1, u1, v0}, 0, 1, 0, light));
+			if (water) continue;
+
+			// Faces down to a lower neighbour: the waterline ledge (sand side above the water surface)
+			// and one-block steps into a dip take the sheet whenever it covers the sand at their edge.
+			// Drops (falling water) and walls (splash wash) get their own faces later.
+			for (int dir = 0; dir < 4; dir++) {
+				int dx = dir == 2 ? -1 : dir == 3 ? 1 : 0, dz = dir == 0 ? -1 : dir == 1 ? 1 : 0;
+				int nx = bx + dx, nz = bz + dz;
+				if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) continue;
+				int ni = nz * r.size + nx;
+				float bottom = isWaterColumn(r, ni) ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[ni];
+				if (bottom >= top - 0.01f || top - bottom > 1.01f) continue;
+				// The edge strip of texels inside this block, along the shared side.
+				float eu0, ev0, eu1, ev1;
+				float[] xyz;
+				final float out = 0.002f;
+				if (dz != 0) {
+					float ez = dz < 0 ? wz - out : wz + 1 + out;
+					float row = (bz * 16 + (dz < 0 ? 0 : 15) + 0.5f) * t;
+					eu0 = u0; eu1 = u1; ev0 = row; ev1 = row;
+					xyz = new float[] {wx, top, ez, wx + 1, top, ez, wx + 1, bottom, ez, wx, bottom, ez};
+				} else {
+					float ex = dx < 0 ? wx - out : wx + 1 + out;
+					float col = (bx * 16 + (dx < 0 ? 0 : 15) + 0.5f) * t;
+					eu0 = col; eu1 = col; ev0 = v0; ev1 = v1;
+					xyz = new float[] {ex, top, wz, ex, top, wz + 1, ex, bottom, wz + 1, ex, bottom, wz};
+				}
+				float[] uv = dz != 0
+					? new float[] {eu0, ev0, eu1, ev0, eu1, ev1, eu0, ev1}
+					: new float[] {eu0, ev0, eu0, ev1, eu1, ev1, eu1, ev0};
+				pos.set(r.originX + nx, isWaterColumn(r, ni) ? r.waterY : r.waterY + 1 + r.level[ni], r.originZ + nz);
+				qs.add(new Quad(xyz, uv, dx, 0, dz, LightCoordsUtil.getLightCoords(lvl, pos)));
+			}
 		}
 		region = r;
 		quads = qs;
@@ -278,22 +319,22 @@ public final class FoamRenderer {
 		List<Quad> qs = quads;
 		context.submitNodeCollector().submitCustomGeometry(poseStack, type, (pose, buffer) -> {
 			for (Quad q : qs) {
-				vertex(buffer, pose, q.x(), q.y(), q.z(), q.u0(), q.v0(), q.light());
-				vertex(buffer, pose, q.x(), q.y(), q.z() + 1, q.u0(), q.v1(), q.light());
-				vertex(buffer, pose, q.x() + 1, q.y(), q.z() + 1, q.u1(), q.v1(), q.light());
-				vertex(buffer, pose, q.x() + 1, q.y(), q.z(), q.u1(), q.v0(), q.light());
+				float[] p = q.xyz(), uv = q.uv();
+				for (int k = 0; k < 4; k++)
+					vertex(buffer, pose, p[k * 3], p[k * 3 + 1], p[k * 3 + 2], uv[k * 2], uv[k * 2 + 1], q.light(), q.nx(), q.ny(), q.nz());
 			}
 		});
 		poseStack.popPose();
 	}
 
-	private static void vertex(com.mojang.blaze3d.vertex.VertexConsumer buffer, PoseStack.Pose pose, float x, float y, float z, float u, float v, int light) {
+	private static void vertex(com.mojang.blaze3d.vertex.VertexConsumer buffer, PoseStack.Pose pose, float x, float y, float z, float u, float v, int light,
+		float nx, float ny, float nz) {
 		buffer.addVertex(pose, x, y, z)
 			.setColor(255, 255, 255, 255)
 			.setUv(u, v)
 			.setOverlay(OverlayTexture.NO_OVERLAY)
 			.setLight(light)
-			.setNormal(pose, 0, 1, 0);
+			.setNormal(pose, nx, ny, nz);
 	}
 
 	/** The baked foam texture, registered so vanilla render types can sample it. */
