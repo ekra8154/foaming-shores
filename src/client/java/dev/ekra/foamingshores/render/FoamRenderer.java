@@ -27,7 +27,10 @@ import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.MappableRingBuffer;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.client.renderer.block.FluidModel;
 import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
@@ -73,7 +76,7 @@ public final class FoamRenderer {
 	private static final int FACE_COLS = 128, TILE_H = 80, MAX_FACES = 1024;
 	private static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
 	private static final int UBO_SIZE = new Std140SizeCalculator()
-		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
+		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.get() + 16 * 2 * MAX_WAVES + 16 * (MAX_DIPS / 2);
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
@@ -529,8 +532,9 @@ public final class FoamRenderer {
 			bakeFailed = true;
 			return;
 		}
-		pass(pipeline, ubo, output, waves, now, epoch, 0);
-		if (faceCount > 0) pass(pipeline, faceUbo, faceOutput, waves, now, epoch, 1);
+		WaterSprites water = waterSprites();
+		pass(pipeline, ubo, output, waves, now, epoch, 0, water);
+		if (faceCount > 0) pass(pipeline, faceUbo, faceOutput, waves, now, epoch, 1, water);
 	}
 
 	private float dipFill(ShoreRegion r, int id) {
@@ -543,9 +547,26 @@ public final class FoamRenderer {
 		return id < dipWetUntil.length ? dipWetUntil[id] : -1e6;
 	}
 
+	/** Where vanilla's water textures sit in the block atlas, in atlas texels. */
+	private record WaterSprites(GpuTextureView atlas, int stillX, int stillY, int flowX, int flowY) {
+	}
+
+	/** Looked up at every bake: a resource reload can move the sprites. */
+	private static WaterSprites waterSprites() {
+		Minecraft mc = Minecraft.getInstance();
+		FluidModel model = mc.getModelManager().getFluidStateModelSet().get(Fluids.WATER.defaultFluidState());
+		TextureAtlasSprite still = model.stillMaterial().sprite(), flow = model.flowingMaterial().sprite();
+		AbstractTexture atlas = mc.getTextureManager().getTexture(still.atlasLocation());
+		GpuTextureView view = atlas.getTextureView();
+		int w = view.getWidth(0), h = view.getHeight(0);
+		return new WaterSprites(view,
+			Math.round(still.getU0() * w), Math.round(still.getV0() * h),
+			Math.round(flow.getU0() * w), Math.round(flow.getV0() * h));
+	}
+
 	/** One bake pass: mode 0 draws block tops into the region texture, mode 1 draws faces. */
 	private void pass(CompiledRenderPipeline pipeline, MappableRingBuffer buffer, RegionTexture target, List<WaveSchedule.Wave> waves,
-		double now, double epoch, int mode) {
+		double now, double epoch, int mode, WaterSprites water) {
 		FoamSettings s = settings;
 		try (GpuBufferSlice.MappedView view = buffer.currentBuffer().map(false, true)) {
 			Std140Builder b = Std140Builder.intoBuffer(view.data())
@@ -558,7 +579,8 @@ public final class FoamRenderer {
 				.putVec4(s.backwash, s.foamTint, 0, 0)
 				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1)
 				.putVec4(s.spill, s.fallFade, s.splashHeight, s.pile)
-				.putVec4(mode, faceCount, FACE_TEX_W, FACE_TEX_H);
+				.putVec4(mode, faceCount, FACE_TEX_W, FACE_TEX_H)
+				.putVec4(water.stillX, water.stillY, water.flowX, water.flowY);
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {
 					WaveSchedule.Wave w = waves.get(i);
@@ -582,6 +604,7 @@ public final class FoamRenderer {
 			pass.setUniform("NoiseSampler", noiseView, RenderSystem.getSamplerCache().getRepeat(FilterMode.NEAREST));
 			pass.setUniform("FaceSampler", faceDataView, nearest);
 			pass.setUniform("DipSampler", dipView, nearest);
+			pass.setUniform("AtlasSampler", water.atlas(), nearest);
 			pass.draw(3, 1, 0, 0);
 		}
 		buffer.rotate();

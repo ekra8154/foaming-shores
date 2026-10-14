@@ -18,6 +18,8 @@ uniform sampler2D NoiseSampler;
 uniform sampler2D FaceSampler;
 // Per field sample: (rank from the dip's rim 0..1, dip id or -1, -, -).
 uniform sampler2D DipSampler;
+// Vanilla's block atlas: the sheet is drawn with the water textures, animated by vanilla.
+uniform sampler2D AtlasSampler;
 
 layout(std140) uniform FoamBake {
     vec4 Region;   // region size in texels, field samples per block, field size in samples, -
@@ -30,6 +32,7 @@ layout(std140) uniform FoamBake {
     vec4 Water;    // biome water colour
     vec4 Terrain;  // spill over drops, falling foam reach (texels), splash height (texels), foam piling
     vec4 Mode;     // mode, face count, face texture width, face texture height
+    vec4 Sprites;  // atlas texel origin of water_still (x, y) and of water_flow (x, y)
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
     vec4 Dips[32];  // per dip, two per vec4: (puddle fill 0..1, time the dip was last wet)
 };
@@ -116,7 +119,17 @@ vec4 over(vec4 src, vec4 dst) {
 
 vec3 foamBright() { return mix(vec3(250.0, 252.0, 250.0) / 255.0, Water.rgb, Motion2.y); }
 vec3 foamShadow() { return mix(vec3(236.0, 242.0, 240.0) / 255.0, Water.rgb, Motion2.y + 0.26) * 0.94; }
-vec3 shallowWater() { return Water.rgb * 0.78 * 0.75 + vec3(150.0, 142.0, 104.0) / 255.0 * 0.22; }
+// Vanilla water at a world texel, tinted like vanilla tints it; alpha is the texture's own.
+vec4 waterStill(ivec2 wt) {
+    vec4 t = texelFetch(AtlasSampler, ivec2(Sprites.xy) + ivec2(wt.x & 15, wt.y & 15), 0);
+    return vec4(t.rgb * Water.rgb, t.a);
+}
+
+// Vanilla flowing water on a face (it already scrolls downward), column u, row down from the top.
+vec4 waterFlow(int u, int row) {
+    vec4 t = texelFetch(AtlasSampler, ivec2(Sprites.zw) + ivec2(u & 15, row & 15), 0);
+    return vec4(t.rgb * Water.rgb, t.a);
+}
 
 // One wave's timing (seconds), shared by both modes.
 struct Wave {
@@ -315,10 +328,13 @@ vec4 bakeTop(vec2 texel) {
             // The sheet: shallow water, nearly opaque where it leaves the sea, thinning in dithered steps.
             float th = (dp - covF) / max(1.0, -covF);
             float q = th + (bay - 0.5) * 0.3;
-            float a = Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.7 : 0.45);
-            color = over(vec4(shallowWater(), a), color);
+            vec4 w = waterStill(wt);
+            color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.7 : 0.45)), color);
         }
-        if (puddle) color = over(vec4(shallowWater(), Look.z), color);
+        if (puddle) {
+            vec4 w = waterStill(wt);
+            color = over(vec4(w.rgb, w.a * Look.z), color);
+        }
         if (edge) color = over(vec4(mix(Water.rgb, vec3(1.0), 0.62), 0.6), color);
     } else if (swell) {
         color = over(vec4(1.0, 1.0, 1.0, 0.08), color);
@@ -402,8 +418,8 @@ vec4 bakeFace(vec2 pixel) {
     }
     if (flow > 0.0) {
         float q = flow + (bay - 0.5) * 0.3;
-        float a = Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.6 : 0.0);
-        color = over(vec4(shallowWater(), a), color);
+        vec4 w = waterFlow(u, row);
+        color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.6 : 0.0)), color);
     }
     if (streak && flow > bay) color = vec4(foamBright(), 1.0);
     return color;

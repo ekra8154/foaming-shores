@@ -68,7 +68,7 @@ public final class FoamSettings {
 
 	// Look
 	public int ticks = 2;           // animation step, in game ticks
-	public float sheetAlpha = 0.85f;
+	public float sheetAlpha = 1f;    // times vanilla water's own opacity
 	public float foamTint = 0.08f;
 
 	// Water bodies

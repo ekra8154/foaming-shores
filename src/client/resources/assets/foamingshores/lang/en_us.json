@@ -86,7 +86,7 @@
 	"option.foamingshores.ticks": "Animation step",
 	"tooltip.foamingshores.ticks": "How often the waves move on. Vanilla water animates every 2 ticks.",
 	"option.foamingshores.sheetAlpha": "Sheet opacity",
-	"tooltip.foamingshores.sheetAlpha": "How solid the water running up the beach looks.",
+	"tooltip.foamingshores.sheetAlpha": "How solid the water running up the beach looks, relative to vanilla water. At 1 it is exactly as see-through as vanilla water.",
 	"option.foamingshores.foamTint": "Foam tint",
 	"tooltip.foamingshores.foamTint": "How much the foam takes on the water's colour.",
 
