@@ -46,7 +46,7 @@ import java.util.concurrent.Executors;
  * Prototype renderer for one region around the player:
  * <ol>
  * <li>every so often, snapshot the surface and build the shore fields on a worker thread;</li>
- * <li>every 2 ticks, bake the region's foam into a texture on the GPU (stateless, so a bake needs
+ * <li>every animation step (2 ticks by default), bake the region's foam into a texture on the GPU (stateless, so a bake needs
  *     nothing but the fields, the recent waves and the time);</li>
  * <li>every frame, draw a quad over each shore block through a vanilla translucent render type
  *     that samples that texture, so shader packs light it like any other translucent geometry.</li>
@@ -70,6 +70,9 @@ public final class FoamRenderer {
 		return t;
 	});
 	private final FoamSettings settings = FoamSettings.INSTANCE;
+	/** The settings as of the last apply, to tell what a save changed. */
+	private FoamSettings applied = settings.copy();
+	private boolean noiseDirty, wantRebuild;
 
 	private ClientLevel level;
 	private ShoreRegion region;
@@ -100,6 +103,20 @@ public final class FoamRenderer {
 
 	// ---- Tick: keep the region current and bake ---------------------------------------------
 
+	/**
+	 * Called after the settings screen saves. Settings that shape the shore fields or which blocks
+	 * get foam rebuild the region; the noise scales regenerate the noise; the rest show on the next
+	 * bake.
+	 */
+	public void settingsChanged() {
+		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth")) {
+			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
+		}
+		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
+		applied = settings.copy();
+		lastBakeStep = Long.MIN_VALUE;
+	}
+
 	public void tick(Minecraft mc) {
 		ClientLevel lvl = mc.level;
 		if (lvl != level) {
@@ -116,10 +133,11 @@ public final class FoamRenderer {
 			if (built != null) install(lvl, built);
 		}
 		int px = mc.player.getBlockX(), pz = mc.player.getBlockZ();
-		boolean stale = region == null
+		boolean stale = region == null || wantRebuild
 			|| Math.abs(px - (region.originX + REGION / 2)) > REBUILD_DISTANCE
 			|| Math.abs(pz - (region.originZ + REGION / 2)) > REBUILD_DISTANCE;
 		if (stale && building == null) {
+			wantRebuild = false;
 			ShoreSnapshot snap = ShoreSnapshot.capture(lvl, px - REGION / 2, pz - REGION / 2, REGION);
 			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing);
 			building = CompletableFuture.supplyAsync(() -> {
@@ -134,12 +152,18 @@ public final class FoamRenderer {
 		}
 		waterColor = BiomeColors.getAverageWaterColor(lvl, mc.player.blockPosition());
 
-		long step = lvl.getGameTime() / 2; // the animation moves in 2-tick steps, like vanilla water
+		if (noiseDirty && noiseTexture != null) {
+			noiseDirty = false;
+			uploadNoise(RenderSystem.getDevice());
+		}
+		// The animation moves in steps of `ticks` game ticks (vanilla water uses 2).
+		int every = Math.max(1, settings.ticks);
+		long step = lvl.getGameTime() / every;
 		// Several ticks can run in one frame (catching up after a join or a hitch); bake once per frame.
 		if (region != null && step != lastBakeStep && frames != lastBakeFrame) {
 			lastBakeStep = step;
 			lastBakeFrame = frames;
-			bake(step * 2);
+			bake(step * every);
 		}
 	}
 
@@ -247,7 +271,15 @@ public final class FoamRenderer {
 		fieldView = device.createTextureView(fieldTexture);
 		noiseTexture = device.createTexture("Foaming Shores noise", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM, FoamNoise.SIZE, FoamNoise.SIZE, 1, 1);
 		noiseView = device.createTextureView(noiseTexture);
-		byte[] noise = FoamNoise.build(9, 6f);
+		uploadNoise(device);
+		GpuTexture out = device.createTexture("Foaming Shores foam", GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST, GpuFormat.RGBA8_UNORM, TEXELS, TEXELS, 1, 1);
+		output = new RegionTexture(out, device.createTextureView(out));
+		Minecraft.getInstance().getTextureManager().register(TEXTURE_ID, output);
+		ubo = new MappableRingBuffer(() -> "Foaming Shores bake UBO", 130, UBO_SIZE);
+	}
+
+	private void uploadNoise(GpuDevice device) {
+		byte[] noise = FoamNoise.build(settings.jagScale, settings.laceCell);
 		ByteBuffer nb = MemoryUtil.memAlloc(noise.length);
 		try {
 			nb.put(noise).flip();
@@ -255,10 +287,6 @@ public final class FoamRenderer {
 		} finally {
 			MemoryUtil.memFree(nb);
 		}
-		GpuTexture out = device.createTexture("Foaming Shores foam", GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST, GpuFormat.RGBA8_UNORM, TEXELS, TEXELS, 1, 1);
-		output = new RegionTexture(out, device.createTextureView(out));
-		Minecraft.getInstance().getTextureManager().register(TEXTURE_ID, output);
-		ubo = new MappableRingBuffer(() -> "Foaming Shores bake UBO", 130, UBO_SIZE);
 	}
 
 	/** Draws the region's foam at the given game tick into the region texture. */

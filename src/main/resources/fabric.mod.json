@@ -9,6 +9,9 @@
 	"entrypoints": {
 		"client": [
 			"dev.ekra.foamingshores.FoamingShoresClient"
+		],
+		"modmenu": [
+			"dev.ekra.foamingshores.compat.FoamingShoresModMenu"
 		]
 	},
 	"mixins": [
@@ -22,5 +25,9 @@
 		"fabric-api": "*",
 		"minecraft": "${minecraft_support_range}",
 		"java": ">=25"
+	},
+	"suggests": {
+		"modmenu": "*",
+		"cloth-config": "*"
 	}
 }

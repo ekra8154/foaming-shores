@@ -11,11 +11,16 @@ import org.slf4j.LoggerFactory;
 public class FoamingShoresClient implements ClientModInitializer {
 	public static final String MOD_ID = "foamingshores";
 	public static final Logger LOGGER = LoggerFactory.getLogger("Foaming Shores");
+	private static FoamRenderer renderer;
+
+	public static FoamRenderer renderer() {
+		return renderer;
+	}
 
 	@Override
 	public void onInitializeClient() {
 		FoamPipelines.init();
-		FoamRenderer renderer = new FoamRenderer();
+		renderer = new FoamRenderer();
 		ClientTickEvents.END_CLIENT_TICK.register(renderer::tick);
 		LevelRenderEvents.COLLECT_SUBMITS.register(renderer::submit);
 		LOGGER.info("Foaming Shores loaded");
