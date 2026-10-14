@@ -157,11 +157,13 @@ final class Splashes {
 				quad(buffer, pose, (float) x - h, (float) y, (float) z - h, (float) x - h, (float) y, (float) z + h,
 					(float) x + h, (float) y, (float) z + h, (float) x + h, (float) y, (float) z - h, fr, fg, fb, alpha, light);
 			} else {
-				// A square turned to face the camera: the corners rotated by the camera's orientation.
-				camera.transform(a.set(-h, -h, 0));
-				camera.transform(b.set(-h, h, 0));
-				camera.transform(c.set(h, h, 0));
-				camera.transform(dd.set(h, -h, 0));
+				// A square turned to face the camera: the corners rotated by the camera's orientation,
+				// counter-clockwise as seen from the camera like vanilla particles (the particle
+				// pipeline culls back faces).
+				camera.transform(a.set(h, -h, 0));
+				camera.transform(b.set(h, h, 0));
+				camera.transform(c.set(-h, h, 0));
+				camera.transform(dd.set(-h, -h, 0));
 				float px = (float) x, py = (float) y, pz = (float) z;
 				quad(buffer, pose, px + a.x, py + a.y, pz + a.z, px + b.x, py + b.y, pz + b.z,
 					px + c.x, py + c.y, pz + c.z, px + dd.x, py + dd.y, pz + dd.z, fr, fg, fb, 255, light);
