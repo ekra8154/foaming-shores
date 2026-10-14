@@ -51,7 +51,11 @@ public final class FoamConfigScreen {
 			new Opt("laceSea", 0.2f, 5, 0.1f, "half_life"),
 			new Opt("drift", 0, 30, 1, "texels_per_second"))),
 		new Group("terrain", List.of(
-			new Opt("downhill", 1, 3, 0.1f, "times"))),
+			new Opt("pile", 0, 1, 0.05f, "none"),
+			new Opt("splashHeight", 4, 48, 1, "texels"),
+			new Opt("downhill", 1, 3, 0.1f, "times"),
+			new Opt("spill", 0, 1, 0.05f, "none"),
+			new Opt("fallFade", 2, 48, 1, "texels"))),
 		new Group("wet", List.of(
 			new Opt("wetDark", 0, 0.6f, 0.01f, "none"),
 			new Opt("dryTime", 0.5f, 20, 0.5f, "seconds"))),

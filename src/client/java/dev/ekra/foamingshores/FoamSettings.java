@@ -54,7 +54,12 @@ public final class FoamSettings {
 	public float drift = 10f;       // texels per second
 
 	// Walls and drops
+	public float splash = 1f;
+	public float splashHeight = 20f; // texels
+	public float pile = 0.7f;
 	public float downhill = 1.6f;
+	public float spill = 0.5f;
+	public float fallFade = 12f;    // texels
 
 	// Wet sand
 	public float wetDark = 0.28f;

@@ -17,6 +17,7 @@ public final class FoamPipelines {
 		.withUniform("FoamBake", UniformType.UNIFORM_BUFFER)
 		.withUniform("FieldSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("NoiseSampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("FaceSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.build();
 
 	// Optional: if the shader fails to compile, vanilla logs a warning instead of failing the reload.

@@ -29,6 +29,8 @@ public final class ShoreRegion {
 	public final int samples; // size * RES
 	public final float[] arrival, shoreDist, exposure;
 	public final byte[] level;
+	/** Y of each column's topmost solid-or-fluid block (leaves ignored), unclamped. */
+	public final int[] topY;
 	/** Whether each block column's surface is water at the region's water height (sea or pool). */
 	public final boolean[] water;
 	/** Whether each block column is water that belongs to a body big enough to have waves. */
@@ -45,6 +47,7 @@ public final class ShoreRegion {
 		this.shoreDist = new float[n];
 		this.exposure = new float[n];
 		this.level = new byte[size * size];
+		this.topY = snap.topY.clone();
 		this.water = new boolean[size * size];
 		this.sea = new boolean[size * size];
 	}

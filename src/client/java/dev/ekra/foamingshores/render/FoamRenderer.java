@@ -60,8 +60,12 @@ public final class FoamRenderer {
 	/** Rebuild once the player is this far (blocks) from the region's centre. */
 	private static final int REBUILD_DISTANCE = 24;
 	public static final Identifier TEXTURE_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_region");
+	public static final Identifier FACES_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_faces");
+	/** Face texture: tiles of 16 x TILE_H texels, FACE_COLS per row. */
+	private static final int FACE_COLS = 128, TILE_H = 80, MAX_FACES = 1024;
+	private static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
 	private static final int UBO_SIZE = new Std140SizeCalculator()
-		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
+		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.get() + 16 * 2 * MAX_WAVES;
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
@@ -79,10 +83,12 @@ public final class FoamRenderer {
 	private List<Quad> quads = List.of();
 	private CompletableFuture<Built> building;
 
-	private GpuTexture fieldTexture, noiseTexture;
-	private GpuTextureView fieldView, noiseView;
-	private RegionTexture output;
-	private MappableRingBuffer ubo;
+	private GpuTexture fieldTexture, noiseTexture, faceDataTexture;
+	private GpuTextureView fieldView, noiseView, faceDataView;
+	private RegionTexture output, faceOutput;
+	private MappableRingBuffer ubo, faceUbo;
+	private List<Quad> faceQuads = List.of();
+	private int faceCount;
 	private long lastBakeStep = Long.MIN_VALUE;
 	/** Frames drawn so far, and the frame of the last bake: the bake's uniform buffer is a ring of 3
 	 *  fenced per frame (like vanilla's lightmap), so it may be rotated at most once per frame. */
@@ -109,7 +115,8 @@ public final class FoamRenderer {
 	 * bake.
 	 */
 	public void settingsChanged() {
-		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth")) {
+		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth",
+			"splashHeight", "fallFade")) {
 			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
@@ -123,6 +130,8 @@ public final class FoamRenderer {
 			level = lvl;
 			region = null;
 			quads = List.of();
+			faceQuads = List.of();
+			faceCount = 0;
 			building = null;
 		}
 		if (lvl == null || mc.player == null) return;
@@ -224,7 +233,7 @@ public final class FoamRenderer {
 
 			// Faces down to a lower neighbour: the waterline ledge (sand side above the water surface)
 			// and one-block steps into a dip take the sheet whenever it covers the sand at their edge.
-			// Drops (falling water) and walls (splash wash) get their own faces later.
+			// Drops (falling water) and walls (splash wash) are in buildFaces.
 			for (int dir = 0; dir < 4; dir++) {
 				int dx = dir == 2 ? -1 : dir == 3 ? 1 : 0, dz = dir == 0 ? -1 : dir == 1 ? 1 : 0;
 				int nx = bx + dx, nz = bz + dz;
@@ -254,9 +263,93 @@ public final class FoamRenderer {
 				qs.add(new Quad(xyz, uv, dx, 0, dz, LightCoordsUtil.getLightCoords(lvl, pos)));
 			}
 		}
+		buildFaces(lvl, r, built.bandBlocks());
 		region = r;
 		quads = qs;
 		lastBakeStep = Long.MIN_VALUE;
+	}
+
+	/**
+	 * Wall and drop faces. Both hang off a shore block's edge: a wall is a neighbour whose top is
+	 * higher (the face is the wall's side, washed from its foot), a drop is a neighbour at least two
+	 * blocks lower (the face is the shore block's own side, which water pours down). Each face's column
+	 * u follows the shore block's texel along the shared edge; the face table tells the bake shader
+	 * where that texel is, which way the face points, its kind and its height.
+	 */
+	private void buildFaces(ClientLevel lvl, ShoreRegion r, List<int[]> band) {
+		int washPx = Math.min(TILE_H, Math.round(settings.splashHeight * 0.6f) + 1);
+		int fallPx = Math.min(TILE_H, (int) Math.ceil(settings.fallFade * 1.65f) + 1);
+		List<Quad> qs = new ArrayList<>();
+		ByteBuffer data = MemoryUtil.memAlloc(FACE_COLS * 2 * (MAX_FACES / FACE_COLS) * 16);
+		try {
+			MemoryUtil.memSet(data, 0);
+			BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+			int n = 0;
+			for (int[] b : band) {
+				int bx = b[0], bz = b[1], bi = bz * r.size + bx;
+				boolean water = isWaterColumn(r, bi);
+				if (!water && r.level[bi] > 0) continue;
+				float top = water ? r.waterY + 8f / 9f : r.topY[bi] + 1;
+				for (int dir = 0; dir < 4 && n < MAX_FACES; dir++) {
+					int dx = dir == 2 ? -1 : dir == 3 ? 1 : 0, dz = dir == 0 ? -1 : dir == 1 ? 1 : 0;
+					int nx = bx + dx, nz = bz + dz;
+					if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) continue;
+					int ni = nz * r.size + nx;
+					boolean nWater = isWaterColumn(r, ni);
+					float nTop = nWater ? r.waterY + 8f / 9f : r.topY[ni] + 1;
+					int kind, h;
+					float yTop;
+					if (!nWater && r.level[ni] > 0 && nTop > top + 0.01f) {
+						kind = 2; // wall
+						h = Math.min(washPx, Math.round((nTop - top) * 16));
+						yTop = top + h / 16f;
+					} else if (!water && top - nTop >= 2 - 0.01f) {
+						kind = 1; // drop
+						h = Math.min(fallPx, Math.round((top - nTop) * 16));
+						yTop = top;
+					} else continue;
+					if (h <= 0) continue;
+
+					// The shore block's texels along the shared edge, as region texel coordinates.
+					float ex = dx > 0 ? bx * 16 + 15 : bx * 16;
+					float ez = dz > 0 ? bz * 16 + 15 : bz * 16;
+					float sx = dz != 0 ? 1 : 0, sz = dx != 0 ? 1 : 0;
+					int col = n % FACE_COLS, row = n / FACE_COLS;
+					data.position((row * FACE_COLS * 2 + col * 2) * 16);
+					data.putFloat(ex).putFloat(ez).putFloat(sx).putFloat(sz);
+					data.putFloat(dx).putFloat(dz).putFloat(kind).putFloat(h);
+
+					// The quad on the shared side, nudged off the block face it overlays: a drop's out
+					// over the drop, a wall's back toward the shore.
+					int wx = r.originX + bx, wz = r.originZ + bz;
+					float nudge = kind == 1 ? 0.002f : -0.002f;
+					float yBot = yTop - h / 16f;
+					float u0 = col * 16f / FACE_TEX_W, u1 = (col + 1) * 16f / FACE_TEX_W;
+					float vT = row * (float) TILE_H / FACE_TEX_H, vB = (row * TILE_H + h) / (float) FACE_TEX_H;
+					float[] xyz;
+					if (dz != 0) {
+						float pz = (dz < 0 ? wz : wz + 1) + dz * nudge;
+						xyz = new float[] {wx, yTop, pz, wx + 1, yTop, pz, wx + 1, yBot, pz, wx, yBot, pz};
+					} else {
+						float px = (dx < 0 ? wx : wx + 1) + dx * nudge;
+						xyz = new float[] {px, yTop, wz, px, yTop, wz + 1, px, yBot, wz + 1, px, yBot, wz};
+					}
+					float[] uv = {u0, vT, u1, vT, u1, vB, u0, vB};
+					// Light from the open block in front of the face.
+					int lx = kind == 1 ? r.originX + nx : wx, lz = kind == 1 ? r.originZ + nz : wz;
+					pos.set(lx, (int) Math.floor(yTop - 0.5f), lz);
+					float sign = kind == 1 ? 1 : -1;
+					qs.add(new Quad(xyz, uv, dx * sign, 0, dz * sign, LightCoordsUtil.getLightCoords(lvl, pos)));
+					n++;
+				}
+			}
+			data.position(0);
+			RenderSystem.getDevice().createCommandEncoder().writeToTexture(faceDataTexture, data, 0, 0, 0, 0, FACE_COLS * 2, MAX_FACES / FACE_COLS);
+			faceCount = n;
+			faceQuads = qs;
+		} finally {
+			MemoryUtil.memFree(data);
+		}
 	}
 
 	private static boolean isWaterColumn(ShoreRegion r, int bi) {
@@ -276,6 +369,13 @@ public final class FoamRenderer {
 		output = new RegionTexture(out, device.createTextureView(out));
 		Minecraft.getInstance().getTextureManager().register(TEXTURE_ID, output);
 		ubo = new MappableRingBuffer(() -> "Foaming Shores bake UBO", 130, UBO_SIZE);
+
+		faceDataTexture = device.createTexture("Foaming Shores face table", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, FACE_COLS * 2, MAX_FACES / FACE_COLS, 1, 1);
+		faceDataView = device.createTextureView(faceDataTexture);
+		GpuTexture faces = device.createTexture("Foaming Shores face foam", GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST, GpuFormat.RGBA8_UNORM, FACE_TEX_W, FACE_TEX_H, 1, 1);
+		faceOutput = new RegionTexture(faces, device.createTextureView(faces));
+		Minecraft.getInstance().getTextureManager().register(FACES_ID, faceOutput);
+		faceUbo = new MappableRingBuffer(() -> "Foaming Shores face bake UBO", 130, UBO_SIZE);
 	}
 
 	private void uploadNoise(GpuDevice device) {
@@ -295,8 +395,21 @@ public final class FoamRenderer {
 		long epochTicks = (tick / 24000) * 24000;
 		double now = tick / 20.0, epoch = epochTicks / 20.0;
 		List<WaveSchedule.Wave> waves = WaveSchedule.recent(now, settings, MAX_WAVES);
+		CompiledRenderPipeline pipeline = bakeFailed ? null : RenderSystem.getCompiledPipelineNullable(FoamPipelines.BAKE);
+		if (pipeline == null) {
+			if (!bakeFailed) FoamingShoresClient.LOGGER.error("The foam bake shader did not compile; Foaming Shores will draw nothing");
+			bakeFailed = true;
+			return;
+		}
+		pass(pipeline, ubo, output, waves, now, epoch, 0);
+		if (faceCount > 0) pass(pipeline, faceUbo, faceOutput, waves, now, epoch, 1);
+	}
+
+	/** One bake pass: mode 0 draws block tops into the region texture, mode 1 draws faces. */
+	private void pass(CompiledRenderPipeline pipeline, MappableRingBuffer buffer, RegionTexture target, List<WaveSchedule.Wave> waves,
+		double now, double epoch, int mode) {
 		FoamSettings s = settings;
-		try (GpuBufferSlice.MappedView view = ubo.currentBuffer().map(false, true)) {
+		try (GpuBufferSlice.MappedView view = buffer.currentBuffer().map(false, true)) {
 			Std140Builder b = Std140Builder.intoBuffer(view.data())
 				.putVec4(TEXELS, ShoreRegion.RES, REGION * ShoreRegion.RES, 0)
 				.putVec4(Math.floorMod(region.originX * 16, 256), Math.floorMod(region.originZ * 16, 256), (float) (now - epoch), waves.size())
@@ -305,7 +418,9 @@ public final class FoamRenderer {
 				.putVec4(s.dryTime, s.wetDark, s.sheetAlpha, s.shelter)
 				.putVec4(s.approach * 16, s.runup * 16, s.speed * 16, s.stall)
 				.putVec4(s.backwash, s.foamTint, 0, 0)
-				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1);
+				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1)
+				.putVec4(s.spill, s.fallFade, s.splashHeight, s.pile)
+				.putVec4(mode, faceCount, FACE_TEX_W, FACE_TEX_H);
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {
 					WaveSchedule.Wave w = waves.get(i);
@@ -316,22 +431,17 @@ public final class FoamRenderer {
 				}
 			}
 		}
-		CompiledRenderPipeline pipeline = bakeFailed ? null : RenderSystem.getCompiledPipelineNullable(FoamPipelines.BAKE);
-		if (pipeline == null) {
-			if (!bakeFailed) FoamingShoresClient.LOGGER.error("The foam bake shader did not compile; Foaming Shores will draw nothing");
-			bakeFailed = true;
-			return;
-		}
 		CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
 		GpuSampler nearest = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST);
-		try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores bake", output.getTextureView(), Optional.empty())) {
+		try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores bake", target.getTextureView(), Optional.empty())) {
 			pass.setPipeline(pipeline);
-			pass.setUniform("FoamBake", ubo.currentBuffer());
+			pass.setUniform("FoamBake", buffer.currentBuffer());
 			pass.setUniform("FieldSampler", fieldView, nearest);
 			pass.setUniform("NoiseSampler", noiseView, RenderSystem.getSamplerCache().getRepeat(FilterMode.NEAREST));
+			pass.setUniform("FaceSampler", faceDataView, nearest);
 			pass.draw(3, 1, 0, 0);
 		}
-		ubo.rotate();
+		buffer.rotate();
 	}
 
 	// ---- Frame: draw the quads ---------------------------------------------------------------------
@@ -344,7 +454,12 @@ public final class FoamRenderer {
 		poseStack.pushPose();
 		poseStack.translate(-cam.x, -cam.y, -cam.z);
 		RenderType type = RenderTypes.entityTranslucent(TEXTURE_ID, false);
-		List<Quad> qs = quads;
+		submitQuads(context, poseStack, type, quads);
+		if (!faceQuads.isEmpty()) submitQuads(context, poseStack, RenderTypes.entityTranslucent(FACES_ID, false), faceQuads);
+		poseStack.popPose();
+	}
+
+	private static void submitQuads(LevelRenderContext context, PoseStack poseStack, RenderType type, List<Quad> qs) {
 		context.submitNodeCollector().submitCustomGeometry(poseStack, type, (pose, buffer) -> {
 			for (Quad q : qs) {
 				float[] p = q.xyz(), uv = q.uv();
@@ -352,7 +467,6 @@ public final class FoamRenderer {
 					vertex(buffer, pose, p[k * 3], p[k * 3 + 1], p[k * 3 + 2], uv[k * 2], uv[k * 2 + 1], q.light(), q.nx(), q.ny(), q.nz());
 			}
 		});
-		poseStack.popPose();
 	}
 
 	private static void vertex(com.mojang.blaze3d.vertex.VertexConsumer buffer, PoseStack.Pose pose, float x, float y, float z, float u, float v, int light,
