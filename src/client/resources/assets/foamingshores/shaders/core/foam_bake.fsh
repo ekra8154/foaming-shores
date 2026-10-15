@@ -31,7 +31,7 @@ layout(std140) uniform FoamBake {
     vec4 Lace;     // lace half-life under the sheet, on sand, at sea; backwash pull (texels/s)
     vec4 Look;     // drying time, wet darkness, sheet opacity, calmer in coves
     vec4 Motion;   // approach distance (texels), run-up distance (texels), approach speed (texels/s), pause (s)
-    vec4 Motion2;  // backwash time (s), foam tint, puddle soak time (s), -
+    vec4 Motion2;  // backwash time (s), foam tint, puddle soak time (s), puddle spread (texels)
     vec4 Water;    // biome water colour
     vec4 Terrain;  // spill over drops, falling foam reach (texels), splash height (texels), foam piling
     vec4 Mode;     // mode, face count, face texture width, face texture height
@@ -160,6 +160,26 @@ bool waveTimes(Wave w, ivec2 wt, float dp, float e, out float Re, out float tCro
     return true;
 }
 
+// A wave's puddle in a dip, where the water cannot drain back out. It stays where the wave left it,
+// spreads a few texels further while it settles, and soaks into the ground in place, in dithered
+// blotches. tWet: when the puddle's water got here; tDry: when it has soaked away here; past: how
+// many texels beyond the wave's own reach this is. False if the puddle never gets here.
+bool puddleTimes(Wave w, ivec2 wt, float dp, float e, out float tWet, out float tDry, out float past) {
+    float soak = max(0.1, Motion2.z), spread = Motion2.w;
+    float jv = (noiseAt(0, wt + w.front) - 0.5) * 2.0 * Shape.y;
+    past = (jv - Motion.y * w.amp * e) - dp;
+    tWet = w.tB0;
+    tDry = w.tB0;
+    if (past > spread || dp <= UNREACHABLE) return false;
+    // Spreading is quick at first and has settled after 60% of the soak time.
+    float sp = past > 0.0 ? past / max(0.001, spread) : 0.0;
+    tWet = w.tB0 + 0.6 * soak * sp * sp;
+    // Soaking: blotches from smooth noise, broken up by the dither; the thin rim goes a bit sooner.
+    float rank = 0.55 * noiseAt(1, wt + w.lace) + 0.3 * bayerAt(wt) + 0.15 * clamp(1.0 - (past + spread) / 24.0, 0.0, 1.0);
+    tDry = max(tWet + 0.15 * soak, w.tB0 + soak * (0.3 + 0.7 * rank));
+    return true;
+}
+
 // ---- Block tops ----------------------------------------------------------------------------------
 
 vec4 bakeTop(vec2 texel) {
@@ -188,15 +208,14 @@ vec4 bakeTop(vec2 texel) {
         }
     }
 
-    // In a dip, water that ran in cannot drain back uphill over the rim. Its backwash is the puddle:
-    // the water stays where the wave reached and recedes slowly back toward the dip's entry (the
-    // rim it came in over), over the soak time, never climbing out.
+    // In a dip, water that ran in cannot drain back uphill over the rim. Its backwash is the puddle
+    // (see puddleTimes), which soaks away where it lies.
     vec4 dipInfo = texelFetch(DipSampler, ivec2(floor((texel + 0.5) / perSample)), 0);
     bool isDip = !isWater && abs(level + 1.0) < 0.5 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
-    float dipEntry = dipInfo.x, soak = max(0.1, Motion2.z);
+    float soak = max(0.1, Motion2.z);
 
     bool cov = false, edge = false, swell = false, pushing = false, covPuddle = false;
-    float covF = 0.0, foam = 0.0, lastUnc = -1e9;
+    float covF = 0.0, foam = 0.0, lastUnc = -1e9, puddleTh = 0.0;
     int lip = 0;
     int waveCount = int(Origin.w);
     for (int i = 0; i < waveCount; i++) {
@@ -243,7 +262,6 @@ vec4 bakeTop(vec2 texel) {
             if (dp >= F && !(isDip && ph == 3)) {
                 cov = true;
                 covF = F;
-                covPuddle = false;
                 if (ph < 3) {
                     pushing = true;
                     float lw2 = lw * lipScale;
@@ -254,18 +272,23 @@ vec4 bakeTop(vec2 texel) {
 
         float ReT, tCross, tLeave, tUnc;
         bool laid;
-        if (!waveTimes(w, wt, dp, e, ReT, tCross, tLeave, tUnc, laid) || T < tCross) continue;
+        bool reached = waveTimes(w, wt, dp, e, ReT, tCross, tLeave, tUnc, laid);
         if (isDip) {
-            // The puddle's edge rises from the wave's furthest reach to the entry over the soak time.
-            float Fmin = -ReT + jv, span = max(1.0, dipEntry - Fmin);
-            tUnc = w.tB0 + soak * clamp((dp - Fmin) / span, 0.0, 1.0);
-            if (T >= w.tB0 && T < tUnc) {
-                cov = true;
-                covF = Fmin + span * (T - w.tB0) / soak;
-                covPuddle = true;
-                if (dp - covF < 1.5) edge = true;
+            float tWet, tDry, past;
+            if (puddleTimes(w, wt, dp, e, tWet, tDry, past)) {
+                tUnc = tDry; // lace laid here fades under the puddle until it has soaked away
+                if (T >= tWet && T < tDry) {
+                    covPuddle = true;
+                    // Thins in dithered steps before it goes; the spread past the reach stays thin.
+                    puddleTh = max(puddleTh, clamp((tDry - T) / (0.35 * soak), 0.0, 1.0) * (past > 0.0 ? 0.6 : 1.0));
+                    // A pale rim on the spreading edge while it still moves.
+                    float spreadNow = Motion2.w * sqrt(clamp((T - w.tB0) / (0.6 * soak), 0.0, 1.0));
+                    if (past > 0.0 && spreadNow < Motion2.w && spreadNow - past < 1.5) edge = true;
+                }
+                if (T >= tDry) lastUnc = max(lastUnc, tDry);
             }
         }
+        if (!reached || T < tCross) continue;
         if (T >= tUnc) lastUnc = max(lastUnc, tUnc);
         float lv = 0.0, tDep = 0.0;
         if (dp < 10.0 && laid) {
@@ -319,15 +342,15 @@ vec4 bakeTop(vec2 texel) {
     vec4 color = vec4(0.0);
     if (!isWater) {
         // Wet sand: a dark film, so it darkens whatever block is underneath.
-        float wv = (cov || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
+        float wv = (cov || covPuddle || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
         if (wv > 0.0) {
             float q = wv + (bay - 0.5) * 0.34;
             color = over(vec4(0.0, 0.0, 0.0, Look.y * (q > 0.66 ? 1.0 : q > 0.2 ? 0.5 : 0.0)), color);
         }
-        if (cov) {
+        if (cov || covPuddle) {
             // The sheet: shallow water, nearly opaque where it leaves the sea, thinning in dithered
-            // steps toward its edge. A puddle is deepest toward the entry it is receding to.
-            float th = covPuddle ? (dp - covF) / max(1.0, dipEntry - covF) : (dp - covF) / max(1.0, -covF);
+            // steps toward its edge. A puddle thins as it soaks away.
+            float th = max(cov ? (dp - covF) / max(1.0, -covF) : 0.0, covPuddle ? puddleTh : 0.0);
             float q = th + (bay - 0.5) * 0.3;
             vec4 w = waterStill(wt);
             color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.7 : 0.45)), color);
@@ -380,6 +403,9 @@ vec4 bakeFace(vec2 pixel) {
     ivec2 wtLow = ivec2(Origin.xy) + ivec2(lowTexel);
     float eLow = 1.0 + (lowFields.z - 1.0) * Look.w;
     float rowFrac = float(row + 1) / float(max(1, h));
+    // A drop off a dip's floor keeps pouring while the puddle above reaches its edge.
+    vec4 dipInfo = texelFetch(DipSampler, ivec2(floor((texel + 0.5) / (16.0 / Region.y))), 0);
+    bool edgeDip = kind == 1 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
 
     for (int i = 0; i < waveCount; i++) {
         Wave w = waveAt(i);
@@ -411,11 +437,16 @@ vec4 bakeFace(vec2 pixel) {
             if (T < w.tB0 && T < tC + 0.6 * max(0.0, tL - tC)) faceLip = true;
             continue;
         }
-        if (!reached || T < tCross) continue;
         if (kind == 1) {
             // Drop: water pours over from the moment the front reaches the edge until the wave stops
-            // pushing. What is at this row now left the edge fallTime(row) ago. Not every column pours,
-            // and each column's streak falls its own distance (some paths always run further).
+            // pushing, or off a dip until the puddle at the edge has soaked away (thinner, as it is
+            // only settling). What is at this row now left the edge fallTime(row) ago. Not every
+            // column pours, and each column's streak falls its own distance.
+            float pStart = tCross, pEnd = w.tB0, tWetP, tDryP, pastP;
+            if (edgeDip && puddleTimes(w, wt, dp, e, tWetP, tDryP, pastP)) {
+                pEnd = tDryP;
+                if (!reached) pStart = tWetP;
+            } else if (!reached) continue;
             // "Spill over drops" picks the columns that pour a full streak; every other column still
             // dribbles 2 to 4 texels down from the edge, so no column of the face stays bare.
             bool pours = hash3(wt.x, wt.y, 91 + w.front.x) <= min(1.0, Terrain.x * 1.6);
@@ -425,12 +456,15 @@ vec4 bakeFace(vec2 pixel) {
             float r = float(row);
             if (r >= reach) continue;
             float ft = fallTime(r), te = T - ft, fade = 1.0 - r / reach;
-            if (te >= tCross && te <= w.tB0) {
-                flow = max(flow, fade);
+            if (te >= pStart && te <= pEnd) {
+                flow = max(flow, te > w.tB0 ? fade * 0.75 : fade);
                 if (fract(te * 5.0 + hash3(wt.x, wt.y, 83 + w.lace.x)) < 0.3) streak = true;
             }
-            if (T >= tCross + ft) age = min(age, max(0.0, T - min(T, w.tB0 + ft)));
-        } else {
+            if (T >= pStart + ft) age = min(age, max(0.0, T - min(T, pEnd + ft)));
+            continue;
+        }
+        if (!reached || T < tCross) continue;
+        if (kind == 2) {
             // Wall: the wash runs up when a front hits the foot, then slides back down.
             float energy = sqrt(clamp((dp + Re) / Re, 0.0, 1.0));
             float Hh = max(1.0, Terrain.z * (0.25 + 0.75 * energy) * 0.6);

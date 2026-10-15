@@ -56,6 +56,7 @@ public final class FoamConfigScreen {
 			new Opt("splashHeight", 4, 48, 1, "texels"),
 			new Opt("downhill", 1, 3, 0.1f, "times"),
 			new Opt("soak", 1, 30, 0.5f, "seconds"),
+			new Opt("puddleSpread", 0, 16, 1, "texels"),
 			new Opt("spill", 0, 1, 0.05f, "none"),
 			new Opt("fallFade", 2, 48, 1, "texels"))),
 		new Group("wet", List.of(

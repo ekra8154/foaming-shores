@@ -509,7 +509,7 @@ public final class FoamRenderer {
 				.putVec4(s.laceWet, s.laceDry, s.laceSea, s.drift)
 				.putVec4(s.dryTime, s.wetDark, s.sheetAlpha, s.shelter)
 				.putVec4(s.approach * 16, s.runup * 16, s.speed * 16, s.stall)
-				.putVec4(s.backwash, s.foamTint, s.soak, 0)
+				.putVec4(s.backwash, s.foamTint, s.soak, s.puddleSpread)
 				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1)
 				.putVec4(s.spill, s.fallFade, s.splashHeight, s.pile)
 				.putVec4(mode, faceCount, FACE_TEX_W, FACE_TEX_H)

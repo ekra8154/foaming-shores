@@ -59,6 +59,7 @@ public final class FoamSettings {
 	public float pile = 0.7f;
 	public float downhill = 1.6f;
 	public float soak = 8f;
+	public float puddleSpread = 4f; // texels
 	public float spill = 0.5f;
 	public float fallFade = 12f;    // texels
 
