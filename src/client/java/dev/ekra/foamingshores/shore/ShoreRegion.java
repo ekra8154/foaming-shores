@@ -1,8 +1,6 @@
 package dev.ekra.foamingshores.shore;
 
 import java.util.ArrayDeque;
-import java.util.HashMap;
-import java.util.Map;
 
 /**
  * The fields the waves are drawn from, for one square region. Built off-thread from a
@@ -67,10 +65,7 @@ public final class ShoreRegion {
 
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings) {
 		int size = snap.size;
-		// The water surface the waves belong to: the most common surface height among water columns.
-		Map<Integer, Integer> counts = new HashMap<>();
-		for (int i = 0; i < size * size; i++) if (snap.water[i]) counts.merge(snap.topY[i], 1, Integer::sum);
-		int waterY = counts.entrySet().stream().max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse(62);
+		int waterY = snap.waterY;
 		ShoreRegion r = new ShoreRegion(snap, waterY);
 
 		boolean[] surfaceWater = new boolean[size * size];
