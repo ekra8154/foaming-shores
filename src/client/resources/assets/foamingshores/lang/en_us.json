@@ -70,7 +70,7 @@
 	"option.foamingshores.splashHeight": "Splash height",
 	"tooltip.foamingshores.splashHeight": "How high water washes up a wall when a wave hits it at full speed.",
 	"option.foamingshores.spill": "Spill over drops",
-	"tooltip.foamingshores.spill": "How much of a drop's edge pours water down its face when a wave reaches it.",
+	"tooltip.foamingshores.spill": "How many columns of a drop's edge pour a full streak of water down its face when a wave reaches it. The rest still dribble a little.",
 	"option.foamingshores.fallFade": "Falling foam fades within",
 	"tooltip.foamingshores.fallFade": "Average distance water falls down a drop before it has dissolved. Each streak varies.",
 	"option.foamingshores.soak": "Puddle soaks away in",

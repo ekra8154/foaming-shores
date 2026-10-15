@@ -416,8 +416,12 @@ vec4 bakeFace(vec2 pixel) {
             // Drop: water pours over from the moment the front reaches the edge until the wave stops
             // pushing. What is at this row now left the edge fallTime(row) ago. Not every column pours,
             // and each column's streak falls its own distance (some paths always run further).
-            if (hash3(wt.x, wt.y, 91 + w.front.x) > min(1.0, Terrain.x * 1.6)) continue;
-            float reach = max(2.0, Terrain.y * (0.65 + 0.7 * hash3(wt.x, wt.y, 77) + 0.6 * (hash3(wt.x, wt.y, 79 + w.front.y) - 0.5)));
+            // "Spill over drops" picks the columns that pour a full streak; every other column still
+            // dribbles 2 to 4 texels down from the edge, so no column of the face stays bare.
+            bool pours = hash3(wt.x, wt.y, 91 + w.front.x) <= min(1.0, Terrain.x * 1.6);
+            float reach = pours
+                ? max(2.0, Terrain.y * (0.65 + 0.7 * hash3(wt.x, wt.y, 77) + 0.6 * (hash3(wt.x, wt.y, 79 + w.front.y) - 0.5)))
+                : 2.0 + 2.0 * hash3(wt.x, wt.y, 81 + w.front.y);
             float r = float(row);
             if (r >= reach) continue;
             float ft = fallTime(r), te = T - ft, fade = 1.0 - r / reach;
