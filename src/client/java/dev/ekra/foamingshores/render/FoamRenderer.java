@@ -148,7 +148,7 @@ public final class FoamRenderer {
 	 */
 	public void settingsChanged() {
 		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth",
-			"splashHeight", "fallFade", "farSmooth", "wrapAngle", "minIsland", "waveVary", "travelFade")) {
+			"splashHeight", "fallFade", "farSmooth", "wrapAngle", "minIsland", "waveVary", "travelFade", "wrap", "wrapLag")) {
 			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
@@ -442,7 +442,7 @@ public final class FoamRenderer {
 			faceCount = n;
 			faceQuads = qs;
 			splashes.setRegion(r, feet);
-			audio.setSounds(ShoreSounds.build(r, wallRows, dropRows));
+			audio.setSounds(ShoreSounds.build(r, wallRows, dropRows, settings));
 		} finally {
 			MemoryUtil.memFree(data);
 		}

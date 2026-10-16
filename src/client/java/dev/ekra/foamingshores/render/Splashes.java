@@ -114,11 +114,19 @@ final class Splashes {
 			int wx = r.originX * 16 + f.tx(), wz = r.originZ * 16 + f.tz();
 			// Measured from where this foot's water came ashore, with each wave as it is here.
 			float xl = fv[0] - fv[2];
+			float[] c = WaveMath.crossAt(r, f.tx(), f.tz(), s);
 			for (WaveSchedule.Wave w : waves) {
 				WaveMath.Local l = WaveMath.local(w, r.originX + f.tx() / 16.0, r.originZ + f.tz() / 16.0, fv[2], s);
 				WaveMath.Times t = WaveMath.times(w, l, wx, wz, xl, fv[1], s, noise);
 				if (t != null && t.tCross() > from && t.tCross() <= to)
 					splash(f, r, Math.sqrt(Math.max(0, Math.min(1, (xl + t.Re()) / t.Re()))), s);
+				// The crossing front hits the wall too, weaker the further it has fallen behind.
+				if (c != null) {
+					WaveMath.Local l2 = WaveMath.local(w, r.originX + f.tx() / 16.0, r.originZ + f.tz() / 16.0, c[1], s);
+					WaveMath.Times t2 = WaveMath.times(w, l2, wx, wz, c[0] - c[1], fv[1], s, noise);
+					if (t2 != null && t2.tCross() > from && t2.tCross() <= to)
+						splash(f, r, Math.sqrt(Math.max(0, Math.min(1, (c[0] - c[1] + t2.Re()) / t2.Re())) * Math.min(1, c[2])), s);
+				}
 			}
 		}
 	}

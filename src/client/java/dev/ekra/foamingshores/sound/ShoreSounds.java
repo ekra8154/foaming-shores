@@ -19,8 +19,11 @@ import java.util.Map;
  * Immutable once built.
  */
 public final class ShoreSounds {
-	/** A point that makes sound: world position (blocks), the world texel it samples, arrival and exposure there. */
-	record Point(double x, double y, double z, int wx, int wz, float dp, float exposure, float waterline, double bx, double bz) {
+	/**
+	 * A point that makes sound: world position (blocks), the world texel it samples, arrival and
+	 * exposure there, and how strong its waves are (1, or less for the crossing front at a face).
+	 */
+	record Point(double x, double y, double z, int wx, int wz, float dp, float exposure, float waterline, double bx, double bz, float strength) {
 		/** Where the point is relative to its own waterline: 0 at sea, negative up the beach. */
 		float xl() {
 			return dp - waterline;
@@ -45,7 +48,7 @@ public final class ShoreSounds {
 	 * The sound sources of a region. {@code wallFaces} and {@code dropFaces} are the face table's
 	 * rows: edge texel (region texels), step along the edge, and direction out of the face.
 	 */
-	public static ShoreSounds build(ShoreRegion r, List<int[]> wallFaces, List<int[]> dropFaces) {
+	public static ShoreSounds build(ShoreRegion r, List<int[]> wallFaces, List<int[]> dropFaces, FoamSettings s) {
 		List<Point> shore = new ArrayList<>();
 		for (int bz = 0; bz < r.size; bz++) {
 			for (int bx = 0; bx < r.size; bx++) {
@@ -64,17 +67,27 @@ public final class ShoreSounds {
 				}
 			}
 		}
-		return new ShoreSounds(shore.toArray(Point[]::new), faces(r, wallFaces, true), faces(r, dropFaces, false), dips(r));
+		return new ShoreSounds(shore.toArray(Point[]::new), faces(r, wallFaces, true, s), faces(r, dropFaces, false, s), dips(r));
 	}
 
 	private static Point point(ShoreRegion r, int tx, int tz, double x, double y, double z) {
 		float[] f = WaveMath.fieldsAt(r, tx, tz);
 		if (f == null) return null; // a wall straight out of the sea: no beach for a wave to wash
-		return new Point(x, y, z, r.originX * 16 + tx, r.originZ * 16 + tz, f[0], f[1], f[2], r.originX + tx / 16.0, r.originZ + tz / 16.0);
+		return new Point(x, y, z, r.originX * 16 + tx, r.originZ * 16 + tz, f[0], f[1], f[2], r.originX + tx / 16.0, r.originZ + tz / 16.0, 1);
 	}
 
-	/** Face rows are (edge x, edge z, step x, step z, out x, out z, top y); a wall's texels are at its foot. */
-	private static Group[] faces(ShoreRegion r, List<int[]> rows, boolean wall) {
+	/** The crossing front at a texel, as a point of its own (its arrival and waterline), or null. */
+	private static Point crossPoint(ShoreRegion r, int tx, int tz, FoamSettings s) {
+		float[] f = WaveMath.fieldsAt(r, tx, tz), c = WaveMath.crossAt(r, tx, tz, s);
+		if (f == null || c == null) return null;
+		return new Point(0, 0, 0, r.originX * 16 + tx, r.originZ * 16 + tz, c[0], f[1], c[1], r.originX + tx / 16.0, r.originZ + tz / 16.0, Math.min(1, c[2]));
+	}
+
+	/**
+	 * Face rows are (edge x, edge z, step x, step z, out x, out z, top y); a wall's texels are at its
+	 * foot. Where a crossing front runs over the face too, its texels are there a second time for it.
+	 */
+	private static Group[] faces(ShoreRegion r, List<int[]> rows, boolean wall, FoamSettings s) {
 		List<Group> out = new ArrayList<>();
 		for (int[] row : rows) {
 			List<Point> texels = new ArrayList<>();
@@ -82,6 +95,8 @@ public final class ShoreSounds {
 				int tx = row[0] + row[2] * u, tz = row[1] + row[3] * u;
 				Point p = point(r, tx, tz, 0, 0, 0);
 				if (p != null) texels.add(p);
+				Point c = crossPoint(r, tx, tz, s);
+				if (c != null) texels.add(c);
 			}
 			if (texels.isEmpty()) continue;
 			double cx = r.originX + (row[0] + row[2] * 7.5 + 0.5) / 16.0 + row[4] * (wall ? 1 / 32.0 : 0.5 / 16);
@@ -272,7 +287,7 @@ public final class ShoreSounds {
 					times(ph, p, e, s, noise, t);
 					if (!t.reached || t.tCross <= t0 || t.tCross > T) continue;
 					count++;
-					energy = Math.max(energy, Math.sqrt(Math.min(1, Math.max(0, (p.xl() + t.Re) / t.Re))));
+					energy = Math.max(energy, Math.sqrt(Math.min(1, Math.max(0, (p.xl() + t.Re) / t.Re)) * p.strength()));
 					when = Math.min(when, t.tCross);
 				}
 			}
@@ -300,7 +315,7 @@ public final class ShoreSounds {
 					}
 				}
 			}
-			if (pouring > 0) add(pw, SurfSynth.TRICKLE, g, 0.9 * Math.sqrt(pouring / 16.0));
+			if (pouring > 0) add(pw, SurfSynth.TRICKLE, g, 0.9 * Math.sqrt(Math.min(1, pouring / 16.0)));
 		}
 
 		// Dips: water runs in while a wave covers part of one, then soaks away.

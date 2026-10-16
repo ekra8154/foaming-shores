@@ -36,6 +36,34 @@ public final class WaveMath {
 		return wsum > 0 ? new float[] {arr / wsum, exp / wsum, wl / wsum} : null;
 	}
 
+	/**
+	 * The crossing front at a region texel: its arrival (texels), its own waterline, and how strong it
+	 * is there (it fades as it falls behind the first front), blended over the samples where it exists
+	 * as the bake shader does; null where there is none or it has faded out.
+	 */
+	public static float[] crossAt(ShoreRegion r, float tx, float tz, FoamSettings s) {
+		float[] f = fieldsAt(r, tx, tz);
+		if (f == null) return null;
+		float per = ShoreRegion.TEXELS_PER_SAMPLE;
+		float sx = (tx + 0.5f) / per - 0.5f, sz = (tz + 0.5f) / per - 0.5f;
+		int S = r.samples;
+		int ix = Math.max(0, Math.min(S - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(S - 2, (int) Math.floor(sz)));
+		float fx = Math.max(0, Math.min(1, sx - ix)), fz = Math.max(0, Math.min(1, sz - iz));
+		float c = 0, cw = 0, wsum = 0;
+		for (int k = 0; k < 4; k++) {
+			int ox = k & 1, oz = k >> 1, p = (iz + oz) * S + ix + ox;
+			float w = (ox == 1 ? fx : 1 - fx) * (oz == 1 ? fz : 1 - fz);
+			if (r.cross[p] <= ShoreRegion.UNREACHABLE || r.crossWaterline[p] <= ShoreRegion.UNREACHABLE) continue;
+			c += r.cross[p] * w;
+			cw += r.crossWaterline[p] * w;
+			wsum += w;
+		}
+		if (wsum <= 0) return null;
+		c /= wsum;
+		float fade = s.wrap * (1 - (f[0] - c) / (s.wrapLag * 16));
+		return fade > 0 ? new float[] {c, cw / wsum, fade} : null;
+	}
+
 	/** How much of a wave is left after travelling past where it would normally break. */
 	public static float travelLeft(float waterline, FoamSettings s) {
 		return waterline >= 0 ? 1 : Math.max(0, 1 + waterline / (s.travelFade * 16));
