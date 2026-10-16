@@ -212,13 +212,17 @@ public final class ShoreRegion {
 
 		// Arrival: waves start only in open water and travel through water from there. Water never
 		// steps up a level, never enters a wall or a drop of two or more, and runs further downhill.
+		// Open water behind a narrower gap (a cove) is not where waves start either: only water whose
+		// whole way out is open water, and no wider than its way out, so a wave never appears from
+		// nowhere as a ring inside a cove before the real one comes through the mouth.
 		float open = settings.openWaterBlocks() * 16f;
 		double downCost = 1.0 / settings.downhill();
 		double[] cost = new double[n];
 		float widest = 0;
 		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
 		float sourceAt = Math.min(open, widest * 0.9f);
-		for (int p = 0; p < n; p++) cost[p] = seaS[p] && rawW[p] >= sourceAt ? -rawW[p] : Fields.FAR;
+		float[] way = Fields.openWay(rawW, seaS, S, S);
+		for (int p = 0; p < n; p++) cost[p] = seaS[p] && rawW[p] >= sourceAt && way[p] >= sourceAt && rawW[p] <= way[p] + tps ? -rawW[p] : Fields.FAR;
 		int[] pred = new int[n], order = new int[n];
 		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
 			if (seaS[q] && !seaS[p]) return -1;

@@ -166,6 +166,70 @@ final class Fields {
 		return settled;
 	}
 
+	/**
+	 * How open each {@code sea} point's way out is: the most {@code value} (distance from land) stays
+	 * along the best 4-neighbour path from the widest point of its own connected water (a widest-path
+	 * search). A cove behind a narrower mouth scores no more than its mouth. {@code -FAR} off the sea.
+	 */
+	static float[] openWay(float[] value, boolean[] sea, int w, int h) {
+		int n = w * h;
+		// The widest point of each connected stretch of water.
+		int[] comp = new int[n];
+		Arrays.fill(comp, -1);
+		int[] stack = new int[n];
+		double[] neg = new double[n];
+		Arrays.fill(neg, FAR);
+		for (int s = 0; s < n; s++) {
+			if (!sea[s] || comp[s] >= 0) continue;
+			int top = 0, best = s;
+			stack[top++] = s;
+			comp[s] = s;
+			while (top > 0) {
+				int p = stack[--top], x = p % w, y = p / w;
+				if (value[p] > value[best]) best = p;
+				for (int k = 0; k < 4; k++) {
+					int q = k == 0 ? (x > 0 ? p - 1 : -1) : k == 1 ? (x < w - 1 ? p + 1 : -1) : k == 2 ? (y > 0 ? p - w : -1) : (y < h - 1 ? p + w : -1);
+					if (q < 0 || !sea[q] || comp[q] >= 0) continue;
+					comp[q] = s;
+					stack[top++] = q;
+				}
+			}
+			neg[best] = -value[best];
+		}
+		// Widest path, as a Dijkstra on the negated bottleneck.
+		int[] heap = new int[n], pos = new int[n];
+		boolean[] done = new boolean[n];
+		Arrays.fill(pos, -1);
+		int size = 0;
+		for (int p = 0; p < n; p++) if (neg[p] < FAR) { heap[size] = p; pos[p] = size; size++; }
+		for (int i = (size >> 1) - 1; i >= 0; i--) siftDown(heap, pos, neg, size, i);
+		while (size > 0) {
+			int p = heap[0];
+			size--;
+			pos[p] = -1;
+			done[p] = true;
+			if (size > 0) {
+				heap[0] = heap[size];
+				pos[heap[0]] = 0;
+				siftDown(heap, pos, neg, size, 0);
+			}
+			int x = p % w, y = p / w;
+			for (int k = 0; k < 4; k++) {
+				int q = k == 0 ? (x > 0 ? p - 1 : -1) : k == 1 ? (x < w - 1 ? p + 1 : -1) : k == 2 ? (y > 0 ? p - w : -1) : (y < h - 1 ? p + w : -1);
+				if (q < 0 || done[q] || !sea[q]) continue;
+				double nc = Math.max(neg[p], -value[q]);
+				if (nc < neg[q]) {
+					neg[q] = nc;
+					if (pos[q] < 0) { heap[size] = q; pos[q] = size; size++; siftUp(heap, pos, neg, size - 1); }
+					else siftUp(heap, pos, neg, pos[q]);
+				}
+			}
+		}
+		float[] out = new float[n];
+		for (int p = 0; p < n; p++) out[p] = neg[p] < FAR ? (float) -neg[p] : -FAR;
+		return out;
+	}
+
 	interface Step {
 		double cost(int p, int q, boolean diagonal);
 	}
