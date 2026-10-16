@@ -30,12 +30,22 @@ public final class ShoreSnapshot {
 	 * and only something standing in the water's layer is a wall.
 	 */
 	final int[] topY;
-	/** Whether that topmost block is water. */
+	/**
+	 * Whether that topmost block is water. A stream running over land is not: its column's surface
+	 * is the land under it (see {@link #surfY}).
+	 */
 	final boolean[] water;
+	/**
+	 * Y of the water block whose surface a column shows, or {@link #NO_SURFACE}: the water's own layer
+	 * for water at that height, the stream's top block for a stream over land, the pool's top block
+	 * for water lower than the body's.
+	 */
+	final int[] surfY;
+	public static final int NO_SURFACE = Integer.MIN_VALUE;
 	/** The water surface the waves belong to: the most common surface height among water columns. */
 	int waterY;
 	/**
-	 * For water columns, the heights (0..1 above topY) of the surface's corners as vanilla draws it,
+	 * Where a column has a water surface, the heights (0..1 above surfY) of its corners as vanilla draws it,
 	 * four per column in the order north-west, south-west, south-east, north-east: the same corners in
 	 * the same order make the same two triangles, so whatever lies on them lies on the water.
 	 */
@@ -49,6 +59,7 @@ public final class ShoreSnapshot {
 		this.size = size;
 		this.topY = new int[size * size];
 		this.water = new boolean[size * size];
+		this.surfY = new int[size * size];
 		this.corners = new float[size * size * 4];
 	}
 
@@ -100,14 +111,29 @@ public final class ShoreSnapshot {
 			}
 		}
 
+		// Water standing above the body's level on land (a stream, a spilled source): the waves see
+		// the land under it, and their foam lies on the stream's surface.
+		for (int dz = 0; dz < size; dz++) {
+			for (int dx = 0; dx < size; dx++) {
+				int x = originX + dx, z = originZ + dz, i = dz * size + dx;
+				s.surfY[i] = s.water[i] ? (s.topY[i] > layer ? s.topY[i] : Math.min(s.topY[i], layer)) : NO_SURFACE;
+				if (!s.water[i] || s.topY[i] <= layer || s.missingChunks.contains(ChunkPos.pack(x >> 4, z >> 4))) continue;
+				int y = s.topY[i];
+				while (y > layer && level.getFluidState(pos.set(x, y, z)).is(FluidTags.WATER)) y--;
+				s.topY[i] = y;
+				s.water[i] = level.getFluidState(pos.set(x, y, z)).is(FluidTags.WATER);
+				if (s.water[i]) s.surfY[i] = y; // water all the way down to the body's layer: the body's own
+			}
+		}
+
 		for (int dz = 0; dz < size; dz++) {
 			for (int dx = 0; dx < size; dx++) {
 				int i = dz * size + dx;
-				if (!s.water[i] || s.missingChunks.contains(ChunkPos.pack((originX + dx) >> 4, (originZ + dz) >> 4))) {
+				if (s.surfY[i] == NO_SURFACE || s.missingChunks.contains(ChunkPos.pack((originX + dx) >> 4, (originZ + dz) >> 4))) {
 					Arrays.fill(s.corners, i * 4, i * 4 + 4, 8f / 9f);
 					continue;
 				}
-				surfaceCorners(level, pos.set(originX + dx, s.topY[i], originZ + dz), s.corners, i * 4);
+				surfaceCorners(level, pos.set(originX + dx, s.surfY[i], originZ + dz), s.corners, i * 4);
 			}
 		}
 		return s;

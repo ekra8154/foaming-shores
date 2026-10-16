@@ -308,23 +308,28 @@ public final class FoamRenderer {
 			int wx = r.originX + bx, wz = r.originZ + bz;
 			boolean water = isWaterColumn(r, bi);
 			if (!water && r.level[bi] > 0) continue; // walls: their tops get no foam; their faces are in buildFaces
+			if (r.low[bi]) continue; // a pool below the body's level: the waves never get there
+			// Water the foam lies on: the body's own, or a stream running over this land.
+			boolean surface = r.surfY[bi] != ShoreSnapshot.NO_SURFACE;
+			// Under falling water (every corner a full block) the surface is inside the waterfall.
+			if (surface && water && r.corners[bi * 4] >= 1 && r.corners[bi * 4 + 1] >= 1 && r.corners[bi * 4 + 2] >= 1 && r.corners[bi * 4 + 3] >= 1) continue;
 			float top = water ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[bi];
 			float y = top + (water ? 0.01f : 0.002f);
-			pos.set(wx, water ? r.waterY : r.waterY + 1 + r.level[bi], wz);
+			pos.set(wx, surface ? r.surfY[bi] : r.waterY + 1 + r.level[bi], wz);
 			int light = LightCoordsUtil.getLightCoords(lvl, pos);
-			if (water) light = LightCoordsUtil.max(light, LightCoordsUtil.getLightCoords(lvl, pos.above())); // as vanilla lights its surface
+			if (surface) light = LightCoordsUtil.max(light, LightCoordsUtil.getLightCoords(lvl, pos.above())); // as vanilla lights its surface
 			float u0 = bx * 16 * t, v0 = bz * 16 * t, u1 = (bx + 1) * 16 * t, v1 = (bz + 1) * 16 * t;
 			// Side quads stand SIDE_NUDGE off the block's sides and start at the top quad's height, so
 			// reach the top that far over every side that drops to a lower neighbour: no slit between.
-			float xa = wx - (water || !lowerSide(r, bx, bz, -1, 0, top) ? 0 : SIDE_NUDGE);
-			float xb = wx + 1 + (water || !lowerSide(r, bx, bz, 1, 0, top) ? 0 : SIDE_NUDGE);
-			float za = wz - (water || !lowerSide(r, bx, bz, 0, -1, top) ? 0 : SIDE_NUDGE);
-			float zb = wz + 1 + (water || !lowerSide(r, bx, bz, 0, 1, top) ? 0 : SIDE_NUDGE);
+			float xa = wx - (surface || !lowerSide(r, bx, bz, -1, 0, top) ? 0 : SIDE_NUDGE);
+			float xb = wx + 1 + (surface || !lowerSide(r, bx, bz, 1, 0, top) ? 0 : SIDE_NUDGE);
+			float za = wz - (surface || !lowerSide(r, bx, bz, 0, -1, top) ? 0 : SIDE_NUDGE);
+			float zb = wz + 1 + (surface || !lowerSide(r, bx, bz, 0, 1, top) ? 0 : SIDE_NUDGE);
 			// On water, follow vanilla's surface corner by corner (in its vertex order, so the quad splits
 			// into the same two triangles): flowing water slopes, and the sea dips a little by the shore.
 			float yNW = y, ySW = y, ySE = y, yNE = y;
-			if (water) {
-				float base = r.waterY + 0.01f;
+			if (surface) {
+				float base = r.surfY[bi] + 0.01f;
 				yNW = base + r.corners[bi * 4];
 				ySW = base + r.corners[bi * 4 + 1];
 				ySE = base + r.corners[bi * 4 + 2];
@@ -362,22 +367,27 @@ public final class FoamRenderer {
 			for (int[] b : band) {
 				int bx = b[0], bz = b[1], bi = bz * r.size + bx;
 				boolean water = isWaterColumn(r, bi);
-				if (!water && r.level[bi] > 0) continue;
+				if ((!water && r.level[bi] > 0) || r.low[bi]) continue;
 				float top = water ? r.waterY + 8f / 9f : r.topY[bi] + 1;
 				for (int dir = 0; dir < 4 && n < MAX_FACES; dir++) {
 					int dx = dir == 2 ? -1 : dir == 3 ? 1 : 0, dz = dir == 0 ? -1 : dir == 1 ? 1 : 0;
 					int nx = bx + dx, nz = bz + dz;
 					if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) continue;
 					int ni = nz * r.size + nx;
-					boolean nWater = isWaterColumn(r, ni);
-					float nTop = nWater ? r.waterY + 8f / 9f : r.topY[ni] + 1;
+					boolean nWater = isWaterColumn(r, ni), nLow = r.low[ni];
+					// Water beside: its surface where it meets this side (the lower of its two corners there).
+					float nTop = nWater || nLow ? edgeSurface(r, ni, -dx, -dz) : r.topY[ni] + 1;
 					int kind, h;
 					float yTop;
-					if (!nWater && r.level[ni] > 0 && nTop > top + 0.01f) {
+					if (!nWater && !nLow && r.level[ni] > 0 && nTop > top + 0.01f) {
 						kind = 2; // wall
 						h = Math.min(washPx, Math.round((nTop - top) * 16));
 						yTop = top + h / 16f;
-					} else if (!water && top - nTop >= 2 - 0.01f) {
+					} else if (water && nLow && top - nTop > 0.3f) {
+						kind = 5; // waterfall: the body's own water going over into lower water
+						h = Math.min(fallPx, Math.round((top - nTop) * 16));
+						yTop = top;
+					} else if (!water && (top - nTop >= 2 - 0.01f || (nLow && top - nTop > 0.3f))) {
 						kind = 1; // drop
 						h = Math.min(fallPx, Math.round((top - nTop) * 16));
 						yTop = top + 0.002f; // level with the top quad, which reaches over this side
@@ -398,7 +408,7 @@ public final class FoamRenderer {
 					data.putFloat(dx).putFloat(dz).putFloat(kind).putFloat(h);
 					int[] soundRow = {Math.round(ex), Math.round(ez), Math.round(sx), Math.round(sz), dx, dz, Math.round(top * 16)};
 					if (kind == 2) wallRows.add(soundRow);
-					else if (kind == 1) dropRows.add(soundRow);
+					else if (kind == 1 || kind == 5) dropRows.add(soundRow);
 					if (kind == 2) {
 						for (int u = 0; u < 16; u++)
 							feet.add(new Splashes.Foot((int) (ex + sx * u), (int) (ez + sz * u), dx, dz, top));
@@ -411,11 +421,11 @@ public final class FoamRenderer {
 					float yBot = yTop - h / 16f;
 					float u0 = col * 16f / FACE_TEX_W, u1 = (col + 1) * 16f / FACE_TEX_W;
 					float vT = row * (float) TILE_H / FACE_TEX_H, vB = (row * TILE_H + h) / (float) FACE_TEX_H;
-					// A wall rising out of the water starts where vanilla's surface meets it, which slopes
-					// where the water flows: the two surface corners on this side, at its west/north end (a)
-					// and its east/south end (b).
+					// A wall rising out of the water, or a waterfall, starts where vanilla's surface meets
+					// this side, which slopes where the water flows: the two surface corners on this side,
+					// at its west/north end (a) and its east/south end (b).
 					float da = 0, db = 0;
-					if (kind == 2 && water) {
+					if ((kind == 2 || kind == 5) && water) {
 						int ca = dz < 0 ? 0 : dz > 0 ? 1 : dx < 0 ? 0 : 3, cb = dz < 0 ? 3 : dz > 0 ? 2 : dx < 0 ? 1 : 2;
 						da = r.corners[bi * 4 + ca] - 8f / 9f;
 						db = r.corners[bi * 4 + cb] - 8f / 9f;
@@ -458,6 +468,13 @@ public final class FoamRenderer {
 		int ni = nz * r.size + nx;
 		float nTop = isWaterColumn(r, ni) ? r.waterY + 8f / 9f : r.waterY + 1 + r.level[ni];
 		return nTop < top - 0.01f;
+	}
+
+	/** A water column's surface height (blocks) along its side (sx, sz): the lower of the two corners there. */
+	private static float edgeSurface(ShoreRegion r, int bi, int sx, int sz) {
+		int ca = sz < 0 ? 0 : sz > 0 ? 1 : sx < 0 ? 0 : 3, cb = sz < 0 ? 3 : sz > 0 ? 2 : sx < 0 ? 1 : 2;
+		int base = r.surfY[bi] != ShoreSnapshot.NO_SURFACE ? r.surfY[bi] : r.waterY;
+		return base + Math.min(r.corners[bi * 4 + ca], r.corners[bi * 4 + cb]);
 	}
 
 	private static boolean isWaterColumn(ShoreRegion r, int bi) {

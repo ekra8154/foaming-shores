@@ -44,10 +44,17 @@ public final class ShoreRegion {
 	/** Whether each block column's surface is water at the region's water height (sea or pool). */
 	public final boolean[] water;
 	/**
-	 * Per column, the water surface's corner heights above topY as vanilla draws them (north-west,
-	 * south-west, south-east, north-east); meaningful for water columns only.
+	 * Per column, the water block whose surface it shows ({@link ShoreSnapshot#NO_SURFACE} for none:
+	 * the body's layer, a stream's top over land, a lower pool's top) and that surface's corner
+	 * heights above it as vanilla draws them (north-west, south-west, south-east, north-east).
 	 */
+	public final int[] surfY;
 	public final float[] corners;
+	/**
+	 * Water lower than the body's (a pit's pool, the foot of a waterfall): a drain. Fronts never
+	 * reach it; whatever reaches its edge pours in and is gone.
+	 */
+	public final boolean[] low;
 	/** Whether each block column is water that belongs to a body big enough to have waves. */
 	public final boolean[] sea;
 	/**
@@ -75,6 +82,8 @@ public final class ShoreRegion {
 		this.topY = snap.topY.clone();
 		this.water = new boolean[size * size];
 		this.corners = snap.corners.clone();
+		this.surfY = snap.surfY.clone();
+		this.low = new boolean[size * size];
 		this.sea = new boolean[size * size];
 		this.dipId = new short[size * size];
 		this.dipEntry = new float[samples * samples];
@@ -105,7 +114,9 @@ public final class ShoreRegion {
 			surfaceWater[i] = snap.water[i] && snap.topY[i] == waterY;
 			r.water[i] = surfaceWater[i];
 			int lv = surfaceWater[i] ? 0 : snap.topY[i] - waterY;
-			r.level[i] = (byte) Math.max(-4, Math.min(1, lv));
+			r.low[i] = snap.water[i] && snap.topY[i] < waterY;
+			// A lower pool is never stepped into, however shallow the step: as deep as a drop.
+			r.level[i] = (byte) (r.low[i] ? -4 : Math.max(-4, Math.min(1, lv)));
 		}
 		markBodies(r, surfaceWater, settings.minBodyBlocks());
 		buildFields(r, settings);

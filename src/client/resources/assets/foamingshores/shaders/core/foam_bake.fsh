@@ -18,8 +18,9 @@ uniform sampler2D Field2Sampler;
 // 256x256 tiling noise: r = front raggedness, g = lip width, b = foam lace.
 uniform sampler2D NoiseSampler;
 // Per face, two texels: (edge texel x, z, step x, z) in region texels, (out x, z, kind, height).
-// Kind 1 = drop, 3 = ledge over the sea, 4 = step down into a dip (edge texel on top of each);
-// 2 = wall (edge texel is the one at its foot).
+// Kind 1 = drop, 3 = ledge over the sea, 4 = step down into a dip, 5 = waterfall (the body's own
+// water going over into lower water: vanilla draws the water, only foam pours) (edge texel on top
+// of each); 2 = wall (edge texel is the one at its foot).
 uniform sampler2D FaceSampler;
 // Per field sample: (arrival at its dip's entry, 1 if in a dip, 1 if land too small to shape the
 // waves, -).
@@ -511,6 +512,7 @@ vec4 bakeFace(vec2 pixel) {
     vec4 d0 = texelFetch(FaceSampler, ivec2((face % 128) * 2, face / 128), 0);
     vec4 d1 = texelFetch(FaceSampler, ivec2((face % 128) * 2 + 1, face / 128), 0);
     int kind = int(d1.z + 0.5), h = int(d1.w + 0.5);
+    bool edgeKind = kind == 3 || kind == 4, pourKind = kind == 1 || kind == 5;
     if (row >= h) return vec4(0.0);
 
     vec2 texel = d0.xy + d0.zw * float(u);
@@ -552,11 +554,11 @@ vec4 bakeFace(vec2 pixel) {
         float xE = second ? f2E.z - f2E.w : xlE, xLo = second ? f2L.z - f2L.w : xlLow;
         Wave w = weaker(waveHere(i, texel, second ? f2E.w : dwE), second ? max(fadeE, 0.0) : 1.0);
         Wave wL = weaker(waveHere(i, lowTexel, second ? f2L.w : dwLow), second ? max(fadeL, 0.0) : 1.0);
-        if (T < (kind >= 3 ? min(w.tR0, wL.tR0) : w.tR0)) continue;
+        if (T < (edgeKind ? min(w.tR0, wL.tR0) : w.tR0)) continue;
         float Re, tCross, tLeave, tUnc;
         bool laid;
         bool reached = waveTimes(w, wt, xE, e, Re, tCross, tLeave, tUnc, laid);
-        if (kind >= 3) {
+        if (edgeKind) {
             // Ledge or step: this row's front times, between the edge's and the low side's.
             float ReL, tCrossL, tLeaveL, tUncL;
             bool laidL;
@@ -580,10 +582,10 @@ vec4 bakeFace(vec2 pixel) {
             if (T < w.tB0 && T < tC + 0.6 * max(0.0, tL - tC)) faceLip = true;
             continue;
         }
-        if (kind == 1) {
-            // Drop: water pours over from the moment the front reaches the edge until the wave stops
-            // pushing, or off a dip until the puddle at the edge has soaked away (thinner, as it is
-            // only settling). What is at this row now left the edge fallTime(row) ago. Not every
+        if (pourKind) {
+            // Drop or waterfall: water pours over from the moment the front reaches the edge until
+            // the wave stops pushing, or off a dip until the puddle at the edge has soaked away
+            // (thinner, as it is only settling). What is at this row now left the edge fallTime(row) ago. Not every
             // column pours, and each column's streak falls its own distance.
             float pStart = tCross, pEnd = w.tB0, tWetP, tDryP, pastP;
             if (edgeDip && !second && puddleTimes(w, wt, xlE, e, tWetP, tDryP, pastP)) {
@@ -638,11 +640,11 @@ vec4 bakeFace(vec2 pixel) {
     vec4 color = vec4(0.0);
     // A face dries from the top down.
     float wv = age < 1e8 ? max(0.0, 1.0 - age * (0.6 + 1.2 * fromBottom) / Look.x) : 0.0;
-    if (wv > 0.0) {
+    if (wv > 0.0 && kind != 5) {
         float q = wv + (bay - 0.5) * 0.34;
         color = over(vec4(0.0, 0.0, 0.0, Look.y * (q > 0.66 ? 1.0 : q > 0.2 ? 0.5 : 0.0)), color);
     }
-    if (flow > 0.0) {
+    if (flow > 0.0 && kind != 5) { // a waterfall's water is vanilla's own
         float q = flow + (bay - 0.5) * 0.3;
         vec4 w = waterFlow(u, row);
         color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.6 : 0.0)), color);
@@ -653,7 +655,7 @@ vec4 bakeFace(vec2 pixel) {
         if (faceFoam > 0.004 && fv > thr) color = vec4(fv > thr + (1.0 - thr) * 0.45 ? foamBright() : foamShadow(), 1.0);
         if (faceLip) color = vec4(foamBright(), 1.0);
     }
-    if (kind >= 3 && row == 0) {
+    if ((edgeKind || kind == 5) && row == 0) {
         vec4 top = texelFetch(RegionSampler, ivec2(texel), 0);
         if (top.a > 0.99) color = top; // foam is opaque; the sheet and wet sand are not
     }
