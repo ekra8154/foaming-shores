@@ -15,6 +15,18 @@ import java.util.ArrayDeque;
  * <li>{@code exposure}: 0..1, how much open water lies nearby; coves get smaller waves.</li>
  * <li>{@code level}: per block, the height of its top relative to the water surface in blocks
  *     (+1 wall and above, -1 dip, -4 drop and below, clamped), 0 for beach-level land and water.</li>
+ * <li>{@code waterline}: where each point's path from open water came ashore (the arrival at that
+ *     waterline; at sea, the point's own arrival). A front sweeps through all the water at the
+ *     wave's speed, round islands and up inlets, and a beach's run-up is timed and measured from its
+ *     own waterline. Blurred over land so run-up edges stay round.</li>
+ * <li>{@code far}: the arrival field blurred over many blocks at sea: fronts far out follow it, so
+ *     they run nearly straight and bend to the real coast as they come in.</li>
+ * <li>{@code cross}, {@code crossWaterline}: the second front where two meet (behind an island, over
+ *     a narrow spit): the arrival field keeps only the earlier, so their meeting line is a seam, and
+ *     this continues each front past it (and where it came ashore) so the two cross instead of
+ *     merging. UNREACHABLE where there is none.</li>
+ * <li>{@code isle}: per point, land too small to shape the waves: fronts ignore it and the foam
+ *     line runs over it; its shore only gets a wash.</li>
  * </ul>
  */
 public final class ShoreRegion {
@@ -41,6 +53,8 @@ public final class ShoreRegion {
 	 */
 	public final short[] dipId;
 	public final float[] dipEntry;
+	public final float[] waterline, far, cross, crossWaterline;
+	public final boolean[] isle;
 
 	private ShoreRegion(ShoreSnapshot snap, int waterY) {
 		this.originX = snap.originX;
@@ -58,9 +72,21 @@ public final class ShoreRegion {
 		this.sea = new boolean[size * size];
 		this.dipId = new short[size * size];
 		this.dipEntry = new float[samples * samples];
+		this.waterline = new float[n];
+		this.far = new float[n];
+		this.cross = new float[n];
+		this.crossWaterline = new float[n];
+		this.isle = new boolean[n];
 	}
 
-	public record Settings(int minBodyBlocks, float openWaterBlocks, float downhill, int smoothingTexels) {
+	/**
+	 * What the fields depend on. {@code runupReachTexels}: how far up a beach a wave can run (the
+	 * strip where crossing fronts matter on land); {@code wrapAngle}: how head-on (degrees) two
+	 * fronts must meet to cross; {@code minIsland}: land bodies smaller than this (blocks) do not
+	 * shape the waves.
+	 */
+	public record Settings(int minBodyBlocks, float openWaterBlocks, float downhill, int smoothingTexels,
+		float farSmoothBlocks, float wrapAngle, int minIsland, float runupReachTexels) {
 	}
 
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings) {
@@ -160,14 +186,23 @@ public final class ShoreRegion {
 		}
 		// Signed distance to the waterline, in texels.
 		float[] toSea = Fields.distanceTo(seaS, S, S), toLand = Fields.distanceTo(landS, S, S);
-		float[] raw = new float[n];
-		for (int p = 0; p < n; p++) {
-			float v = seaS[p] ? toLand[p] * tps - tps / 2 : -(toSea[p] * tps - tps / 2);
-			raw[p] = Math.max(-200, Math.min(200, v));
-		}
+		float[] raw = signed(seaS, toSea, toLand, n, tps);
 		int blurR = Math.max(0, Math.round(settings.smoothingTexels() / 2f / tps));
 		float[] shore = blurR > 0 ? Fields.boxBlur(Fields.boxBlur(raw, S, S, blurR), S, S, blurR) : raw;
 		System.arraycopy(shore, 0, r.shoreDist, 0, n);
+
+		// Small pieces of land (a lone block, a rock) do not shape the waves: the fronts' distance to
+		// the coast ignores them, so a wave passes them as a line instead of ringing each one. They
+		// still block the water. Land touching the region's edge may be bigger than it looks: kept.
+		int[] isleSize = smallIslands(r, settings.minIsland());
+		boolean[] seaW = new boolean[n], landW = new boolean[n];
+		for (int p = 0; p < n; p++) {
+			int bi = ((p / S) / RES) * size + (p % S) / RES;
+			r.isle[p] = isleSize[bi] > 0;
+			seaW[p] = seaS[p] || r.isle[p];
+			landW[p] = !seaW[p];
+		}
+		float[] rawW = signed(seaW, Fields.distanceTo(seaW, S, S), Fields.distanceTo(landW, S, S), n, tps);
 
 		// Arrival: waves start only in open water and travel through water from there. Water never
 		// steps up a level, never enters a wall or a drop of two or more, and runs further downhill.
@@ -175,16 +210,17 @@ public final class ShoreRegion {
 		double downCost = 1.0 / settings.downhill();
 		double[] cost = new double[n];
 		float widest = 0;
-		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, raw[p]);
+		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
 		float sourceAt = Math.min(open, widest * 0.9f);
-		for (int p = 0; p < n; p++) cost[p] = seaS[p] && raw[p] >= sourceAt ? -raw[p] : Fields.FAR;
-		Fields.dijkstra(cost, S, S, (p, q, diag) -> {
+		for (int p = 0; p < n; p++) cost[p] = seaS[p] && rawW[p] >= sourceAt ? -rawW[p] : Fields.FAR;
+		int[] pred = new int[n], order = new int[n];
+		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
 			if (seaS[q] && !seaS[p]) return -1;
 			int lp = lvl[p], lq = lvl[q];
 			if (lq > lp || lq > 0 || lq < -1) return -1;
 			double step = (diag ? Math.sqrt(2) : 1) * tps;
 			return lq < 0 ? step * downCost : step;
-		});
+		}, pred, order, null);
 		// Smooth only over points water can reach, so walls and drops stay sharp.
 		float[] a = new float[n], m = new float[n];
 		for (int p = 0; p < n; p++) if (cost[p] < Fields.FAR) { a[p] = (float) Math.max(-200, Math.min(200, -cost[p])); m[p] = 1; }
@@ -195,12 +231,186 @@ public final class ShoreRegion {
 		} else {
 			for (int p = 0; p < n; p++) r.arrival[p] = m[p] > 0 ? a[p] : UNREACHABLE;
 		}
+		float[] arr = r.arrival;
 
-		// Exposure: the largest sea distance within 4 blocks; narrow inlets score low.
+		// Which way the front travels at each point: the step from the previous point on its path,
+		// smoothed along the path.
+		float[] dirX = new float[n], dirY = new float[n];
+		for (int i = 0; i < settled; i++) {
+			int q = order[i], pp = pred[q];
+			if (pp < 0) continue;
+			float vx = (q % S) - (pp % S), vy = (q / S) - (pp / S), l0 = (float) Math.hypot(vx, vy);
+			vx /= l0;
+			vy /= l0;
+			if (dirX[pp] != 0 || dirY[pp] != 0) {
+				vx = 0.85f * dirX[pp] + 0.15f * vx;
+				vy = 0.85f * dirY[pp] + 0.15f * vy;
+			}
+			float l = (float) Math.hypot(vx, vy);
+			if (l == 0) l = 1;
+			dirX[q] = vx / l;
+			dirY[q] = vy / l;
+		}
+
+		// Waterline: at sea a point's own arrival; on land the arrival where its path came ashore.
+		float[] dW = r.waterline;
+		java.util.Arrays.fill(dW, UNREACHABLE);
+		for (int i = 0; i < settled; i++) {
+			int q = order[i];
+			if (arr[q] <= UNREACHABLE) continue;
+			if (seaS[q]) { dW[q] = arr[q]; continue; }
+			int pp = pred[q];
+			dW[q] = pp >= 0 && arr[pp] > UNREACHABLE ? (seaS[pp] ? arr[pp] : dW[pp]) : arr[q];
+		}
+		{
+			// Over land it comes from the blocky shoreline, so as it is the run-up would trace block
+			// edges: blur it over land, and leave an ordinary beach (a waterline within a few texels of
+			// where waves normally break) measured exactly as before.
+			int rr = Math.max(1, blurR);
+			float[] a3 = new float[n], m3 = new float[n];
+			for (int p = 0; p < n; p++) if (!seaS[p] && dW[p] > UNREACHABLE) { a3[p] = dW[p]; m3[p] = 1; }
+			float[] A3 = Fields.boxBlur(Fields.boxBlur(a3, S, S, rr), S, S, rr), M3 = Fields.boxBlur(Fields.boxBlur(m3, S, S, rr), S, S, rr);
+			for (int p = 0; p < n; p++) {
+				if (seaS[p] || dW[p] <= UNREACHABLE) continue;
+				dW[p] = Math.min(0, (M3[p] > 1e-4f ? A3[p] / M3[p] : dW[p]) + 8);
+			}
+		}
+
+		// Far field: the arrival blurred over farSmooth blocks, over land too (its signed distance)
+		// so the blur stays centred on the coast instead of being pulled out to sea.
+		{
+			int rr = Math.max(1, Math.round(settings.farSmoothBlocks() * 16f / 2f / tps));
+			float[] a2 = new float[n];
+			for (int p = 0; p < n; p++) a2[p] = arr[p] > UNREACHABLE ? arr[p] : Math.max(-200, r.shoreDist[p]);
+			float[] A2 = Fields.boxBlur(Fields.boxBlur(a2, S, S, rr), S, S, rr);
+			for (int p = 0; p < n; p++) r.far[p] = seaS[p] && arr[p] > UNREACHABLE ? A2[p] : arr[p];
+		}
+
+		crossing(r, settings, seaS, lvl, dirX, dirY);
+
+		// Exposure: the largest sea distance within 4 blocks; narrow inlets score low. A small
+		// island's own shore gets only a wash, smaller the smaller it is.
 		float[] clipped = new float[n];
-		for (int p = 0; p < n; p++) clipped[p] = Math.max(0, Math.min(64, raw[p]));
+		for (int p = 0; p < n; p++) clipped[p] = Math.max(0, Math.min(64, rawW[p]));
 		float[] mx = Fields.maxFilter(clipped, S, S, 4 * RES);
 		for (int p = 0; p < n; p++) mx[p] = Math.min(1, mx[p] / 40f);
 		System.arraycopy(Fields.boxBlur(mx, S, S, Math.max(1, RES / 2)), 0, r.exposure, 0, n);
+		for (int p = 0; p < n; p++) {
+			int k = isleSize[((p / S) / RES) * size + (p % S) / RES];
+			if (k > 0) r.exposure[p] = Math.min(r.exposure[p], 0.25f + 0.5f * k / settings.minIsland());
+		}
+	}
+
+	private static float[] signed(boolean[] sea, float[] toSea, float[] toLand, int n, float tps) {
+		float[] out = new float[n];
+		for (int p = 0; p < n; p++) {
+			float v = sea[p] ? toLand[p] * tps - tps / 2 : -(toSea[p] * tps - tps / 2);
+			out[p] = Math.max(-200, Math.min(200, v));
+		}
+		return out;
+	}
+
+	/** Per block, the size of its land body if smaller than {@code min} blocks and clear of the region's edge, else 0. */
+	private static int[] smallIslands(ShoreRegion r, int min) {
+		int size = r.size;
+		int[] out = new int[size * size];
+		boolean[] seen = new boolean[size * size];
+		ArrayDeque<Integer> queue = new ArrayDeque<>();
+		java.util.List<Integer> comp = new java.util.ArrayList<>();
+		for (int s0 = 0; s0 < size * size; s0++) {
+			if (seen[s0] || r.water[s0]) continue;
+			comp.clear();
+			queue.add(s0);
+			seen[s0] = true;
+			boolean edge = false;
+			while (!queue.isEmpty() && comp.size() <= min) {
+				int i = queue.poll();
+				comp.add(i);
+				int x = i % size, z = i / size;
+				if (x == 0 || z == 0 || x == size - 1 || z == size - 1) edge = true;
+				int[] nb = {x > 0 ? i - 1 : -1, x < size - 1 ? i + 1 : -1, z > 0 ? i - size : -1, z < size - 1 ? i + size : -1};
+				for (int j : nb) if (j >= 0 && !seen[j] && !r.water[j]) { seen[j] = true; queue.add(j); }
+			}
+			// A big body stops counting early; flood the rest of it so it is not mistaken for islands.
+			boolean big = !queue.isEmpty();
+			while (!queue.isEmpty()) {
+				int i = queue.poll();
+				int x = i % size, z = i / size;
+				int[] nb = {x > 0 ? i - 1 : -1, x < size - 1 ? i + 1 : -1, z > 0 ? i - size : -1, z < size - 1 ? i + size : -1};
+				for (int j : nb) if (j >= 0 && !seen[j] && !r.water[j]) { seen[j] = true; queue.add(j); }
+			}
+			if (!big && !edge && comp.size() < min) for (int i : comp) out[i] = comp.size();
+		}
+		return out;
+	}
+
+	/**
+	 * The second front. Seams are neighbouring points whose fronts travel in clearly different
+	 * directions (more than wrapAngle apart: converging, as where two fronts meet). From the seam each
+	 * front carries on into the other's side, as if the other were not there (Huygens' construction),
+	 * never back the way the water came, with the first front's rules for where water may go; on land
+	 * only within the strip a wave can run up. Each side of a seam starts the other side's front, with
+	 * the other side's waterline.
+	 */
+	private static void crossing(ShoreRegion r, Settings settings, boolean[] seaS, byte[] lvl, float[] dirX, float[] dirY) {
+		int S = r.samples, n = S * S;
+		float tps = TEXELS_PER_SAMPLE;
+		float[] arr = r.arrival, dW = r.waterline;
+		float reach = -settings.runupReachTexels();
+		double cos = Math.cos(Math.toRadians(settings.wrapAngle()));
+		boolean[] seam = new boolean[n];
+		float[] partW = new float[n];
+		// The second front's own travel direction: it starts as the other side's and carries on.
+		float[] d2x = new float[n], d2y = new float[n];
+		for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+			int p = y * S + x;
+			if (arr[p] <= UNREACHABLE || (dirX[p] == 0 && dirY[p] == 0) || (!seaS[p] && arr[p] - dW[p] < reach)) continue;
+			int[] qs = {x + 1 < S ? p + 1 : -1, y + 1 < S ? p + S : -1, x + 1 < S && y + 1 < S ? p + S + 1 : -1};
+			for (int q : qs) {
+				if (q < 0 || arr[q] <= UNREACHABLE || (dirX[q] == 0 && dirY[q] == 0) || seaS[p] != seaS[q]) continue;
+				if (!seaS[q] && arr[q] - dW[q] < reach) continue;
+				if (dirX[p] * dirX[q] + dirY[p] * dirY[q] < cos) {
+					seam[p] = true;
+					seam[q] = true;
+					partW[p] = dW[q];
+					partW[q] = dW[p];
+					d2x[p] = dirX[q];
+					d2y[p] = dirY[q];
+					d2x[q] = dirX[p];
+					d2y[q] = dirY[p];
+				}
+			}
+		}
+		double[] cost = new double[n];
+		for (int p = 0; p < n; p++) cost[p] = seam[p] ? -arr[p] : Fields.FAR;
+		int[] pred = new int[n], order = new int[n];
+		double maxLag = 12 * 16;
+		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
+			if (arr[q] <= UNREACHABLE || (seaS[q] && !seaS[p])) return -1;
+			int lp = lvl[p], lq = lvl[q];
+			if (lq > lp || lq > 0 || lq < -1) return -1;
+			if (!seaS[q] && arr[q] - dW[q] < reach) return -1;
+			int dx = (q % S) - (p % S), dy = (q / S) - (p / S);
+			double len = diag ? Math.sqrt(2) : 1;
+			// Never back the way this second front came (it may well run against the first front).
+			if ((dx * d2x[p] + dy * d2y[p]) / len < -0.3) return -1;
+			return len * tps;
+		}, pred, order, (p, q, nc) -> {
+			if (nc + arr[q] >= maxLag) return false;
+			float vx = (q % S) - (p % S), vy = (q / S) - (p / S), l0 = (float) Math.hypot(vx, vy);
+			float x = 0.85f * d2x[p] + 0.15f * vx / l0, y = 0.85f * d2y[p] + 0.15f * vy / l0, l = (float) Math.hypot(x, y);
+			d2x[q] = l > 0 ? x / l : 0;
+			d2y[q] = l > 0 ? y / l : 0;
+			return true;
+		});
+		java.util.Arrays.fill(r.cross, UNREACHABLE);
+		java.util.Arrays.fill(r.crossWaterline, UNREACHABLE);
+		for (int i = 0; i < settled; i++) {
+			int q = order[i], pp = pred[q];
+			float v = (float) -cost[q];
+			if (pp < 0) r.crossWaterline[q] = seaS[q] ? arr[q] : partW[q];
+			else r.crossWaterline[q] = seaS[q] ? v : seaS[pp] ? (float) -cost[pp] : r.crossWaterline[pp];
+			if (!seam[q]) r.cross[q] = Math.max(-200, Math.min(200, v));
+		}
 	}
 }

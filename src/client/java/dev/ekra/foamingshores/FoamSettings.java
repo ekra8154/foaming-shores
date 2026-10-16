@@ -38,6 +38,17 @@ public final class FoamSettings {
 	public float lull = 12f;
 	public float shelter = 0.75f;
 
+	// Swell
+	public float straight = 0.8f;
+	public float farSmooth = 10f;   // blocks
+	public float peel = 1.5f;       // seconds
+	public float peelScale = 18f;   // blocks
+	public float waveVary = 0.4f;
+	public float travelFade = 8f;   // blocks
+	public float wrap = 0.8f;
+	public float wrapLag = 5f;      // blocks
+	public float wrapAngle = 110f;  // degrees
+
 	// Wave edge
 	public float jag = 3f;          // texels
 	public int jagScale = 9;        // texels
@@ -73,6 +84,7 @@ public final class FoamSettings {
 	public float foamTint = 0.08f;
 
 	// Water bodies
+	public int minIsland = 10;      // blocks
 	public int minBody = 30;        // blocks
 	public float openWater = 2f;
 

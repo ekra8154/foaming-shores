@@ -21,7 +21,7 @@ public final class WaveSchedule {
 	/** Waves that set off at or before {@code time} and may still show (running, or leaving lace or wet sand). */
 	public static List<Wave> recent(double time, FoamSettings s, int max) {
 		double slot = slotLength(s);
-		double keep = s.waveDuration(1f) + Math.min(40, Math.max(s.dryTime, 8 * Math.max(s.laceWet, Math.max(s.laceDry, s.laceSea))));
+		double keep = s.waveDuration(1 + s.waveVary) + s.peel + s.travelFade / s.speed + Math.min(40, Math.max(s.dryTime, 8 * Math.max(s.laceWet, Math.max(s.laceDry, s.laceSea))));
 		long last = (long) Math.floor(time / slot);
 		long first = (long) Math.floor((time - keep) / slot) - 1;
 		List<Wave> out = new ArrayList<>();

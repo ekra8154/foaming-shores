@@ -37,6 +37,16 @@ public final class FoamConfigScreen {
 			new Opt("setSize", 1, 8, 1, "none"),
 			new Opt("lull", 0, 40, 1, "seconds"),
 			new Opt("shelter", 0, 1, 0.05f, "none"))),
+		new Group("swell", List.of(
+			new Opt("straight", 0, 1, 0.05f, "none"),
+			new Opt("farSmooth", 1, 24, 1, "blocks"),
+			new Opt("peel", 0, 4, 0.1f, "seconds"),
+			new Opt("peelScale", 4, 64, 1, "blocks"),
+			new Opt("waveVary", 0, 1, 0.05f, "none"),
+			new Opt("travelFade", 1, 24, 0.5f, "blocks"),
+			new Opt("wrap", 0, 1, 0.05f, "none"),
+			new Opt("wrapLag", 1, 12, 0.5f, "blocks"),
+			new Opt("wrapAngle", 30, 170, 5, "degrees"))),
 		new Group("edge", List.of(
 			new Opt("jag", 0, 10, 0.5f, "texels"),
 			new Opt("jagScale", 3, 40, 1, "texels"),
@@ -67,6 +77,7 @@ public final class FoamConfigScreen {
 			new Opt("sheetAlpha", 0, 1, 0.05f, "none"),
 			new Opt("foamTint", 0, 0.5f, 0.01f, "none"))),
 		new Group("bodies", List.of(
+			new Opt("minIsland", 1, 60, 1, "blocks"),
 			new Opt("minBody", 1, 200, 1, "blocks"),
 			new Opt("openWater", 0.5f, 4, 0.25f, "blocks_from_land"))),
 		new Group("sound", List.of(

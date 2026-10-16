@@ -90,6 +90,7 @@ public final class FoamRenderer {
 	private static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
 	private static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
+		.putVec4().putVec4().putVec4()
 		.get() + 16 * 2 * MAX_WAVES;
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
@@ -111,8 +112,8 @@ public final class FoamRenderer {
 	/** Chunks missing from the snapshot behind the current region, and behind the one being built. */
 	private Set<Long> missing = Set.of(), buildingMissing = Set.of();
 
-	private GpuTexture fieldTexture, noiseTexture, faceDataTexture, dipTexture;
-	private GpuTextureView fieldView, noiseView, faceDataView, dipView;
+	private GpuTexture fieldTexture, field2Texture, noiseTexture, faceDataTexture, dipTexture;
+	private GpuTextureView fieldView, field2View, noiseView, faceDataView, dipView;
 	private byte[] noiseBytes;
 	private RegionTexture output, faceOutput;
 	private MappableRingBuffer ubo, faceUbo;
@@ -147,7 +148,7 @@ public final class FoamRenderer {
 	 */
 	public void settingsChanged() {
 		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth",
-			"splashHeight", "fallFade")) {
+			"splashHeight", "fallFade", "farSmooth", "wrapAngle", "minIsland", "waveVary", "travelFade")) {
 			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
@@ -210,7 +211,8 @@ public final class FoamRenderer {
 			wantRebuild = false;
 			ShoreSnapshot snap = ShoreSnapshot.capture(lvl, px - REGION / 2, pz - REGION / 2, REGION);
 			buildingMissing = snap.missingChunks;
-			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing);
+			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing,
+				settings.farSmooth, settings.wrapAngle, settings.minIsland, settings.runup * 16 * (1 + settings.waveVary) + settings.jag + 4);
 			building = CompletableFuture.supplyAsync(() -> {
 				try {
 					ShoreRegion r = ShoreRegion.build(snap, rs);
@@ -246,15 +248,19 @@ public final class FoamRenderer {
 
 	/** Blocks whose top lies within reach of the waves, with the level they sit at. */
 	private List<int[]> bandBlocks(ShoreRegion r) {
-		float lo = -(settings.runup * 16 + settings.jag + 10), hi = settings.approach * 16 + settings.jag + settings.lipWidth * 2 + 10;
+		// Land is measured from its own waterline (up to the run-up's reach); the sea anywhere a
+		// travelling front still has some size left.
+		float lo = -(settings.runup * 16 * (1 + settings.waveVary) + settings.jag + 10), hi = settings.approach * 16 + settings.jag + settings.lipWidth * 2 + 10;
+		float fade = settings.travelFade * 16;
 		List<int[]> out = new ArrayList<>();
 		int S = r.samples, res = ShoreRegion.RES;
 		for (int bz = 0; bz < r.size; bz++) {
 			for (int bx = 0; bx < r.size; bx++) {
 				boolean hit = false;
 				for (int sz = 0; sz < res && !hit; sz++) for (int sx = 0; sx < res && !hit; sx++) {
-					float a = r.arrival[(bz * res + sz) * S + bx * res + sx];
-					hit = a >= lo && a <= hi;
+					int q = (bz * res + sz) * S + bx * res + sx;
+					float a = r.arrival[q], w = r.waterline[q];
+					hit = a > ShoreRegion.UNREACHABLE && a <= hi && a - w >= lo && w > -fade;
 				}
 				if (hit) out.add(new int[] {bx, bz});
 			}
@@ -277,11 +283,16 @@ public final class FoamRenderer {
 			}
 			buf.flip();
 			RenderSystem.getDevice().createCommandEncoder().writeToTexture(fieldTexture, buf, 0, 0, 0, 0, S, S);
+			// Fields 2: waterline, far field, crossing front, crossing front's waterline.
+			buf.clear();
+			for (int p = 0; p < S * S; p++) buf.putFloat(r.waterline[p]).putFloat(r.far[p]).putFloat(r.cross[p]).putFloat(r.crossWaterline[p]);
+			buf.flip();
+			RenderSystem.getDevice().createCommandEncoder().writeToTexture(field2Texture, buf, 0, 0, 0, 0, S, S);
 			// Dips: where each dip's water enters, and whether a sample is in a dip.
 			buf.clear();
 			for (int sz = 0; sz < S; sz++) for (int sx = 0; sx < S; sx++) {
 				int bi = (sz / ShoreRegion.RES) * r.size + sx / ShoreRegion.RES;
-				buf.putFloat(r.dipEntry[sz * S + sx]).putFloat(r.dipId[bi] >= 0 ? 1 : 0).putFloat(0).putFloat(0);
+				buf.putFloat(r.dipEntry[sz * S + sx]).putFloat(r.dipId[bi] >= 0 ? 1 : 0).putFloat(r.isle[sz * S + sx] ? 1 : 0).putFloat(0);
 			}
 			buf.flip();
 			RenderSystem.getDevice().createCommandEncoder().writeToTexture(dipTexture, buf, 0, 0, 0, 0, S, S);
@@ -439,6 +450,8 @@ public final class FoamRenderer {
 		int S = REGION * ShoreRegion.RES;
 		fieldTexture = device.createTexture("Foaming Shores fields", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, S, S, 1, 1);
 		fieldView = device.createTextureView(fieldTexture);
+		field2Texture = device.createTexture("Foaming Shores fields 2", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, S, S, 1, 1);
+		field2View = device.createTextureView(field2Texture);
 		dipTexture = device.createTexture("Foaming Shores dips", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, S, S, 1, 1);
 		dipView = device.createTextureView(dipTexture);
 		noiseTexture = device.createTexture("Foaming Shores noise", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM, FoamNoise.SIZE, FoamNoise.SIZE, 1, 1);
@@ -526,7 +539,13 @@ public final class FoamRenderer {
 				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1)
 				.putVec4(s.spill, s.fallFade, s.splashHeight, s.pile)
 				.putVec4(mode, faceCount, FACE_TEX_W, FACE_TEX_H)
-				.putVec4(water.stillX, water.stillY, water.flowX, water.flowY);
+				.putVec4(water.stillX, water.stillY, water.flowX, water.flowY)
+				.putVec4(s.straight, s.peel, s.peelScale, s.waveVary)
+				.putVec4(s.travelFade * 16, s.wrap, s.wrapLag * 16, 0);
+			// Where the region sits on the swell's noise lattice (whole cells and the fraction), so the
+			// shader works with small numbers however far out in the world the region is.
+			double lx = region.originX / (double) Math.max(1, s.peelScale), lz = region.originZ / (double) Math.max(1, s.peelScale);
+			b.putVec4((float) Math.floor(lx), (float) Math.floor(lz), (float) (lx - Math.floor(lx)), (float) (lz - Math.floor(lz)));
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {
 					WaveSchedule.Wave w = waves.get(i);
@@ -543,6 +562,7 @@ public final class FoamRenderer {
 			pass.setPipeline(pipeline);
 			pass.setUniform("FoamBake", buffer.currentBuffer());
 			pass.setUniform("FieldSampler", fieldView, nearest);
+			pass.setUniform("Field2Sampler", field2View, nearest);
 			pass.setUniform("NoiseSampler", noiseView, RenderSystem.getSamplerCache().getRepeat(FilterMode.NEAREST));
 			pass.setUniform("FaceSampler", faceDataView, nearest);
 			pass.setUniform("DipSampler", dipView, nearest);

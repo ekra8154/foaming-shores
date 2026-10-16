@@ -110,7 +110,19 @@ final class Fields {
 	 * q, or a negative number when the step is not allowed.
 	 */
 	static void dijkstra(double[] cost, int w, int h, Step step) {
+		dijkstra(cost, w, h, step, null, null, null);
+	}
+
+	/**
+	 * As {@link #dijkstra(double[], int, int, Step)}, also recording each point's predecessor on its
+	 * cheapest path ({@code pred}, -1 for sources and unreached points) and the order points settle
+	 * in ({@code order}); either may be null. {@code accept}, if not null, can refuse a new cost for a
+	 * point. Returns how many points settled.
+	 */
+	static int dijkstra(double[] cost, int w, int h, Step step, int[] pred, int[] order, Accept accept) {
 		int n = w * h;
+		if (pred != null) Arrays.fill(pred, -1);
+		int settled = 0;
 		int[] heap = new int[n], pos = new int[n];
 		boolean[] done = new boolean[n];
 		Arrays.fill(pos, -1);
@@ -122,6 +134,8 @@ final class Fields {
 			size--;
 			pos[p] = -1;
 			done[p] = true;
+			if (order != null) order[settled] = p;
+			settled++;
 			if (size > 0) {
 				heap[0] = heap[size];
 				pos[heap[0]] = 0;
@@ -141,17 +155,24 @@ final class Fields {
 				double c = step.cost(p, q, diag);
 				if (c < 0) continue;
 				double nc = cost[p] + c;
-				if (nc < cost[q]) {
+				if (nc < cost[q] && (accept == null || accept.accept(p, q, nc))) {
 					cost[q] = nc;
+					if (pred != null) pred[q] = p;
 					if (pos[q] < 0) { heap[size] = q; pos[q] = size; size++; siftUp(heap, pos, cost, size - 1); }
 					else siftUp(heap, pos, cost, pos[q]);
 				}
 			}
 		}
+		return settled;
 	}
 
 	interface Step {
 		double cost(int p, int q, boolean diagonal);
+	}
+
+	interface Accept {
+		/** Whether q may take {@code newCost} by way of p (if so, p becomes q's predecessor). */
+		boolean accept(int p, int q, double newCost);
 	}
 
 	private static void siftUp(int[] heap, int[] pos, double[] c, int i) {

@@ -20,7 +20,11 @@ import java.util.Map;
  */
 public final class ShoreSounds {
 	/** A point that makes sound: world position (blocks), the world texel it samples, arrival and exposure there. */
-	record Point(double x, double y, double z, int wx, int wz, float dp, float exposure) {
+	record Point(double x, double y, double z, int wx, int wz, float dp, float exposure, float waterline, double bx, double bz) {
+		/** Where the point is relative to its own waterline: 0 at sea, negative up the beach. */
+		float xl() {
+			return dp - waterline;
+		}
 	}
 
 	/** A wall face, drop face or dip: where it is heard from and the texels whose waves drive it. */
@@ -66,7 +70,7 @@ public final class ShoreSounds {
 	private static Point point(ShoreRegion r, int tx, int tz, double x, double y, double z) {
 		float[] f = WaveMath.fieldsAt(r, tx, tz);
 		if (f == null) return null; // a wall straight out of the sea: no beach for a wave to wash
-		return new Point(x, y, z, r.originX * 16 + tx, r.originZ * 16 + tz, f[0], f[1]);
+		return new Point(x, y, z, r.originX * 16 + tx, r.originZ * 16 + tz, f[0], f[1], f[2], r.originX + tx / 16.0, r.originZ + tz / 16.0);
 	}
 
 	/** Face rows are (edge x, edge z, step x, step z, out x, out z, top y); a wall's texels are at its foot. */
@@ -145,12 +149,14 @@ public final class ShoreSounds {
 		return true;
 	}
 
-	/** One wave's phases (seconds) and its run-up length (texels) before shelter. */
-	private record Phases(WaveSchedule.Wave w, double tR0, double Tu, double tB0, double tEnd, double Tb, float R) {
-		static Phases of(WaveSchedule.Wave w, FoamSettings s) {
-			double Ta = s.approach / s.speed, Tu = 2 * s.runup * w.amp() / s.speed;
-			double tR0 = w.t0() + Ta, tB0 = tR0 + Tu + s.stall;
-			return new Phases(w, tR0, Tu, tB0, tB0 + s.backwash, s.backwash, s.runup * 16 * w.amp());
+	/**
+	 * One wave as it is at one point (see {@link WaveMath#local}): its start and size there, its
+	 * phases (seconds) from the point's own waterline, and its run-up length (texels) before shelter.
+	 */
+	private record Phases(WaveSchedule.Wave w, double t0, double amp, double tR0, double Tu, double tB0, double tEnd, double Tb, float R) {
+		static Phases of(WaveSchedule.Wave w, Point p, FoamSettings s) {
+			WaveMath.Local l = WaveMath.local(w, p.bx(), p.bz(), p.waterline(), s);
+			return new Phases(w, l.t0(), l.amp(), l.tR0(), l.Tu(), l.tB0(), l.tEnd(), s.backwash, s.runup * 16 * l.amp());
 		}
 	}
 
@@ -169,11 +175,12 @@ public final class ShoreSounds {
 		t.jv = jv(ph.w(), p.wx(), p.wz(), s, noise);
 		t.Re = (float) (ph.R() * e);
 		double TuE = ph.Tu() * Math.min(1, e);
-		double uR = (t.jv - p.dp()) / t.Re;
+		if (t.Re <= 0) { t.reached = false; return; }
+		double uR = (t.jv - p.xl()) / t.Re;
 		t.reached = uR <= 1;
 		if (!t.reached) return;
 		t.tCross = uR <= 0 ? ph.tR0() : ph.tR0() + TuE * (1 - Math.sqrt(1 - uR));
-		double uL = (t.jv - p.dp() + s.lipWidth + 3) / t.Re;
+		double uL = (t.jv - p.xl() + s.lipWidth + 3) / t.Re;
 		t.laid = uL > 0;
 		t.tLeave = uL <= 1 ? ph.tR0() + TuE * (1 - Math.sqrt(1 - Math.max(0, uL))) : ph.tB0();
 	}
@@ -191,8 +198,8 @@ public final class ShoreSounds {
 		double[][] pw = new double[SurfSynth.LAYERS][2];
 		List<SurfSynth.Event> events = new ArrayList<>();
 		double washB = 0, washW = 0, cL = 0, cR = 0, cT = 0, cW = 0, cB = 0;
-		List<Phases> act = new ArrayList<>(waves.size());
-		for (WaveSchedule.Wave w : waves) if (w.t0() <= T) act.add(Phases.of(w, s));
+		List<WaveSchedule.Wave> act = new ArrayList<>(waves.size());
+		for (WaveSchedule.Wave w : waves) if (w.t0() <= T) act.add(w);
 		Gains far = new Gains(), near = new Gains(), g = new Gains();
 		Times t = new Times();
 
@@ -201,16 +208,18 @@ public final class ShoreSounds {
 			boolean heard = ear(ear, p.x(), p.y(), p.z(), range, near);
 			double e = 1 + (p.exposure() - 1) * s.shelter;
 			add(pw, SurfSynth.BED, far, 0.12 * e); // the sea is never quite silent
-			for (Phases ph : act) {
-				double amp = ph.w().amp();
+			for (WaveSchedule.Wave w : act) {
+				Phases ph = Phases.of(w, p, s);
+				if (T < ph.t0()) continue;
+				double amp = ph.amp();
 				// The distant roar swells as a wave comes in and dies away after it breaks.
-				double swell = T < ph.tR0() ? Math.pow(Math.max(0, (T - ph.w().t0()) / (ph.tR0() - ph.w().t0())), 2) : Math.exp(-(T - ph.tR0()) / 1.8);
+				double swell = T < ph.tR0() ? Math.pow(Math.max(0, (T - ph.t0()) / Math.max(1e-3, ph.tR0() - ph.t0())), 2) : Math.exp(-(T - ph.tR0()) / 1.8);
 				add(pw, SurfSynth.BED, far, 0.35 * amp * e * swell);
 				if (!heard) continue;
 				// It breaks as its front reaches the waterline here; the raggedness spreads that along the coast.
 				double tc = ph.tR0() - 0.15 - jv(ph.w(), p.wx(), p.wz(), s, noise) / (s.speed * 16);
 				if (tc > t0 && tc <= T) {
-					double a = amp * e * Math.min(1, Math.max(0, 1 + p.dp() / 16)); // well up an inlet it only washes in
+					double a = amp * e; // already smaller where it had to travel round to get here
 					if (a > 0) {
 						cL += sq(near.l * a);
 						cR += sq(near.r * a);
@@ -257,12 +266,13 @@ public final class ShoreSounds {
 			double energy = 0, when = Double.MAX_VALUE;
 			for (Point p : wall.texels()) {
 				double e = 1 + (p.exposure() - 1) * s.shelter;
-				for (Phases ph : act) {
+				for (WaveSchedule.Wave w : act) {
+					Phases ph = Phases.of(w, p, s);
 					if (T < ph.tR0()) continue;
 					times(ph, p, e, s, noise, t);
 					if (!t.reached || t.tCross <= t0 || t.tCross > T) continue;
 					count++;
-					energy = Math.max(energy, Math.sqrt(Math.min(1, Math.max(0, (p.dp() + t.Re) / t.Re))));
+					energy = Math.max(energy, Math.sqrt(Math.min(1, Math.max(0, (p.xl() + t.Re) / t.Re))));
 					when = Math.min(when, t.tCross);
 				}
 			}
@@ -280,7 +290,8 @@ public final class ShoreSounds {
 			int pouring = 0;
 			for (Point p : drop.texels()) {
 				double e = 1 + (p.exposure() - 1) * s.shelter;
-				for (Phases ph : act) {
+				for (WaveSchedule.Wave w : act) {
+					Phases ph = Phases.of(w, p, s);
 					if (T < ph.tR0() || T > ph.tB0()) continue;
 					times(ph, p, e, s, noise, t);
 					if (t.reached && T >= t.tCross) {
@@ -300,10 +311,11 @@ public final class ShoreSounds {
 			for (Point p : dip.texels()) {
 				double e = 1 + (p.exposure() - 1) * s.shelter;
 				boolean pointWet = false;
-				for (Phases ph : act) {
+				for (WaveSchedule.Wave w : act) {
+					Phases ph = Phases.of(w, p, s);
 					if (T < ph.tR0()) continue;
 					// The puddle reaches a little past the wave and soaks away over about the soak time.
-					double past = (jv(ph.w(), p.wx(), p.wz(), s, noise) - ph.R() * e) - p.dp();
+					double past = (jv(ph.w(), p.wx(), p.wz(), s, noise) - ph.R() * e) - p.xl();
 					if (past > s.puddleSpread) continue;
 					if (T >= ph.tB0() && T < ph.tB0() + s.soak * 0.65) pointWet = true;
 					if (!pour && T < ph.tB0()) {

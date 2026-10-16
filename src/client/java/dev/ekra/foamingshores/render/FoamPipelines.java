@@ -16,6 +16,7 @@ public final class FoamPipelines {
 	public static final BindGroupLayout BAKE_LAYOUT = BindGroupLayout.builder()
 		.withUniform("FoamBake", UniformType.UNIFORM_BUFFER)
 		.withUniform("FieldSampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("Field2Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("NoiseSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("FaceSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("DipSampler", UniformType.COMBINED_IMAGE_SAMPLER)

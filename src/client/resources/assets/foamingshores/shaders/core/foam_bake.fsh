@@ -11,13 +11,18 @@
 // Per field sample (4 per block): arrival, shore distance (both in texels), exposure, and the
 // block's level (-4..1 for land, 8 for a pool, 9 for sea water).
 uniform sampler2D FieldSampler;
+// Per field sample: where its water came ashore (the arrival at that waterline; at sea its own
+// arrival), the far field (arrival blurred over many blocks), the crossing front's arrival and that
+// front's waterline (-1000 where there is none).
+uniform sampler2D Field2Sampler;
 // 256x256 tiling noise: r = front raggedness, g = lip width, b = foam lace.
 uniform sampler2D NoiseSampler;
 // Per face, two texels: (edge texel x, z, step x, z) in region texels, (out x, z, kind, height).
 // Kind 1 = drop, 3 = ledge over the sea, 4 = step down into a dip (edge texel on top of each);
 // 2 = wall (edge texel is the one at its foot).
 uniform sampler2D FaceSampler;
-// Per field sample in a dip: (arrival at the dip's entry, 1, -, -); (-, 0, -, -) elsewhere.
+// Per field sample: (arrival at its dip's entry, 1 if in a dip, 1 if land too small to shape the
+// waves, -).
 uniform sampler2D DipSampler;
 // Vanilla's block atlas: the sheet is drawn with the water textures, animated by vanilla.
 uniform sampler2D AtlasSampler;
@@ -36,6 +41,9 @@ layout(std140) uniform FoamBake {
     vec4 Terrain;  // spill over drops, falling foam reach (texels), splash height (texels), foam piling
     vec4 Mode;     // mode, face count, face texture width, face texture height
     vec4 Sprites;  // atlas texel origin of water_still (x, y) and of water_flow (x, y)
+    vec4 Swell;    // straighter fronts at sea, peel (s), peel scale (blocks), waves differ along the coast
+    vec4 Swell2;   // travel fade (texels), crossing strength, crossing fades within (texels), -
+    vec4 SwellOrigin; // region origin on the swell's noise lattice: whole cells (x, z), fraction (x, z)
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -84,6 +92,46 @@ vec4 fieldsAt(vec2 texel) {
     return v;
 }
 
+// The second field texture at a region texel, each channel blended only over samples where it is
+// defined (waterline and far field where water reaches, the crossing pair where it exists).
+vec4 fields2At(vec2 texel) {
+    float perSample = 16.0 / Region.y;
+    vec2 s = (texel + 0.5) / perSample - 0.5;
+    int n = int(Region.z);
+    ivec2 i = clamp(ivec2(floor(s)), ivec2(0), ivec2(n - 2));
+    vec2 f = clamp(s - vec2(i), 0.0, 1.0);
+    vec4 w = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+    vec4 a = texelFetch(Field2Sampler, i, 0), b = texelFetch(Field2Sampler, i + ivec2(1, 0), 0);
+    vec4 c = texelFetch(Field2Sampler, i + ivec2(0, 1), 0), d = texelFetch(Field2Sampler, i + ivec2(1, 1), 0);
+    vec4 reach = vec4(texelFetch(FieldSampler, i, 0).x > UNREACHABLE, texelFetch(FieldSampler, i + ivec2(1, 0), 0).x > UNREACHABLE,
+                      texelFetch(FieldSampler, i + ivec2(0, 1), 0).x > UNREACHABLE, texelFetch(FieldSampler, i + ivec2(1, 1), 0).x > UNREACHABLE);
+    vec4 out4 = vec4(-1000.0);
+    vec4 w1 = w * reach;
+    float s1 = w1.x + w1.y + w1.z + w1.w;
+    if (s1 > 0.0) out4.xy = (a.xy * w1.x + b.xy * w1.y + c.xy * w1.z + d.xy * w1.w) / s1;
+    vec4 w2 = w * vec4(a.z > UNREACHABLE && a.w > UNREACHABLE, b.z > UNREACHABLE && b.w > UNREACHABLE,
+                       c.z > UNREACHABLE && c.w > UNREACHABLE, d.z > UNREACHABLE && d.w > UNREACHABLE);
+    float s2 = w2.x + w2.y + w2.z + w2.w;
+    if (s2 > 0.0) out4.zw = (a.zw * w2.x + b.zw * w2.y + c.zw * w2.z + d.zw * w2.w) / s2;
+    return out4;
+}
+
+// How much of a wave is left after travelling past where it would normally break (a waterline
+// below 0: round an island, up an inlet).
+float travelLeft(float waterline) {
+    return waterline >= 0.0 ? 1.0 : max(0.0, 1.0 + waterline / Swell2.x);
+}
+
+// Smooth value noise on an integer lattice: base + floor(p) are the lattice cells (whole numbers
+// passed separately so the shader never handles large world coordinates).
+float vnoise(ivec2 base, vec2 p, int seed) {
+    vec2 fl = floor(p), f = p - fl;
+    f = f * f * (3.0 - 2.0 * f);
+    ivec2 i = base + ivec2(fl);
+    float a = hash3(i.x, i.y, seed), b = hash3(i.x + 1, i.y, seed), c = hash3(i.x, i.y + 1, seed), d = hash3(i.x + 1, i.y + 1, seed);
+    return a + (b - a) * f.x + (c - a) * f.y + (a - b - c + d) * f.x * f.y;
+}
+
 float levelAt(vec2 texel) {
     float n = Region.x;
     if (texel.x < 0.0 || texel.y < 0.0 || texel.x >= n || texel.y >= n) return 0.0;
@@ -116,26 +164,48 @@ vec4 waterFlow(int u, int row) {
     return vec4(t.rgb * Water.rgb, t.a);
 }
 
-// One wave's timing (seconds), shared by both modes.
+// One wave as it is at one texel (seconds; distances in texels).
 struct Wave {
     float t0, amp, Ta, Tu, tR0, tB0, tEnd;
+    float att;  // how much is left after travelling round to get here
+    float Fa;   // where the approaching front is now, in arrival units (it keeps going through all water)
+    float prog; // 0..1 through the approach
     ivec2 front, lace, lip;
 };
 
-Wave waveAt(int i) {
+// Wave i at a region texel whose water came ashore at arrival `waterline`. Each wave carries two
+// smooth fields over the world: how late it reaches each stretch of coast (0..peel seconds) and how
+// big it is there, so it breaks along the beach instead of everywhere at once. Its run-up starts
+// when the front reaches this texel's own waterline; a waterline further out than the approach
+// distance is reached as soon as the wave appears.
+Wave waveHere(int i, vec2 texel, float waterline) {
     vec4 A = Waves[2 * i], B = Waves[2 * i + 1];
     Wave w;
-    w.t0 = A.x;
-    w.amp = A.y;
-    w.Ta = Motion.x / Motion.z;
-    w.Tu = 2.0 * Motion.y * w.amp / Motion.z;
-    w.tR0 = w.t0 + w.Ta;
-    w.tB0 = w.tR0 + w.Tu + Motion.w;
-    w.tEnd = w.tB0 + Motion2.x;
     w.front = ivec2(A.zw);
     w.lace = ivec2(B.xy);
     w.lip = ivec2(B.zw);
+    vec2 pc = SwellOrigin.zw + texel / (16.0 * max(1.0, Swell.z));
+    ivec2 base = ivec2(SwellOrigin.xy);
+    float delay = Swell.y * vnoise(base, pc, 7001 + w.front.x * 131 + w.front.y);
+    float size = max(0.15, 1.0 + Swell.w * (2.0 * vnoise(base, pc, 7013 + w.lace.x * 131 + w.lace.y) - 1.0));
+    w.att = travelLeft(waterline);
+    w.t0 = A.x + delay;
+    w.amp = A.y * size * w.att;
+    w.Ta = Motion.x / Motion.z;
+    w.Tu = 2.0 * Motion.y * w.amp / Motion.z;
+    w.tR0 = w.t0 + max(0.0, Motion.x - waterline) / Motion.z;
+    w.tB0 = w.tR0 + w.Tu + Motion.w;
+    w.tEnd = w.tB0 + Motion2.x;
+    w.prog = clamp((Origin.z - w.t0) / w.Ta, 0.0, 1.0);
+    w.Fa = Motion.x - Motion.z * (Origin.z - w.t0);
     return w;
+}
+
+// Where a texel's water came ashore: at sea the texel itself.
+float waterlineAt(vec2 texel, float dp) {
+    float perSample = 16.0 / Region.y;
+    float L = texelFetch(FieldSampler, ivec2(floor((texel + 0.5) / perSample)), 0).w;
+    return L > 8.5 ? dp : fields2At(texel).x;
 }
 
 // Closed-form history of a wave at a texel: when its front reached the texel, when the lip
@@ -188,16 +258,34 @@ vec4 bakeTop(vec2 texel) {
     vec4 fields = fieldsAt(texel);
     float dp = fields.x, sd = fields.y, expo = fields.z;
     float perSample = 16.0 / Region.y;
-    float L = texelFetch(FieldSampler, ivec2(floor((texel + 0.5) / perSample)), 0).w;
-    bool isWater = L > 7.5;
+    ivec2 smp = ivec2(floor((texel + 0.5) / perSample));
+    float L = texelFetch(FieldSampler, smp, 0).w;
+    bool isWater = L > 7.5, isSea = L > 8.5;
     float level = isWater ? 0.0 : L;
     float bay = bayerAt(wt);
+    vec4 dipInfo = texelFetch(DipSampler, smp, 0);
+    bool isle = dipInfo.z > 0.5;
 
+    // Where this texel's water came ashore, and where it is relative to that: 0 at sea, negative up
+    // the beach. A front sweeps through all the water, so the sea anywhere it still has some size
+    // left takes part; land only within the run-up's reach of its own waterline.
+    vec4 f2 = fields2At(texel);
+    float dwl = isSea ? dp : f2.x;
+    float xl = dp - dwl;
     float lipW = Shape.x, jag = Shape.y, offshore = Shape.z, thr = 1.0 - Shape.w;
     float approach = Motion.x, runup = Motion.y;
-    float lo = -(runup + jag + 10.0), hi = approach + jag + lipW * 2.0 + 10.0;
-    if (dp < lo || dp > hi) return vec4(0.0);
+    float lo = -(runup * (1.0 + Swell.w) + jag + 10.0), hi = approach + jag + lipW * 2.0 + 10.0;
+    if (dp <= UNREACHABLE || dp > hi || xl < lo || travelLeft(dwl) <= 0.0) return vec4(0.0);
     float e = 1.0 + (expo - 1.0) * Look.w;
+
+    // Out at sea a front follows the far field, nearly straight; it bends to the coast's real shape
+    // as it comes in. The crossing front is shifted the same way so the two meet at the seam.
+    float dA = dp > 0.0 ? dp + (f2.y - dp) * min(1.0, dp / approach) * Swell.x : dp;
+    float d2v = f2.z, dA2 = d2v > UNREACHABLE ? d2v + (dA - dp) : -1000.0;
+    float wrapFade = dA2 > UNREACHABLE ? Swell2.y * (1.0 - (dp - d2v) / Swell2.z) : 0.0;
+    // The crossing front over land: from its own waterline, fading as it falls behind the first.
+    float xl2 = !isSea && d2v > UNREACHABLE && f2.w > UNREACHABLE ? d2v - f2.w : 1e9;
+    float fade2 = xl2 < 1e8 ? Swell2.y * (1.0 - (dp - d2v) / Swell2.z) : 0.0;
 
     // Beach-level texels within 2 of a raised block: foam piles here while a wave pushes.
     bool nearWall = false;
@@ -210,44 +298,71 @@ vec4 bakeTop(vec2 texel) {
 
     // In a dip, water that ran in cannot drain back uphill over the rim. Its backwash is the puddle
     // (see puddleTimes), which soaks away where it lies.
-    vec4 dipInfo = texelFetch(DipSampler, ivec2(floor((texel + 0.5) / perSample)), 0);
     bool isDip = !isWater && abs(level + 1.0) < 0.5 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
     float soak = max(0.1, Motion2.z);
 
     bool cov = false, edge = false, swell = false, pushing = false, covPuddle = false;
-    float covF = 0.0, foam = 0.0, lastUnc = -1e9, puddleTh = 0.0;
+    float covF = 0.0, foam = 0.0, lastUnc = -1e9, puddleTh = 0.0, th2 = 0.0;
     int lip = 0;
     int waveCount = int(Origin.w);
     for (int i = 0; i < waveCount; i++) {
-        Wave w = waveAt(i);
-        float tau = T - w.t0;
-        if (tau < 0.0) continue;
+        // The second run-up first: waveHere returns a fresh struct, but keep the two apart anyway.
+        if (fade2 > 0.0) {
+            Wave w2 = waveHere(i, texel, f2.w);
+            if (T >= w2.tR0 && T < w2.tEnd) {
+                float Re2 = runup * w2.amp * e * fade2, jv2 = (noiseAt(0, wt + w2.front) - 0.5) * 2.0 * jag;
+                float TuE2 = w2.Tu * min(1.0, e), F2;
+                bool backwash2 = T >= w2.tB0;
+                if (!backwash2) {
+                    float kk = min(1.0, (T - w2.tR0) / max(0.001, TuE2));
+                    F2 = -Re2 * (1.0 - (1.0 - kk) * (1.0 - kk)) + jv2;
+                } else {
+                    float k = (T - w2.tB0) / Motion2.x;
+                    F2 = -Re2 + (Re2 + 6.0) * k * k + jv2 * 0.7;
+                }
+                if (xl2 >= F2) {
+                    th2 = max(th2, (xl2 - F2) / max(1.0, -F2));
+                    float lw2 = lipW * (0.6 + 0.8 * noiseAt(1, wt + w2.lip));
+                    if (!backwash2 && xl2 < F2 + lw2 && bay < fade2 + 0.2) lip = max(lip, xl2 - F2 < lw2 * 0.55 ? 2 : 1);
+                    if (backwash2 && xl2 - F2 < 1.5) edge = true;
+                }
+            }
+            float Rx, tCx, tLx, tUx;
+            bool laidx;
+            if (waveTimes(w2, wt, xl2, e, Rx, tCx, tLx, tUx, laidx) && T >= tUx) lastUnc = max(lastUnc, tUx);
+        }
+
+        Wave w = waveHere(i, texel, dwl);
+        if (T < w.t0) continue;
         float jv = (noiseAt(0, wt + w.front) - 0.5) * 2.0 * jag;
         float lw = lipW * (0.6 + 0.8 * noiseAt(1, wt + w.lip));
         float Re = runup * w.amp * e;
 
-        if (tau < w.Ta) {
-            // Coming in: a foam line sweeping toward the shore, sparse far out.
-            float prog = tau / w.Ta;
-            float F = approach * (1.0 - prog) + jv;
-            if (dp >= F) {
-                if (dp < F + lw) {
-                    float dens = (offshore + (1.0 - offshore) * pow(prog, 1.5)) * e;
-                    if (bay < dens) lip = max(lip, dp - F < lw * 0.55 ? 2 : 1);
-                } else if (dp < F + lw + 5.0 && isWater) swell = true;
+        if (isSea || isle) {
+            // At sea (and over land too small to matter): the approaching foam line, sweeping on
+            // through all the water, sparse far out and fading as it travels.
+            float F = w.Fa + jv;
+            float dens = (offshore + (1.0 - offshore) * pow(w.prog, 1.5)) * e * w.att;
+            if (dA >= F) {
+                if (dA < F + lw) {
+                    if (bay < dens) lip = max(lip, dA - F < lw * 0.55 ? 2 : 1);
+                } else if (dA < F + lw + 5.0 && isWater) swell = true;
             }
-            continue;
+            // The second front crossing it: a thinner line, fading as it falls behind.
+            if (wrapFade > 0.0 && dA2 >= F && dA2 < F + lw * 0.8 && bay < dens * wrapFade) lip = max(lip, dA2 - F < lw * 0.4 ? 2 : 1);
         }
+        if (T < w.tR0) continue;
 
-        // Where the wave is now. A sheltered spot's run-up is shorter and ends proportionally
-        // sooner, so the front leaves the shore at the speed it arrived everywhere.
+        // Where the wave is now, on the beach (measured from this texel's own waterline). A
+        // sheltered spot's run-up is shorter and ends proportionally sooner, so the front leaves
+        // the shore at the speed it arrived everywhere.
         float TuE = w.Tu * min(1.0, e);
-        if (T < w.tEnd) {
+        if (!isSea && T < w.tEnd) {
             float F;
             int ph;
             float lipScale = 1.0;
             if (T < w.tR0 + w.Tu) {
-                float kk = min(1.0, (tau - w.Ta) / TuE);
+                float kk = min(1.0, (T - w.tR0) / max(0.001, TuE));
                 F = -Re * (1.0 - (1.0 - kk) * (1.0 - kk)) + jv;
                 ph = 1;
             } else if (T < w.tB0) {
@@ -259,23 +374,23 @@ vec4 bakeTop(vec2 texel) {
                 F = -Re + (Re + 6.0) * k * k + jv * 0.7;
                 ph = 3;
             }
-            if (dp >= F && !(isDip && ph == 3)) {
+            if (xl >= F && !(isDip && ph == 3)) {
                 cov = true;
                 covF = F;
                 if (ph < 3) {
                     pushing = true;
                     float lw2 = lw * lipScale;
-                    if (dp < F + lw2) lip = max(lip, dp - F < lw2 * 0.55 ? 2 : 1);
-                } else if (dp - F < 1.5 && !isWater) edge = true;
+                    if (xl < F + lw2) lip = max(lip, xl - F < lw2 * 0.55 ? 2 : 1);
+                } else if (xl - F < 1.5 && !isWater) edge = true;
             }
         }
 
         float ReT, tCross, tLeave, tUnc;
         bool laid;
-        bool reached = waveTimes(w, wt, dp, e, ReT, tCross, tLeave, tUnc, laid);
+        bool reached = waveTimes(w, wt, xl, e, ReT, tCross, tLeave, tUnc, laid);
         if (isDip) {
             float tWet, tDry, past;
-            if (puddleTimes(w, wt, dp, e, tWet, tDry, past)) {
+            if (puddleTimes(w, wt, xl, e, tWet, tDry, past)) {
                 tUnc = tDry; // lace laid here fades under the puddle until it has soaked away
                 if (T >= tWet && T < tDry) {
                     covPuddle = true;
@@ -291,7 +406,8 @@ vec4 bakeTop(vec2 texel) {
         if (!reached || T < tCross) continue;
         if (T >= tUnc) lastUnc = max(lastUnc, tUnc);
         float lv = 0.0, tDep = 0.0;
-        if (dp < 10.0 && laid) {
+        // At sea only the water right by the shore carries lace.
+        if ((isSea ? sd < 10.0 : true) && laid) {
             ivec2 s = wt;
             if (Lace.w > 0.0 && abs(level) < 0.5 && T > w.tB0) {
                 // The backwash drags lace seaward: read the pattern from further up the beach.
@@ -299,7 +415,7 @@ vec4 bakeTop(vec2 texel) {
                               arrivalAt(texel + vec2(0.0, 1.0)) - arrivalAt(texel - vec2(0.0, 1.0)));
                 float gradLen = length(g);
                 if (gradLen > 0.0 && gradLen < 100.0) {
-                    float gg = 0.6 + 0.8 * clamp(1.0 + dp / max(1.0, ReT), 0.0, 1.0);
+                    float gg = 0.6 + 0.8 * clamp(1.0 + xl / max(1.0, ReT), 0.0, 1.0);
                     float D = Lace.w * gg * (min(T, tUnc) - w.tB0);
                     s = wt - ivec2(round(g / gradLen * D));
                 }
@@ -335,22 +451,22 @@ vec4 bakeTop(vec2 texel) {
 
     bool pile = false;
     if (nearWall && pushing) {
-        float pressure = clamp((dp - covF) / 6.0, 0.0, 1.0);
+        float pressure = clamp((xl - covF) / 6.0, 0.0, 1.0);
         pile = bay < pressure * Terrain.w;
     }
 
     vec4 color = vec4(0.0);
     if (!isWater) {
         // Wet sand: a dark film, so it darkens whatever block is underneath.
-        float wv = (cov || covPuddle || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
+        float wv = (cov || covPuddle || th2 > 0.0 || (abs(level) < 0.5 && sd > -2.5)) ? 1.0 : max(0.0, 1.0 - (T - lastUnc) / Look.x);
         if (wv > 0.0) {
             float q = wv + (bay - 0.5) * 0.34;
             color = over(vec4(0.0, 0.0, 0.0, Look.y * (q > 0.66 ? 1.0 : q > 0.2 ? 0.5 : 0.0)), color);
         }
-        if (cov || covPuddle) {
+        if (cov || covPuddle || th2 > 0.0) {
             // The sheet: shallow water, nearly opaque where it leaves the sea, thinning in dithered
             // steps toward its edge. A puddle thins as it soaks away.
-            float th = max(cov ? (dp - covF) / max(1.0, -covF) : 0.0, covPuddle ? puddleTh : 0.0);
+            float th = max(max(cov ? (xl - covF) / max(1.0, -covF) : 0.0, covPuddle ? puddleTh : 0.0), th2);
             float q = th + (bay - 0.5) * 0.3;
             vec4 w = waterStill(wt);
             color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.7 : 0.45)), color);
@@ -388,6 +504,7 @@ vec4 bakeFace(vec2 pixel) {
     float T = Origin.z;
     vec4 fields = fieldsAt(texel);
     float dp = fields.x, e = 1.0 + (fields.z - 1.0) * Look.w;
+    float dwE = waterlineAt(texel, dp), xlE = dp - dwE;
     float bay = bayerAt(ivec2(u, row));
     float fromBottom = float(h - 1 - row) / max(1.0, float(h - 1)); // 0 at the bottom, 1 at the top
     float flow = 0.0, age = 1e9, faceFoam = 0.0;
@@ -402,22 +519,24 @@ vec4 bakeFace(vec2 pixel) {
     bool lowOk = lowFields.x > UNREACHABLE;
     ivec2 wtLow = ivec2(Origin.xy) + ivec2(lowTexel);
     float eLow = 1.0 + (lowFields.z - 1.0) * Look.w;
+    float dwLow = lowOk ? waterlineAt(lowTexel, lowFields.x) : 0.0, xlLow = lowFields.x - dwLow;
     float rowFrac = float(row + 1) / float(max(1, h));
     // A drop off a dip's floor keeps pouring while the puddle above reaches its edge.
     vec4 dipInfo = texelFetch(DipSampler, ivec2(floor((texel + 0.5) / (16.0 / Region.y))), 0);
     bool edgeDip = kind == 1 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
 
     for (int i = 0; i < waveCount; i++) {
-        Wave w = waveAt(i);
-        if (T < w.tR0) continue;
+        Wave w = waveHere(i, texel, dwE);
+        Wave wL = waveHere(i, lowTexel, dwLow);
+        if (T < (kind >= 3 ? min(w.tR0, wL.tR0) : w.tR0)) continue;
         float Re, tCross, tLeave, tUnc;
         bool laid;
-        bool reached = waveTimes(w, wt, dp, e, Re, tCross, tLeave, tUnc, laid);
+        bool reached = waveTimes(w, wt, xlE, e, Re, tCross, tLeave, tUnc, laid);
         if (kind >= 3) {
             // Ledge or step: this row's front times, between the edge's and the low side's.
             float ReL, tCrossL, tLeaveL, tUncL;
             bool laidL;
-            bool reachedL = lowOk && waveTimes(w, wtLow, lowFields.x, eLow, ReL, tCrossL, tLeaveL, tUncL, laidL);
+            bool reachedL = lowOk && waveTimes(wL, wtLow, xlLow, eLow, ReL, tCrossL, tLeaveL, tUncL, laidL);
             if (!reached && !reachedL) continue;
             float tC = reached && reachedL ? mix(tCross, tCrossL, rowFrac) : reached ? tCross : tCrossL;
             float tL = reached && reachedL ? mix(tLeave, tLeaveL, rowFrac) : reached ? tLeave : tLeaveL;
@@ -443,7 +562,7 @@ vec4 bakeFace(vec2 pixel) {
             // only settling). What is at this row now left the edge fallTime(row) ago. Not every
             // column pours, and each column's streak falls its own distance.
             float pStart = tCross, pEnd = w.tB0, tWetP, tDryP, pastP;
-            if (edgeDip && puddleTimes(w, wt, dp, e, tWetP, tDryP, pastP)) {
+            if (edgeDip && puddleTimes(w, wt, xlE, e, tWetP, tDryP, pastP)) {
                 pEnd = tDryP;
                 if (!reached) pStart = tWetP;
             } else if (!reached) continue;
@@ -466,7 +585,7 @@ vec4 bakeFace(vec2 pixel) {
         if (!reached || T < tCross) continue;
         if (kind == 2) {
             // Wall: the wash runs up when a front hits the foot, then slides back down.
-            float energy = sqrt(clamp((dp + Re) / Re, 0.0, 1.0));
+            float energy = sqrt(clamp((xlE + Re) / Re, 0.0, 1.0));
             float Hh = max(1.0, Terrain.z * (0.25 + 0.75 * energy) * 0.6);
             float tau = T - tCross;
             float hNow = tau < 0.15 ? Hh * tau / 0.15 : Hh * max(0.0, 1.0 - (tau - 0.15) / 0.6);
