@@ -43,6 +43,11 @@ public final class ShoreRegion {
 	public final int[] topY;
 	/** Whether each block column's surface is water at the region's water height (sea or pool). */
 	public final boolean[] water;
+	/**
+	 * Per column, the water surface's corner heights above topY as vanilla draws them (north-west,
+	 * south-west, south-east, north-east); meaningful for water columns only.
+	 */
+	public final float[] corners;
 	/** Whether each block column is water that belongs to a body big enough to have waves. */
 	public final boolean[] sea;
 	/**
@@ -69,6 +74,7 @@ public final class ShoreRegion {
 		this.level = new byte[size * size];
 		this.topY = snap.topY.clone();
 		this.water = new boolean[size * size];
+		this.corners = snap.corners.clone();
 		this.sea = new boolean[size * size];
 		this.dipId = new short[size * size];
 		this.dipEntry = new float[samples * samples];

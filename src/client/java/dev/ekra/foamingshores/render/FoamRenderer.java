@@ -312,6 +312,7 @@ public final class FoamRenderer {
 			float y = top + (water ? 0.01f : 0.002f);
 			pos.set(wx, water ? r.waterY : r.waterY + 1 + r.level[bi], wz);
 			int light = LightCoordsUtil.getLightCoords(lvl, pos);
+			if (water) light = LightCoordsUtil.max(light, LightCoordsUtil.getLightCoords(lvl, pos.above())); // as vanilla lights its surface
 			float u0 = bx * 16 * t, v0 = bz * 16 * t, u1 = (bx + 1) * 16 * t, v1 = (bz + 1) * 16 * t;
 			// Side quads stand SIDE_NUDGE off the block's sides and start at the top quad's height, so
 			// reach the top that far over every side that drops to a lower neighbour: no slit between.
@@ -319,8 +320,18 @@ public final class FoamRenderer {
 			float xb = wx + 1 + (water || !lowerSide(r, bx, bz, 1, 0, top) ? 0 : SIDE_NUDGE);
 			float za = wz - (water || !lowerSide(r, bx, bz, 0, -1, top) ? 0 : SIDE_NUDGE);
 			float zb = wz + 1 + (water || !lowerSide(r, bx, bz, 0, 1, top) ? 0 : SIDE_NUDGE);
+			// On water, follow vanilla's surface corner by corner (in its vertex order, so the quad splits
+			// into the same two triangles): flowing water slopes, and the sea dips a little by the shore.
+			float yNW = y, ySW = y, ySE = y, yNE = y;
+			if (water) {
+				float base = r.waterY + 0.01f;
+				yNW = base + r.corners[bi * 4];
+				ySW = base + r.corners[bi * 4 + 1];
+				ySE = base + r.corners[bi * 4 + 2];
+				yNE = base + r.corners[bi * 4 + 3];
+			}
 			qs.add(new Quad(
-				new float[] {xa, y, za, xa, y, zb, xb, y, zb, xb, y, za},
+				new float[] {xa, yNW, za, xa, ySW, zb, xb, ySE, zb, xb, yNE, za},
 				new float[] {u0, v0, u0, v1, u1, v1, u1, v0}, 0, 1, 0, light));
 		}
 		buildFaces(lvl, r, built.bandBlocks());
@@ -400,13 +411,22 @@ public final class FoamRenderer {
 					float yBot = yTop - h / 16f;
 					float u0 = col * 16f / FACE_TEX_W, u1 = (col + 1) * 16f / FACE_TEX_W;
 					float vT = row * (float) TILE_H / FACE_TEX_H, vB = (row * TILE_H + h) / (float) FACE_TEX_H;
+					// A wall rising out of the water starts where vanilla's surface meets it, which slopes
+					// where the water flows: the two surface corners on this side, at its west/north end (a)
+					// and its east/south end (b).
+					float da = 0, db = 0;
+					if (kind == 2 && water) {
+						int ca = dz < 0 ? 0 : dz > 0 ? 1 : dx < 0 ? 0 : 3, cb = dz < 0 ? 3 : dz > 0 ? 2 : dx < 0 ? 1 : 2;
+						da = r.corners[bi * 4 + ca] - 8f / 9f;
+						db = r.corners[bi * 4 + cb] - 8f / 9f;
+					}
 					float[] xyz;
 					if (dz != 0) {
 						float pz = (dz < 0 ? wz : wz + 1) + dz * nudge;
-						xyz = new float[] {wx, yTop, pz, wx + 1, yTop, pz, wx + 1, yBot, pz, wx, yBot, pz};
+						xyz = new float[] {wx, yTop + da, pz, wx + 1, yTop + db, pz, wx + 1, yBot + db, pz, wx, yBot + da, pz};
 					} else {
 						float px = (dx < 0 ? wx : wx + 1) + dx * nudge;
-						xyz = new float[] {px, yTop, wz, px, yTop, wz + 1, px, yBot, wz + 1, px, yBot, wz};
+						xyz = new float[] {px, yTop + da, wz, px, yTop + db, wz + 1, px, yBot + db, wz + 1, px, yBot + da, wz};
 					}
 					float[] uv = {u0, vT, u1, vT, u1, vB, u0, vB};
 					// Light from the open block in front of the face.

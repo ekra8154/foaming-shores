@@ -311,7 +311,7 @@ vec4 bakeTop(vec2 texel) {
     bool isDip = !isWater && abs(level + 1.0) < 0.5 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
     float soak = max(0.1, Motion2.z);
 
-    bool cov = false, edge = false, swell = false, pushing = false, covPuddle = false;
+    bool cov = false, edge = false, swell = false, pushing = false, covPuddle = false, washing = false;
     float covF = 0.0, foam = 0.0, lastUnc = -1e9, puddleTh = 0.0, th2 = 0.0;
     int lip = 0;
     int waveCount = int(Origin.w);
@@ -415,6 +415,10 @@ vec4 bakeTop(vec2 texel) {
         }
         if (!reached || T < tCross) continue;
         if (T >= tUnc) lastUnc = max(lastUnc, tUnc);
+        // The wash up a wall carries the foam line with it (see bakeFace): no pile at the foot
+        // until it has nearly come back down.
+        bool washUp = nearWall && T < tCross + 0.6;
+        washing = washing || washUp;
         float lv = 0.0, tDep = 0.0;
         // At sea only the water right by the shore carries lace.
         if ((isSea ? sd < 10.0 : true) && laid) {
@@ -443,7 +447,7 @@ vec4 bakeTop(vec2 texel) {
             tDep = tLeave;
         }
         // Foam piles at a wall's foot for as long as the wave pushes against it.
-        if (nearWall && 0.9 * Terrain.w > lv) {
+        if (nearWall && !washUp && 0.9 * Terrain.w > lv) {
             lv = 0.9 * Terrain.w;
             tDep = w.tB0;
         }
@@ -460,7 +464,7 @@ vec4 bakeTop(vec2 texel) {
     }
 
     bool pile = false;
-    if (nearWall && pushing) {
+    if (nearWall && pushing && !washing) {
         float pressure = clamp((xl - covF) / 6.0, 0.0, 1.0);
         pile = bay < pressure * Terrain.w;
     }
@@ -613,8 +617,20 @@ vec4 bakeFace(vec2 pixel) {
             if (up > Hh) continue;
             // Strictly below the wash: once it has drained (hNow = 0) no row is under water.
             if (up < hNow) flow = 1.0;
+            // The foam line rides the top of the wash up the face and back down, as it would run on
+            // up the beach; the ground at the foot only piles foam once the wash has come back.
+            float lwF = max(1.5, 0.5 * Shape.x * (0.6 + 0.8 * noiseAt(1, wt + w.lip)));
+            if (hNow > 0.5 && up < hNow && up >= hNow - lwF) faceLip = true;
             float left = tCross + 0.15 + 0.6 * (1.0 - up / Hh);
             age = min(age, max(0.0, T - left));
+            // Lace left where the wash reached, the pattern carrying on from the ground into the face.
+            float tLaid = tCross + 0.15 * up / Hh;
+            if (T >= tLaid) {
+                float lv = noiseAt(2, wt + ivec2(d1.xy * (up + 1.0)) + w.lace);
+                float tu = max(tLaid, left);
+                float k = (min(T, tu) - tLaid) * 0.6931 / Lace.x + max(0.0, T - tu) * 0.6931 / Lace.y;
+                faceFoam = max(faceFoam, lv * exp(-k) * (1.0 - 0.5 * up / Hh));
+            }
         }
     }
 
@@ -632,7 +648,7 @@ vec4 bakeFace(vec2 pixel) {
         color = over(vec4(w.rgb, w.a * Look.z * (q > 0.6 ? 1.0 : q > 0.25 ? 0.6 : 0.0)), color);
     }
     if (streak && flow > bay) color = vec4(foamBright(), 1.0);
-    if (kind >= 3) {
+    if (kind >= 2) {
         float thr = 1.0 - Shape.w, fv = faceFoam + (bay - 0.5) * 0.1;
         if (faceFoam > 0.004 && fv > thr) color = vec4(fv > thr + (1.0 - thr) * 0.45 ? foamBright() : foamShadow(), 1.0);
         if (faceLip) color = vec4(foamBright(), 1.0);
