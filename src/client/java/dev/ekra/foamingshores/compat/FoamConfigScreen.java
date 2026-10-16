@@ -123,7 +123,8 @@ public final class FoamConfigScreen {
 			new Opt("slapSpray", 0f, 3f, 0.05f, "times"),
 			new Opt("slapSprayMax", 0.3f, 20f, 0.1f, "millimetres"),
 			new Opt("slapSprayBig", 0f, 1f, 0.05f, "none"),
-			new Opt("slapSprayTime", 0.1f, 2f, 0.05f, "seconds"))),
+			new Opt("slapSprayTime", 0.1f, 2f, 0.05f, "seconds"),
+			new Opt("slapFar", 0f, 1f, 0.05f, "none"))),
 		new Group("sound_pour", List.of(
 			new Opt("trLevel", 0f, 2f, 0.01f, "none"),
 			new Opt("trRate", 0f, 50000f, 500f, "per_second"),

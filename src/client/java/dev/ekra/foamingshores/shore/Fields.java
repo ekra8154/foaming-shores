@@ -134,7 +134,11 @@ final class Fields {
 				if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
 				int q = ny * w + nx;
 				if (done[q]) continue;
-				double c = step.cost(p, q, dx != 0 && dy != 0);
+				boolean diag = dx != 0 && dy != 0;
+				// A diagonal step needs both sides open: water cannot squeeze between two blocks
+				// that only touch at a corner.
+				if (diag && (step.cost(p, y * w + nx, false) < 0 || step.cost(p, ny * w + x, false) < 0)) continue;
+				double c = step.cost(p, q, diag);
 				if (c < 0) continue;
 				double nc = cost[p] + c;
 				if (nc < cost[q]) {

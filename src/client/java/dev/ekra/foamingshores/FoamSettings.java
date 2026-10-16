@@ -132,6 +132,7 @@ public final class FoamSettings {
 	public float slapSprayMax = 2.2f;
 	public float slapSprayBig = 0f;
 	public float slapSprayTime = 0.6f;
+	public float slapFar = 0.6f;
 	// Sound: pouring and puddles
 	public float trLevel = 0.5f;
 	public float trRate = 9000f;

@@ -209,6 +209,8 @@
 	"tooltip.foamingshores.slapSprayBig": "Turns the spray's big bubbles down without taking them out.",
 	"option.foamingshores.slapSprayTime": "Spray lasts",
 	"tooltip.foamingshores.slapSprayTime": "How long the spray keeps falling back.",
+	"option.foamingshores.slapFar": "Loudness further up the beach",
+	"tooltip.foamingshores.slapFar": "A wave that has run up the sand before reaching a wall is slower and slaps softer. This is the least it can be, as a share of a full slap.",
 
 	"category.foamingshores.sound_pour": "Sound: pouring and puddles",
 	"option.foamingshores.trLevel": "Pouring bubbles: volume",

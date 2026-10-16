@@ -268,7 +268,9 @@ public final class ShoreSounds {
 			}
 			if (count == 0) continue;
 			st.slapCool.put(i, T);
-			double a = 0.75 * energy * Math.min(1, Math.sqrt(count / 6.0)) * s.sndSlap;
+			// A wall further up the beach is hit by a slower wave, so it slaps softer, but never less
+			// than slapFar of a full slap: the water still hits it and should be heard over the wash.
+			double a = 0.75 * (s.slapFar + (1 - s.slapFar) * energy) * Math.min(1, Math.sqrt(count / 3.0)) * s.sndSlap;
 			events.add(new SurfSynth.Event(false, Math.max(0, when - t0), a, 1, g.l * a, g.r * a));
 		}
 
