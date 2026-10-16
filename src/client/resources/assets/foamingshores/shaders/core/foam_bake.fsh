@@ -201,6 +201,15 @@ Wave waveHere(int i, vec2 texel, float waterline) {
     return w;
 }
 
+// The same wave scaled down by k (a crossing front fading as it falls behind the first).
+Wave weaker(Wave w, float k) {
+    w.amp *= k;
+    w.Tu *= k;
+    w.tB0 = w.tR0 + w.Tu + Motion.w;
+    w.tEnd = w.tB0 + Motion2.x;
+    return w;
+}
+
 // Where a texel's water came ashore: at sea the texel itself.
 float waterlineAt(vec2 texel, float dp) {
     float perSample = 16.0 / Region.y;
@@ -215,11 +224,12 @@ bool waveTimes(Wave w, ivec2 wt, float dp, float e, out float Re, out float tCro
     float jv = (noiseAt(0, wt + w.front) - 0.5) * 2.0 * jag;
     Re = Motion.y * w.amp * e;
     float TuE = w.Tu * min(1.0, e);
-    float uR = (jv - dp) / Re;
     tCross = 0.0;
     tLeave = 0.0;
     tUnc = 0.0;
     laid = false;
+    if (Re <= 0.0) return false; // nothing left of the wave here
+    float uR = (jv - dp) / Re;
     if (uR > 1.0) return false;
     tCross = uR <= 0.0 ? w.tR0 : w.tR0 + TuE * (1.0 - sqrt(1.0 - uR));
     float uL = (jv - dp + Shape.x + 3.0) / Re;
@@ -524,19 +534,29 @@ vec4 bakeFace(vec2 pixel) {
     // A drop off a dip's floor keeps pouring while the puddle above reaches its edge.
     vec4 dipInfo = texelFetch(DipSampler, ivec2(floor((texel + 0.5) / (16.0 / Region.y))), 0);
     bool edgeDip = kind == 1 && dipInfo.y > 0.5 && dipInfo.x > UNREACHABLE;
+    // The crossing front, where there is one (a narrow spit's sides, the lee of an island): it runs
+    // over these faces too, weaker the further it has fallen behind, from its own waterline.
+    vec4 f2E = fields2At(texel), f2L = lowOk ? fields2At(lowTexel) : vec4(-1000.0);
+    float fadeE = f2E.z > UNREACHABLE && f2E.w > UNREACHABLE ? Swell2.y * (1.0 - (dp - f2E.z) / Swell2.z) : 0.0;
+    float fadeL = f2L.z > UNREACHABLE && f2L.w > UNREACHABLE ? Swell2.y * (1.0 - (lowFields.x - f2L.z) / Swell2.z) : 0.0;
 
-    for (int i = 0; i < waveCount; i++) {
-        Wave w = waveHere(i, texel, dwE);
-        Wave wL = waveHere(i, lowTexel, dwLow);
+    for (int j = 0; j < 2 * waveCount; j++) {
+        // Each wave twice: its first front, then the crossing front.
+        int i = j >> 1;
+        bool second = (j & 1) == 1;
+        if (second && fadeE <= 0.0 && fadeL <= 0.0) continue;
+        float xE = second ? f2E.z - f2E.w : xlE, xLo = second ? f2L.z - f2L.w : xlLow;
+        Wave w = weaker(waveHere(i, texel, second ? f2E.w : dwE), second ? max(fadeE, 0.0) : 1.0);
+        Wave wL = weaker(waveHere(i, lowTexel, second ? f2L.w : dwLow), second ? max(fadeL, 0.0) : 1.0);
         if (T < (kind >= 3 ? min(w.tR0, wL.tR0) : w.tR0)) continue;
         float Re, tCross, tLeave, tUnc;
         bool laid;
-        bool reached = waveTimes(w, wt, xlE, e, Re, tCross, tLeave, tUnc, laid);
+        bool reached = waveTimes(w, wt, xE, e, Re, tCross, tLeave, tUnc, laid);
         if (kind >= 3) {
             // Ledge or step: this row's front times, between the edge's and the low side's.
             float ReL, tCrossL, tLeaveL, tUncL;
             bool laidL;
-            bool reachedL = lowOk && waveTimes(wL, wtLow, xlLow, eLow, ReL, tCrossL, tLeaveL, tUncL, laidL);
+            bool reachedL = lowOk && waveTimes(wL, wtLow, xLo, eLow, ReL, tCrossL, tLeaveL, tUncL, laidL);
             if (!reached && !reachedL) continue;
             float tC = reached && reachedL ? mix(tCross, tCrossL, rowFrac) : reached ? tCross : tCrossL;
             float tL = reached && reachedL ? mix(tLeave, tLeaveL, rowFrac) : reached ? tLeave : tLeaveL;
@@ -562,7 +582,7 @@ vec4 bakeFace(vec2 pixel) {
             // only settling). What is at this row now left the edge fallTime(row) ago. Not every
             // column pours, and each column's streak falls its own distance.
             float pStart = tCross, pEnd = w.tB0, tWetP, tDryP, pastP;
-            if (edgeDip && puddleTimes(w, wt, xlE, e, tWetP, tDryP, pastP)) {
+            if (edgeDip && !second && puddleTimes(w, wt, xlE, e, tWetP, tDryP, pastP)) {
                 pEnd = tDryP;
                 if (!reached) pStart = tWetP;
             } else if (!reached) continue;
@@ -585,7 +605,7 @@ vec4 bakeFace(vec2 pixel) {
         if (!reached || T < tCross) continue;
         if (kind == 2) {
             // Wall: the wash runs up when a front hits the foot, then slides back down.
-            float energy = sqrt(clamp((xlE + Re) / Re, 0.0, 1.0));
+            float energy = sqrt(clamp((xE + Re) / Re, 0.0, 1.0));
             float Hh = max(1.0, Terrain.z * (0.25 + 0.75 * energy) * 0.6);
             float tau = T - tCross;
             float hNow = tau < 0.15 ? Hh * tau / 0.15 : Hh * max(0.0, 1.0 - (tau - 0.15) / 0.6);
