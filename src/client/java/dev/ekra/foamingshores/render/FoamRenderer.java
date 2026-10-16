@@ -18,6 +18,8 @@ import dev.ekra.foamingshores.FoamSettings;
 import dev.ekra.foamingshores.FoamingShoresClient;
 import dev.ekra.foamingshores.shore.ShoreRegion;
 import dev.ekra.foamingshores.shore.ShoreSnapshot;
+import dev.ekra.foamingshores.sound.ShoreAudio;
+import dev.ekra.foamingshores.sound.ShoreSounds;
 import dev.ekra.foamingshores.wave.WaveMath;
 import dev.ekra.foamingshores.wave.WaveSchedule;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
@@ -117,6 +119,7 @@ public final class FoamRenderer {
 	private List<Quad> faceQuads = List.of();
 	private int faceCount;
 	private final Splashes splashes = new Splashes();
+	private final ShoreAudio audio = new ShoreAudio();
 	private long lastBakeStep = Long.MIN_VALUE;
 	/** Frames drawn so far, and the frame of the last bake: the bake's uniform buffer is a ring of 3
 	 *  fenced per frame (like vanilla's lightmap), so it may be rotated at most once per frame. */
@@ -148,6 +151,7 @@ public final class FoamRenderer {
 			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
+		audio.settingsChanged();
 		applied = settings.copy();
 		lastBakeStep = Long.MIN_VALUE;
 	}
@@ -181,7 +185,9 @@ public final class FoamRenderer {
 			faceCount = 0;
 			building = null;
 			splashes.clear();
+			audio.clear();
 		}
+		audio.tick(mc, lvl == null ? 0 : lvl.getGameTime() / 20.0);
 		if (lvl == null || mc.player == null) return;
 
 		if (building != null && building.isDone()) {
@@ -324,6 +330,8 @@ public final class FoamRenderer {
 		int fallPx = Math.min(TILE_H, (int) Math.ceil(settings.fallFade * 1.65f) + 1);
 		List<Quad> qs = new ArrayList<>();
 		List<Splashes.Foot> feet = new ArrayList<>();
+		// For the sound: each wall and drop face as (edge texel x, z, step x, z, out x, z, top in texels).
+		List<int[]> wallRows = new ArrayList<>(), dropRows = new ArrayList<>();
 		ByteBuffer data = MemoryUtil.memAlloc(FACE_COLS * 2 * (MAX_FACES / FACE_COLS) * 16);
 		try {
 			MemoryUtil.memSet(data, 0);
@@ -366,6 +374,9 @@ public final class FoamRenderer {
 					data.position((row * FACE_COLS * 2 + col * 2) * 16);
 					data.putFloat(ex).putFloat(ez).putFloat(sx).putFloat(sz);
 					data.putFloat(dx).putFloat(dz).putFloat(kind).putFloat(h);
+					int[] soundRow = {Math.round(ex), Math.round(ez), Math.round(sx), Math.round(sz), dx, dz, Math.round(top * 16)};
+					if (kind == 2) wallRows.add(soundRow);
+					else if (kind == 1) dropRows.add(soundRow);
 					if (kind == 2) {
 						for (int u = 0; u < 16; u++)
 							feet.add(new Splashes.Foot((int) (ex + sx * u), (int) (ez + sz * u), dx, dz, top));
@@ -400,6 +411,7 @@ public final class FoamRenderer {
 			faceCount = n;
 			faceQuads = qs;
 			splashes.setRegion(r, feet);
+			audio.setSounds(ShoreSounds.build(r, wallRows, dropRows));
 		} finally {
 			MemoryUtil.memFree(data);
 		}
@@ -454,6 +466,7 @@ public final class FoamRenderer {
 		byte[] noise = FoamNoise.build(settings.jagScale, settings.laceCell);
 		noiseBytes = noise;
 		splashes.setNoise(noise);
+		audio.setNoise(noise);
 		ByteBuffer nb = MemoryUtil.memAlloc(noise.length);
 		try {
 			nb.put(noise).flip();

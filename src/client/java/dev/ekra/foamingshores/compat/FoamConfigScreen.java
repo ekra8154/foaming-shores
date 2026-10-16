@@ -68,7 +68,84 @@ public final class FoamConfigScreen {
 			new Opt("foamTint", 0, 0.5f, 0.01f, "none"))),
 		new Group("bodies", List.of(
 			new Opt("minBody", 1, 200, 1, "blocks"),
-			new Opt("openWater", 0.5f, 4, 0.25f, "blocks_from_land")))
+			new Opt("openWater", 0.5f, 4, 0.25f, "blocks_from_land"))),
+		new Group("sound", List.of(
+			new Opt("volume", 0f, 1.5f, 0.05f, "none"),
+			new Opt("hearing", 4f, 48f, 1f, "blocks"))),
+		new Group("sound_levels", List.of(
+			new Opt("sndCrash", 0f, 2f, 0.05f, "none"),
+			new Opt("sndWash", 0f, 2f, 0.05f, "none"),
+			new Opt("sndFizz", 0f, 2f, 0.05f, "none"),
+			new Opt("sndSlap", 0f, 2f, 0.05f, "none"),
+			new Opt("sndTrickle", 0f, 2f, 0.05f, "none"),
+			new Opt("sndBed", 0f, 2f, 0.05f, "none"))),
+		new Group("sound_crash", List.of(
+			new Opt("crAttack", 0.01f, 0.8f, 0.01f, "seconds"),
+			new Opt("crDecay", 0.2f, 5f, 0.05f, "seconds"),
+			new Opt("crHigh", 500f, 12000f, 100f, "hertz"),
+			new Opt("crLow", 100f, 4000f, 50f, "hertz"),
+			new Opt("crNoise", 0f, 3f, 0.05f, "none"),
+			new Opt("crCrumble", 0f, 1f, 0.05f, "none"),
+			new Opt("crThump", 0f, 2f, 0.05f, "none"),
+			new Opt("crBubVol", 0f, 2f, 0.01f, "none"),
+			new Opt("crBubbles", 0f, 3f, 0.05f, "times"),
+			new Opt("crBubMin", 0.2f, 5f, 0.1f, "millimetres"),
+			new Opt("crBubMax", 0.3f, 20f, 0.1f, "millimetres"),
+			new Opt("crBig", 0f, 1f, 0.05f, "none"),
+			new Opt("crSpread", 0f, 5f, 0.1f, "none"))),
+		new Group("sound_wash", List.of(
+			new Opt("washLow", 100f, 4000f, 50f, "hertz"),
+			new Opt("washSpan", 0f, 8000f, 100f, "hertz"),
+			new Opt("washQ", 0.2f, 4f, 0.05f, "none"),
+			new Opt("washRough", 0f, 1f, 0.05f, "none"),
+			new Opt("washNoise", 0f, 3f, 0.05f, "none"),
+			new Opt("washBubbles", 0f, 2f, 0.01f, "none"),
+			new Opt("washRate", 0f, 100000f, 1000f, "per_second"),
+			new Opt("washBubMin", 0.2f, 5f, 0.1f, "millimetres"),
+			new Opt("washBubMax", 0.3f, 20f, 0.1f, "millimetres"),
+			new Opt("washBig", 0f, 1f, 0.05f, "none"),
+			new Opt("washSpread", 0f, 5f, 0.1f, "none"))),
+		new Group("sound_fizz", List.of(
+			new Opt("fizzLevel", 0f, 2f, 0.01f, "none"),
+			new Opt("fizzRate", 0f, 200000f, 1000f, "per_second"),
+			new Opt("fizzThr", 0f, 0.5f, 0.01f, "none"),
+			new Opt("fizzHiss", 0f, 3f, 0.05f, "none"),
+			new Opt("fizzBubMin", 0.2f, 5f, 0.1f, "millimetres"),
+			new Opt("fizzBubMax", 0.3f, 20f, 0.1f, "millimetres"),
+			new Opt("fizzBig", 0f, 1f, 0.05f, "none"),
+			new Opt("fizzSpread", 0f, 5f, 0.1f, "none"))),
+		new Group("sound_slap", List.of(
+			new Opt("slapFreq", 200f, 6000f, 50f, "hertz"),
+			new Opt("slapDecay", 0.03f, 1f, 0.01f, "seconds"),
+			new Opt("slapKnock", 0f, 3f, 0.05f, "none"),
+			new Opt("slapThump", 0f, 3f, 0.05f, "none"),
+			new Opt("slapSprayVol", 0f, 2f, 0.01f, "none"),
+			new Opt("slapSpray", 0f, 3f, 0.05f, "times"),
+			new Opt("slapSprayMax", 0.3f, 20f, 0.1f, "millimetres"),
+			new Opt("slapSprayBig", 0f, 1f, 0.05f, "none"),
+			new Opt("slapSprayTime", 0.1f, 2f, 0.05f, "seconds"))),
+		new Group("sound_pour", List.of(
+			new Opt("trLevel", 0f, 2f, 0.01f, "none"),
+			new Opt("trRate", 0f, 50000f, 500f, "per_second"),
+			new Opt("trBubMin", 0.2f, 5f, 0.1f, "millimetres"),
+			new Opt("trBubMax", 0.3f, 20f, 0.1f, "millimetres"),
+			new Opt("trBig", 0f, 1f, 0.05f, "none"),
+			new Opt("trSpread", 0f, 5f, 0.1f, "none"),
+			new Opt("soakLevel", 0f, 2f, 0.01f, "none"),
+			new Opt("soakRate", 0f, 20000f, 250f, "per_second"))),
+		new Group("sound_bed", List.of(
+			new Opt("bedLow", 60f, 1500f, 10f, "hertz"),
+			new Opt("bedHigh", 0f, 2f, 0.05f, "none"),
+			new Opt("bedSwell", 0f, 1f, 0.05f, "none"))),
+		new Group("sound_bubbles", List.of(
+			new Opt("bubAlpha", 0f, 3f, 0.05f, "none"),
+			new Opt("bubDepth", 1f, 30f, 0.5f, "none"),
+			new Opt("bubRise", 0f, 1f, 0.01f, "none"),
+			new Opt("riseCut", 0.3f, 0.99f, 0.01f, "none"))),
+		new Group("sound_air", List.of(
+			new Opt("verbMix", 0f, 2f, 0.05f, "none"),
+			new Opt("verbSize", 0.3f, 0.95f, 0.01f, "none"),
+			new Opt("verbDamp", 0f, 0.95f, 0.05f, "none")))
 	);
 
 	public static Screen create(Screen parent) {
@@ -83,6 +160,13 @@ public final class FoamConfigScreen {
 		ConfigEntryBuilder entries = builder.entryBuilder();
 		for (Group group : GROUPS) {
 			ConfigCategory category = builder.getOrCreateCategory(Component.translatable("category.foamingshores." + group.key()));
+			if (group.key().equals("sound")) {
+				category.addEntry(entries.startBooleanToggle(Component.translatable("option.foamingshores.soundOn"), settings.soundOn)
+					.setDefaultValue(defaults.soundOn)
+					.setTooltip(Component.translatable("tooltip.foamingshores.soundOn"))
+					.setSaveConsumer(v -> settings.soundOn = v)
+					.build());
+			}
 			for (Opt opt : group.opts()) {
 				Field field = field(opt.key());
 				int lo = Math.round(opt.min() / opt.step()), hi = Math.round(opt.max() / opt.step());

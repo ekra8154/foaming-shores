@@ -1,6 +1,7 @@
 package dev.ekra.foamingshores.shore;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
@@ -20,8 +21,9 @@ public final class ShoreSnapshot {
 	public final int originX, originZ, size;
 	/**
 	 * Y of each column's surface, row-major by z then x: the topmost solid-or-fluid block (leaves
-	 * ignored), or, under an overhang that leaves the space just above the water open, the surface
-	 * beneath it, so waves run under floating blocks and only things at water level stop them.
+	 * ignored), or, where the block in the water's own layer does not block movement, the surface
+	 * beneath whatever floats above it: water runs under floating blocks as if they were not there,
+	 * and only something standing in the water's layer is a wall.
 	 */
 	final int[] topY;
 	/** Whether that topmost block is water. */
@@ -68,17 +70,18 @@ public final class ShoreSnapshot {
 		for (int i = 0; i < size * size; i++) if (s.water[i]) counts.merge(s.topY[i], 1, Integer::sum);
 		s.waterY = counts.entrySet().stream().max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse(seaTop);
 
-		// A column whose top is above the water but open just above the water's surface is an
-		// overhang: look under it for the surface the water actually meets (at most 4 blocks down,
-		// which is as deep as the shore fields look).
+		// A column whose top is above the water is a wall only if something blocks movement in the
+		// water's own layer. Otherwise whatever is above floats (a block over the water, an overhang
+		// over the beach): look under it for the surface the water actually meets (at most 4 blocks
+		// down, which is as deep as the shore fields look).
 		var blocks = Heightmap.Types.MOTION_BLOCKING_NO_LEAVES.isOpaque();
-		int open = s.waterY + 1;
+		int layer = s.waterY;
 		for (int dz = 0; dz < size; dz++) {
 			for (int dx = 0; dx < size; dx++) {
 				int x = originX + dx, z = originZ + dz, i = dz * size + dx;
-				if (s.topY[i] <= open || s.missingChunks.contains(ChunkPos.pack(x >> 4, z >> 4))) continue;
-				if (blocks.test(level.getBlockState(pos.set(x, open, z)))) continue;
-				int y = open - 1;
+				if (s.topY[i] <= layer || s.missingChunks.contains(ChunkPos.pack(x >> 4, z >> 4))) continue;
+				if (level.getBlockState(pos.set(x, layer, z)).is(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES)) continue;
+				int y = layer;
 				while (y > s.waterY - 4 && !blocks.test(level.getBlockState(pos.set(x, y, z)))) y--;
 				pos.set(x, y, z);
 				s.topY[i] = y;

@@ -76,6 +76,85 @@ public final class FoamSettings {
 	public int minBody = 30;        // blocks
 	public float openWater = 2f;
 
+	// Sound: listen
+	public boolean soundOn = true;
+	public float volume = 0.7f;
+	public float hearing = 16f;
+	// Sound: layer levels
+	public float sndCrash = 1f;
+	public float sndWash = 1f;
+	public float sndFizz = 1f;
+	public float sndSlap = 1f;
+	public float sndTrickle = 1f;
+	public float sndBed = 1f;
+	// Sound: breaking waves
+	public float crAttack = 0.2f;
+	public float crDecay = 2f;
+	public float crHigh = 5000f;
+	public float crLow = 900f;
+	public float crNoise = 1f;
+	public float crCrumble = 0.4f;
+	public float crThump = 0.2f;
+	public float crBubVol = 0.3f;
+	public float crBubbles = 1f;
+	public float crBubMin = 0.2f;
+	public float crBubMax = 0.3f;
+	public float crBig = 0.05f;
+	public float crSpread = 2.5f;
+	// Sound: run-up and backwash
+	public float washLow = 800f;
+	public float washSpan = 2600f;
+	public float washQ = 0.6f;
+	public float washRough = 0.3f;
+	public float washNoise = 1f;
+	public float washBubbles = 0.35f;
+	public float washRate = 20000f;
+	public float washBubMin = 0.3f;
+	public float washBubMax = 0.3f;
+	public float washBig = 0f;
+	public float washSpread = 2.5f;
+	// Sound: foam fizz
+	public float fizzLevel = 0.7f;
+	public float fizzRate = 60000f;
+	public float fizzThr = 0.06f;
+	public float fizzHiss = 1f;
+	public float fizzBubMin = 0.5f;
+	public float fizzBubMax = 0.3f;
+	public float fizzBig = 0.05f;
+	public float fizzSpread = 3f;
+	// Sound: wall slaps
+	public float slapFreq = 1100f;
+	public float slapDecay = 0.2f;
+	public float slapKnock = 1f;
+	public float slapThump = 1f;
+	public float slapSprayVol = 0.3f;
+	public float slapSpray = 1f;
+	public float slapSprayMax = 2.2f;
+	public float slapSprayBig = 0f;
+	public float slapSprayTime = 0.6f;
+	// Sound: pouring and puddles
+	public float trLevel = 0.5f;
+	public float trRate = 9000f;
+	public float trBubMin = 0.4f;
+	public float trBubMax = 1.5f;
+	public float trBig = 0.05f;
+	public float trSpread = 1.5f;
+	public float soakLevel = 0.03f;
+	public float soakRate = 4000f;
+	// Sound: distant surf
+	public float bedLow = 300f;
+	public float bedHigh = 0.3f;
+	public float bedSwell = 0.35f;
+	// Sound: all bubbles
+	public float bubAlpha = 1.5f;
+	public float bubDepth = 10f;
+	public float bubRise = 0.1f;
+	public float riseCut = 0.9f;
+	// Sound: air
+	public float verbMix = 0.5f;
+	public float verbSize = 0.8f;
+	public float verbDamp = 0.4f;
+
 	public static final FoamSettings INSTANCE = load();
 
 	/** Run-up time for a wave of the given amplitude: a coast uphill that slows evenly to a stop. */
