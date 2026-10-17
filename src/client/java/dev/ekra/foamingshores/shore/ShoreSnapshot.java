@@ -43,8 +43,8 @@ public final class ShoreSnapshot {
 	 */
 	final int[] surfY;
 	public static final int NO_SURFACE = Integer.MIN_VALUE;
-	/** Whether a column's water at the body's layer lies in a river biome. */
-	final boolean[] river;
+	/** Whether a column's water at the body's layer lies in a river biome, or an ocean or beach biome. */
+	final boolean[] river, ocean;
 	/** How deep that water is, in blocks (1 to 4, 4 meaning 4 or more). */
 	final byte[] depth;
 	/** The water surface the waves belong to: the most common surface height among water columns. */
@@ -55,7 +55,10 @@ public final class ShoreSnapshot {
 	 * the same order make the same two triangles, so whatever lies on them lies on the water.
 	 */
 	final float[] corners;
-	/** Chunks (as {@link ChunkPos#pack}) that were not loaded yet; their columns count as open water. */
+	/**
+	 * Chunks (as {@link ChunkPos#pack}) that were not loaded yet; their columns count as water (so
+	 * the sea stays open) but not as ocean, so no waves start there until they arrive.
+	 */
 	public final Set<Long> missingChunks = new HashSet<>();
 
 	private ShoreSnapshot(int originX, int originZ, int size) {
@@ -66,6 +69,7 @@ public final class ShoreSnapshot {
 		this.water = new boolean[size * size];
 		this.surfY = new int[size * size];
 		this.river = new boolean[size * size];
+		this.ocean = new boolean[size * size];
 		this.depth = new byte[size * size];
 		this.corners = new float[size * size * 4];
 	}
@@ -138,7 +142,9 @@ public final class ShoreSnapshot {
 			for (int dx = 0; dx < size; dx++) {
 				int x = originX + dx, z = originZ + dz, i = dz * size + dx;
 				if (!s.water[i] || s.topY[i] != layer || s.missingChunks.contains(ChunkPos.pack(x >> 4, z >> 4))) continue;
-				s.river[i] = level.getBiome(pos.set(x, layer, z)).is(BiomeTags.IS_RIVER);
+				var biome = level.getBiome(pos.set(x, layer, z));
+				s.river[i] = biome.is(BiomeTags.IS_RIVER);
+				s.ocean[i] = biome.is(BiomeTags.IS_OCEAN) || biome.is(BiomeTags.IS_BEACH);
 				if (!s.river[i]) continue;
 				int d = 1;
 				while (d < 4 && level.getFluidState(pos.set(x, layer - d, z)).is(FluidTags.WATER)) d++;

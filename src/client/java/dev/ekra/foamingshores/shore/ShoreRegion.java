@@ -65,7 +65,13 @@ public final class ShoreRegion {
 	 */
 	public float[] riverFx, riverFy, riverBlend, riverShallow;
 	public byte[] riverDecor;
-	/** Whether each block column is water that belongs to a body big enough to have waves. */
+	/** Whether each column's water at the body's layer lies in an ocean or beach biome. */
+	public final boolean[] ocean;
+	/**
+	 * Whether each block column is water that belongs to a body with waves: one with ocean (or
+	 * beach) water in it, big enough or reaching beyond the region. Lakes, ponds and rivers on their
+	 * own stay calm; a river or lake joined to the sea gets waves coming in from it, fading.
+	 */
 	public final boolean[] sea;
 	/**
 	 * Dips: connected land one block below beach level, where water that runs in cannot drain back
@@ -95,6 +101,7 @@ public final class ShoreRegion {
 		this.surfY = snap.surfY.clone();
 		this.low = new boolean[size * size];
 		this.river = new boolean[size * size];
+		this.ocean = new boolean[size * size];
 		this.depth = snap.depth.clone();
 		this.sea = new boolean[size * size];
 		this.dipId = new short[size * size];
@@ -134,6 +141,7 @@ public final class ShoreRegion {
 			int lv = surfaceWater[i] ? 0 : snap.topY[i] - waterY;
 			r.low[i] = snap.water[i] && snap.topY[i] < waterY;
 			r.river[i] = surfaceWater[i] && snap.river[i];
+			r.ocean[i] = surfaceWater[i] && snap.ocean[i];
 			// A lower pool is never stepped into, however shallow the step: as deep as a drop.
 			r.level[i] = (byte) (r.low[i] ? -4 : Math.max(-4, Math.min(1, lv)));
 		}
@@ -166,7 +174,9 @@ public final class ShoreRegion {
 				if (z > 0) visit(i - size, surfaceWater, seen, queue);
 				if (z < size - 1) visit(i + size, surfaceWater, seen, queue);
 			}
-			if (edge || comp.size() >= minBody) for (int i : comp) r.sea[i] = true;
+			boolean ocean = false;
+			for (int i : comp) if (r.ocean[i]) { ocean = true; break; }
+			if (ocean && (edge || comp.size() >= minBody)) for (int i : comp) r.sea[i] = true;
 		}
 	}
 
@@ -253,8 +263,8 @@ public final class ShoreRegion {
 		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
 		float sourceAt = Math.min(open, widest * 0.9f);
 		float[] way = Fields.openWay(rawW, seaS, S, S);
-		// Never in a river either: waves come in from the sea and fade travelling up its mouth.
-		for (int p = 0; p < n; p++) cost[p] = seaS[p] && !r.river[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt && way[p] >= sourceAt
+		// Only in ocean water: waves come in from the sea and fade travelling up a river or into a lake.
+		for (int p = 0; p < n; p++) cost[p] = seaS[p] && r.ocean[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt && way[p] >= sourceAt
 			&& rawW[p] <= way[p] + tps ? -rawW[p] : Fields.FAR;
 		int[] pred = new int[n], order = new int[n];
 		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {

@@ -135,7 +135,7 @@
 	"option.foamingshores.minIsland": "Smallest land that shapes waves",
 	"tooltip.foamingshores.minIsland": "Land smaller than this (a rock, a lone block) does not bend the waves: they pass it as a line and the foam runs over it, and its shore only gets a wash.",
 	"option.foamingshores.minBody": "Smallest body with waves",
-	"tooltip.foamingshores.minBody": "Water bodies smaller than this stay calm. Water reaching past the loaded area always counts as open sea.",
+	"tooltip.foamingshores.minBody": "Waves come only from ocean and beach water. A body of it smaller than this stays calm, unless it reaches past the area around you. Lakes and rivers get waves only where they join the sea, fading as they come in.",
 	"option.foamingshores.openWater": "Open water from",
 	"tooltip.foamingshores.openWater": "Waves start only this far from land and travel into narrower water from its mouth.",
 

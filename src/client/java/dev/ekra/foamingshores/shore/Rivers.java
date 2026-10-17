@@ -82,15 +82,15 @@ final class Rivers {
 			ay[p] = (float) Math.cos(th);
 		}
 
-		// Which way: down the distance to the sea along the water (the sea being the body's water
-		// that is not river), or away from the far end of a stretch that cannot reach it.
+		// Which way: down the distance to the sea along the water (ocean or beach water), or away
+		// from the far end of a stretch that cannot reach it.
 		float[] pot = new float[n];
 		java.util.Arrays.fill(pot, -1);
 		int[] queue = new int[n];
 		int qh = 0, qt = 0;
 		for (int p = 0; p < n; p++) {
 			int bi = ((p / S) / RES) * size + (p % S) / RES;
-			if (water[p] && !rivS[p] && r.sea[bi]) { pot[p] = 0; queue[qt++] = p; }
+			if (water[p] && !rivS[p] && r.ocean[bi]) { pot[p] = 0; queue[qt++] = p; }
 		}
 		while (qh < qt) {
 			int p = queue[qh++];
