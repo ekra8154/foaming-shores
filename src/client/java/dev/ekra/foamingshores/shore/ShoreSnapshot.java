@@ -45,7 +45,7 @@ public final class ShoreSnapshot {
 	public static final int NO_SURFACE = Integer.MIN_VALUE;
 	/** Whether a column's water at the body's layer lies in a river biome, or an ocean or beach biome. */
 	final boolean[] river, ocean;
-	/** How deep that water is, in blocks (1 to 4, 4 meaning 4 or more). */
+	/** How deep a column's water at the body's layer is, in blocks (1 to 4, 4 meaning 4 or more). */
 	final byte[] depth;
 	/** The water surface the waves belong to: the most common surface height among water columns. */
 	int waterY;
@@ -137,7 +137,8 @@ public final class ShoreSnapshot {
 			}
 		}
 
-		// Rivers: the biome says which water is river; the shallows are where it is a block or two deep.
+		// Biomes say which water is river and which is sea (the rest is still water: lakes, ponds, a
+		// river's side pockets); the shallows are where it is a block or two deep.
 		for (int dz = 0; dz < size; dz++) {
 			for (int dx = 0; dx < size; dx++) {
 				int x = originX + dx, z = originZ + dz, i = dz * size + dx;
@@ -145,7 +146,6 @@ public final class ShoreSnapshot {
 				var biome = level.getBiome(pos.set(x, layer, z));
 				s.river[i] = biome.is(BiomeTags.IS_RIVER);
 				s.ocean[i] = biome.is(BiomeTags.IS_OCEAN) || biome.is(BiomeTags.IS_BEACH);
-				if (!s.river[i]) continue;
 				int d = 1;
 				while (d < 4 && level.getFluidState(pos.set(x, layer - d, z)).is(FluidTags.WATER)) d++;
 				s.depth[i] = (byte) d;

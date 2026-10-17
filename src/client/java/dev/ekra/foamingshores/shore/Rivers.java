@@ -29,119 +29,203 @@ final class Rivers {
 	static void build(ShoreRegion r, ShoreRegion.Settings settings, RiverMemory memory) {
 		int size = r.size, S = r.samples, n = S * S, RES = ShoreRegion.RES;
 		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
-		boolean[] water = new boolean[n], land = new boolean[n], rivS = new boolean[n];
-		boolean any = false;
+		boolean[] water = new boolean[n], land = new boolean[n], rivS = new boolean[n], stillS = new boolean[n], inland = new boolean[n];
+		boolean anyRiver = false, anyInland = false;
 		for (int p = 0; p < n; p++) {
 			int bi = ((p / S) / RES) * size + (p % S) / RES;
 			water[p] = r.water[bi];
 			land[p] = !water[p];
 			rivS[p] = water[p] && r.river[bi];
-			any |= rivS[p];
+			stillS[p] = water[p] && r.still[bi];
+			inland[p] = rivS[p] || stillS[p];
+			anyRiver |= rivS[p];
+			anyInland |= inland[p];
 		}
-		if (!any) return;
+		if (!anyInland) return;
 
 		float[] bank = Fields.distanceTo(land, S, S), toRiver = Fields.distanceTo(rivS, S, S);
 		for (int p = 0; p < n; p++) {
 			bank[p] = Math.max(0, bank[p] * tps - tps / 2);
-			toRiver[p] = Math.max(0, toRiver[p] * tps - tps / 2);
+			toRiver[p] = anyRiver ? Math.max(0, toRiver[p] * tps - tps / 2) : 1e9f;
 		}
-		// How much river (fading into the sea at its mouth) and how shallow.
-		float[] rv = new float[n], sv = new float[n];
-		for (int p = 0; p < n; p++) {
-			int bi = ((p / S) / RES) * size + (p % S) / RES;
-			rv[p] = rivS[p] ? 1 : 0;
-			sv[p] = rivS[p] ? (r.depth[bi] <= 1 ? 1 : r.depth[bi] == 2 ? 0.5f : 0) : 0;
-		}
-		float[] rvB = Fields.boxBlur(Fields.boxBlur(rv, S, S, 1), S, S, 1), svB = Fields.boxBlur(sv, S, S, 1);
-		float[] blend = new float[n], shallow = new float[n];
-		for (int p = 0; p < n; p++) {
-			if (land[p]) continue;
-			blend[p] = rivS[p] ? Math.min(1, Math.max(Math.max(0.5f, rvB[p]) * 2 - 1, rvB[p] * 1.6f)) : Math.max(0, rvB[p] * 2 - 1) * 0.6f;
-			shallow[p] = svB[p];
-		}
-
-		// The axis.
-		boolean[] dom = new boolean[n];
-		for (int p = 0; p < n; p++) dom[p] = water[p] && toRiver[p] <= 40;
-		float[] jxx = new float[n], jxy = new float[n], jyy = new float[n];
-		for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
-			int p = y * S + x;
-			if (!dom[p]) continue;
-			float gx = (bank[p + 1] - bank[p - 1]) * 0.5f, gy = (bank[p + S] - bank[p - S]) * 0.5f;
-			jxx[p] = gx * gx;
-			jxy[p] = gx * gy;
-			jyy[p] = gy * gy;
-		}
-		float[] Jxx = Fields.boxBlur(Fields.boxBlur(jxx, S, S, 2), S, S, 2), Jxy = Fields.boxBlur(Fields.boxBlur(jxy, S, S, 2), S, S, 2),
-			Jyy = Fields.boxBlur(Fields.boxBlur(jyy, S, S, 2), S, S, 2);
-		float[] ax = new float[n], ay = new float[n];
-		for (int p = 0; p < n; p++) {
-			if (!dom[p]) continue;
-			double th = 0.5 * Math.atan2(2 * Jxy[p], Jxx[p] - Jyy[p]); // across the river
-			ax[p] = (float) -Math.sin(th);
-			ay[p] = (float) Math.cos(th);
-		}
-
-		// Which way: down the distance to the sea along the water (ocean or beach water), or away
-		// from the far end of a stretch that cannot reach it.
-		float[] pot = new float[n];
-		java.util.Arrays.fill(pot, -1);
-		int[] queue = new int[n];
-		int qh = 0, qt = 0;
-		for (int p = 0; p < n; p++) {
-			int bi = ((p / S) / RES) * size + (p % S) / RES;
-			if (water[p] && !rivS[p] && r.ocean[bi]) { pot[p] = 0; queue[qt++] = p; }
-		}
-		while (qh < qt) {
-			int p = queue[qh++];
-			for (int k = 0; k < 4; k++) {
-				int q = neighbour(p, k, S);
-				if (q >= 0 && water[q] && pot[q] < 0) { pot[q] = pot[p] + 1; queue[qt++] = q; }
+		// How much of a river's current reaches still water: along the water from the river, fading.
+		float[] pull = new float[n];
+		{
+			int[] dist = new int[n];
+			java.util.Arrays.fill(dist, -1);
+			int[] q = new int[n];
+			int h = 0, t = 0;
+			for (int p = 0; p < n; p++) if (rivS[p]) { dist[p] = 0; pull[p] = 1; q[t++] = p; }
+			double reach = Math.max(0.5, settings.backwater()) * 16;
+			while (h < t) {
+				int p = q[h++];
+				if (dist[p] * tps > reach * 4) continue;
+				for (int k = 0; k < 4; k++) {
+					int nb = neighbour(p, k, S);
+					if (nb < 0 || !stillS[nb] || dist[nb] >= 0) continue;
+					dist[nb] = dist[p] + 1;
+					pull[nb] = (float) Math.exp(-dist[nb] * tps / reach);
+					q[t++] = nb;
+				}
 			}
 		}
-		boolean[] seen = new boolean[n];
-		int[] order = new int[n], dist = new int[n];
-		for (int s0 = 0; s0 < n; s0++) {
-			if (!dom[s0] || seen[s0] || pot[s0] >= 0) continue;
-			int far = order[walkAll(s0, dom, pot, S, order, dist) - 1];
-			int count = walkAll(far, dom, pot, S, order, dist);
-			for (int i = 0; i < count; i++) { seen[order[i]] = true; pot[order[i]] = 100000 - dist[order[i]]; }
-		}
-		float[] pv = new float[n], pm = new float[n];
-		for (int p = 0; p < n; p++) if (dom[p] && pot[p] >= 0) { pv[p] = pot[p]; pm[p] = 1; }
-		float[] PV = Fields.boxBlur(Fields.boxBlur(pv, S, S, 1), S, S, 1), PM = Fields.boxBlur(Fields.boxBlur(pm, S, S, 1), S, S, 1);
-		float[] sm = new float[n];
-		for (int p = 0; p < n; p++) sm[p] = PM[p] > 1e-4f ? PV[p] / PM[p] : 0;
-		for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
-			int p = y * S + x;
-			if (!dom[p]) continue;
-			float gx = (dom[p + 1] ? sm[p + 1] : sm[p]) - (dom[p - 1] ? sm[p - 1] : sm[p]);
-			float gy = (dom[p + S] ? sm[p + S] : sm[p]) - (dom[p - S] ? sm[p - S] : sm[p]);
-			if (ax[p] * gx + ay[p] * gy > 0) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
-		}
-		if (memory != null) remember(r, dom, rivS, pot, ax, ay, memory);
-
-		// Speed.
-		float[] bankR = new float[n];
-		for (int p = 0; p < n; p++) bankR[p] = rivS[p] ? bank[p] : 0;
-		float[] halfW = Fields.maxFilter(bankR, S, S, 6);
-		float[] fx = new float[n], fy = new float[n];
+		// How much river or still water (fading into the sea where they meet) and how shallow.
+		float[] rv = new float[n], sv = new float[n], ro = new float[n];
 		for (int p = 0; p < n; p++) {
-			if (!dom[p]) continue;
-			float width = Math.max(8, 2 * halfW[p]);
-			float sp = (float) (settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, 40 / width)) * (1 + 0.4 * shallow[p])
-				* Math.sqrt(Math.min(1, bank[p] / 12)) * blend[p]);
-			fx[p] = ax[p] * sp;
-			fy[p] = ay[p] * sp;
+			int bi = ((p / S) / RES) * size + (p % S) / RES;
+			rv[p] = inland[p] ? 1 : 0;
+			ro[p] = rivS[p] ? 1 : 0;
+			sv[p] = inland[p] ? (r.depth[bi] <= 1 ? 1 : r.depth[bi] == 2 ? 0.5f : 0) : 0;
 		}
-		fx = Fields.boxBlur(fx, S, S, 1);
-		fy = Fields.boxBlur(fy, S, S, 1);
-		for (int p = 0; p < n; p++) if (land[p]) { fx[p] = 0; fy[p] = 0; }
-		r.riverFx = fx;
-		r.riverFy = fy;
+		float[] rvB = Fields.boxBlur(Fields.boxBlur(rv, S, S, 1), S, S, 1), svB = Fields.boxBlur(sv, S, S, 1);
+		float[] roB = Fields.boxBlur(Fields.boxBlur(ro, S, S, 1), S, S, 1);
+		float[] blend = new float[n], shallow = new float[n], flowB = new float[n];
+		for (int p = 0; p < n; p++) {
+			if (land[p]) continue;
+			blend[p] = inland[p] ? Math.min(1, Math.max(Math.max(0.5f, rvB[p]) * 2 - 1, rvB[p] * 1.6f)) : Math.max(0, rvB[p] * 2 - 1) * 0.6f;
+			shallow[p] = svB[p];
+			// Where a current runs: the river, still water as far as its pull reaches, and the sea
+			// just off a river's mouth (not off a lake's).
+			flowB[p] = rivS[p] ? blend[p] : stillS[p] ? pull[p] * blend[p] : Math.max(0, roB[p] * 2 - 1) * 0.6f;
+		}
 		r.riverBlend = blend;
 		r.riverShallow = shallow;
-		r.riverDecor = decor(r, settings, dom, rivS, fx, fy);
+		r.fetch = fetch(r, water, rivS, stillS);
+
+		float[] fx = new float[n], fy = new float[n];
+		boolean[] dom = new boolean[n];
+		if (anyRiver) {
+			// The axis.
+			for (int p = 0; p < n; p++) dom[p] = water[p] && (toRiver[p] <= 40 || pull[p] > 0.05f);
+			float[] jxx = new float[n], jxy = new float[n], jyy = new float[n];
+			for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
+				int p = y * S + x;
+				if (!dom[p]) continue;
+				float gx = (bank[p + 1] - bank[p - 1]) * 0.5f, gy = (bank[p + S] - bank[p - S]) * 0.5f;
+				jxx[p] = gx * gx;
+				jxy[p] = gx * gy;
+				jyy[p] = gy * gy;
+			}
+			float[] Jxx = Fields.boxBlur(Fields.boxBlur(jxx, S, S, 2), S, S, 2), Jxy = Fields.boxBlur(Fields.boxBlur(jxy, S, S, 2), S, S, 2),
+				Jyy = Fields.boxBlur(Fields.boxBlur(jyy, S, S, 2), S, S, 2);
+			float[] ax = new float[n], ay = new float[n];
+			for (int p = 0; p < n; p++) {
+				if (!dom[p]) continue;
+				double th = 0.5 * Math.atan2(2 * Jxy[p], Jxx[p] - Jyy[p]); // across the river
+				ax[p] = (float) -Math.sin(th);
+				ay[p] = (float) Math.cos(th);
+			}
+
+			// Which way: down the distance to the sea along the water (ocean or beach water), or
+			// away from the far end of a stretch that cannot reach it.
+			float[] pot = new float[n];
+			java.util.Arrays.fill(pot, -1);
+			int[] queue = new int[n];
+			int qh = 0, qt = 0;
+			for (int p = 0; p < n; p++) {
+				int bi = ((p / S) / RES) * size + (p % S) / RES;
+				if (water[p] && !rivS[p] && r.ocean[bi]) { pot[p] = 0; queue[qt++] = p; }
+			}
+			while (qh < qt) {
+				int p = queue[qh++];
+				for (int k = 0; k < 4; k++) {
+					int q = neighbour(p, k, S);
+					if (q >= 0 && water[q] && pot[q] < 0) { pot[q] = pot[p] + 1; queue[qt++] = q; }
+				}
+			}
+			boolean[] seen = new boolean[n];
+			int[] order = new int[n], dist = new int[n];
+			for (int s0 = 0; s0 < n; s0++) {
+				if (!dom[s0] || seen[s0] || pot[s0] >= 0) continue;
+				int far = order[walkAll(s0, dom, pot, S, order, dist) - 1];
+				int count = walkAll(far, dom, pot, S, order, dist);
+				for (int i = 0; i < count; i++) { seen[order[i]] = true; pot[order[i]] = 100000 - dist[order[i]]; }
+			}
+			float[] pv = new float[n], pm = new float[n];
+			for (int p = 0; p < n; p++) if (dom[p] && pot[p] >= 0) { pv[p] = pot[p]; pm[p] = 1; }
+			float[] PV = Fields.boxBlur(Fields.boxBlur(pv, S, S, 1), S, S, 1), PM = Fields.boxBlur(Fields.boxBlur(pm, S, S, 1), S, S, 1);
+			float[] sm = new float[n];
+			for (int p = 0; p < n; p++) sm[p] = PM[p] > 1e-4f ? PV[p] / PM[p] : 0;
+			for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
+				int p = y * S + x;
+				if (!dom[p]) continue;
+				float gx = (dom[p + 1] ? sm[p + 1] : sm[p]) - (dom[p - 1] ? sm[p - 1] : sm[p]);
+				float gy = (dom[p + S] ? sm[p + S] : sm[p]) - (dom[p - S] ? sm[p - S] : sm[p]);
+				if (ax[p] * gx + ay[p] * gy > 0) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
+			}
+			if (memory != null) remember(r, dom, rivS, pot, ax, ay, memory);
+
+			// Speed.
+			float[] bankR = new float[n];
+			for (int p = 0; p < n; p++) bankR[p] = rivS[p] ? bank[p] : 0;
+			float[] halfW = Fields.maxFilter(bankR, S, S, 6);
+			for (int p = 0; p < n; p++) {
+				if (!dom[p]) continue;
+				float width = Math.max(8, 2 * halfW[p]);
+				float sp = (float) (settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, 40 / width)) * (1 + 0.4 * shallow[p])
+					* Math.sqrt(Math.min(1, bank[p] / 12)) * flowB[p]);
+				fx[p] = ax[p] * sp;
+				fy[p] = ay[p] * sp;
+			}
+			fx = Fields.boxBlur(fx, S, S, 1);
+			fy = Fields.boxBlur(fy, S, S, 1);
+			for (int p = 0; p < n; p++) if (land[p]) { fx[p] = 0; fy[p] = 0; }
+		}
+		r.riverFx = fx;
+		r.riverFy = fy;
+		byte[] decor = anyRiver ? decor(r, settings, dom, rivS, fx, fy) : new byte[size * 16 * size * 16 * 4];
+		// Still water in the decor's last channel: 0 for none, else 1..255 for how much the wind's
+		// ripples show there (none where a river's current rules).
+		int T = size * 16;
+		for (int tz = 0; tz < T; tz++) for (int tx = 0; tx < T; tx++) {
+			int sp = (tz / (int) tps) * S + tx / (int) tps;
+			if (stillS[sp]) decor[(tz * T + tx) * 4 + 3] = (byte) (1 + Math.round(254 * (1 - pull[sp])));
+		}
+		r.riverDecor = decor;
+	}
+
+	/**
+	 * Still water's fetch: from each field sample of still water (and of land beside it, for the
+	 * lapping on its shores), how far the wind has blown over open water (water that is not river)
+	 * to get there, for each of 16 wind directions.
+	 */
+	private static byte[] fetch(ShoreRegion r, boolean[] water, boolean[] rivS, boolean[] stillS) {
+		int S = r.samples, n = S * S, D = ShoreRegion.FETCH_DIRS;
+		float tps = ShoreRegion.TEXELS_PER_SAMPLE, max = ShoreRegion.FETCH_MAX;
+		float[] toStill = Fields.distanceTo(stillS, S, S);
+		byte[] out = new byte[n * D];
+		int steps = (int) (max / tps);
+		for (int d = 0; d < D; d++) {
+			double a = d * Math.PI * 2 / D, ux = -Math.cos(a), uz = -Math.sin(a); // upwind
+			for (int p = 0; p < n; p++) {
+				boolean onLand = !water[p];
+				if (!stillS[p] && !(onLand && toStill[p] <= 2)) continue;
+				double x = p % S, z = p / S;
+				boolean started = !onLand;
+				int skipped = 0;
+				float f = 0;
+				for (int k = 0; k < steps; k++) {
+					x += ux;
+					z += uz;
+					int ix = (int) Math.round(x), iz = (int) Math.round(z);
+					if (ix < 0 || iz < 0 || ix >= S || iz >= S) {
+						if (started) f += (steps - k) * tps; // open water beyond the region, as far as we know
+						break;
+					}
+					int q = iz * S + ix;
+					boolean open = water[q] && !rivS[q];
+					if (!started) {
+						if (open) started = true;
+						else if (++skipped > 3) break;
+						else continue;
+					}
+					if (!open) break;
+					f += tps;
+				}
+				out[p * D + d] = (byte) Math.round(Math.min(1, f / max) * 255);
+			}
+		}
+		return out;
 	}
 
 	private static int neighbour(int p, int k, int S) {

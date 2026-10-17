@@ -32,8 +32,12 @@ uniform sampler2D RegionSampler;
 // Per field sample: a river's current (texels per second, x and z), how much river it is (1 in a
 // river, fading into the sea at its mouth, 0 elsewhere) and how shallow (1 a block deep, 0.5 two).
 uniform sampler2D RiverSampler;
-// Per region texel, round rocks in rivers: the wake (r), the foam pillow (g) and foam trails (b).
+// Per region texel, round rocks in rivers: the wake (r), the foam pillow (g) and foam trails (b);
+// and still water (a): 0 for none, else 1..255 for how much the wind's ripples show there.
 uniform sampler2D RiverDecorSampler;
+// Still water's fetch, per field sample: four texels side by side hold the 16 wind directions
+// (texel k, channel c is direction 4k + c), as 0..1 of 384 texels of open water upwind.
+uniform sampler2D FetchSampler;
 
 layout(std140) uniform FoamBake {
     vec4 Region;   // region size in texels, field samples per block, field size in samples, -
@@ -51,6 +55,9 @@ layout(std140) uniform FoamBake {
     vec4 Swell2;   // travel fade (texels), crossing strength, crossing fades within (texels), -
     vec4 SwellOrigin; // region origin on the swell's noise lattice: whole cells (x, z), fraction (x, z)
     vec4 River;    // flow lines, flow line length (texels), lighter shallows, lapping at the banks
+    vec4 Wind;     // the way the wind blows (x, z, unit), its strength, its direction as 0..16 of the fetch's directions
+    vec4 Still;    // wind ripples, time between ripples (s), ripples full size over (texels), lapping run-up (texels)
+    vec4 RainW;    // rain (0..1), rain rings, region origin in world texels (x, z)
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -209,6 +216,42 @@ float distanceToBlock(vec2 texel, bool river) {
     return best;
 }
 
+// Still water's fetch at a region texel for the wind now, in texels, between the two nearest of
+// the 16 directions.
+float fetchAt(vec2 texel) {
+    ivec2 smp = ivec2(floor((texel + 0.5) / (16.0 / Region.y)));
+    int i0 = int(floor(Wind.w)) % 16, i1 = (i0 + 1) % 16;
+    float a = texelFetch(FetchSampler, ivec2(smp.x * 4 + i0 / 4, smp.y), 0)[i0 % 4];
+    float b = texelFetch(FetchSampler, ivec2(smp.x * 4 + i1 / 4, smp.y), 0)[i1 % 4];
+    return mix(a, b, fract(Wind.w)) * 384.0;
+}
+
+// Rain rings at a world texel position: each 5x5 cell has at most one drop per 0.9 s, at a hashed
+// spot and moment; its ring spreads for 0.45 s. How strong the ring is here (0 for none).
+float rainRingAt(vec2 wp) {
+    if (RainW.x <= 0.0 || RainW.y <= 0.0) return 0.0;
+    float T = Origin.z, ring = 0.0;
+    ivec2 c0 = ivec2(floor(wp / 5.0));
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 c = c0 + ivec2(dx, dz);
+            float off = hash3(c.x, c.y, 91) * 0.9;
+            int k = int(floor((T + off) / 0.9));
+            float age = T - (float(k) * 0.9 - off);
+            if (age > 0.45 || hash3(c.x, c.y, 97 + (k & 1023)) > RainW.y * 0.55 * RainW.x) continue;
+            vec2 drop = vec2(c) * 5.0 + vec2(hash3(c.x, c.y, 101 + (k & 1023)), hash3(c.x, c.y, 103 + (k & 1023))) * 5.0;
+            if (abs(length(wp - drop) - age * 9.0) < 0.6) ring = max(ring, 1.0 - age / 0.45);
+        }
+    }
+    return ring;
+}
+
+// The wind's ripple phase at a world texel position (0..1, crests near 0), for a fetch fraction.
+float ripplePhase(vec2 wp, float fr, ivec2 wt) {
+    float lam = 18.0 + 22.0 * fr;
+    return fract(dot(wp, Wind.xy) / lam - Origin.z / Still.y + (noiseAt(0, wt) - 0.5) * 0.35);
+}
+
 // A river at a texel, all of it under the waves' own foam. Whatever this layer covers hides vanilla's
 // water there (the quads are drawn before translucent terrain and write depth), so it draws the
 // water itself, with vanilla's own texture and opacity, and every effect is a change to that water:
@@ -218,13 +261,33 @@ float distanceToBlock(vec2 texel, bool river) {
 // on rocks' upstream faces, their wakes and foam trails. On land beside a river, the wet bank.
 vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     float T = Origin.z;
+    vec2 wp = RainW.zw + texel + 0.5;
     if (!isWater) {
         if (abs(levelAt(texel)) > 0.5) return vec4(0.0);
         float dr = distanceToBlock(texel, true);
+        // On a shore the wind blows onto, each ripple laps a little way up as it arrives.
+        if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0 && Wind.z > 0.0) {
+            float fr = min(1.0, fetchAt(texel) / Still.z), reach = Still.x * Wind.z * fr * Still.w;
+            if (reach > 0.3) {
+                float run = reach * max(0.0, sin(ripplePhase(wp, fr, wt) * 6.2832));
+                if (dr < run) {
+                    if (run - dr < 1.1) return vec4(run > reach * 0.6 ? foamBright() : foamShadow(), 1.0);
+                    vec4 sw = waterStill(wt);
+                    return vec4(sw.rgb, sw.a * Look.z * 0.8);
+                }
+                if (dr < reach + 1.0) return vec4(0.0, 0.0, 0.0, Look.y * 0.9);
+            }
+        }
         return dr < 2.5 && (dr < 1.5 || bay < 0.5) ? vec4(0.0, 0.0, 0.0, Look.y * 0.8) : vec4(0.0);
     }
     vec4 rv = riverAt(texel);
-    if (rv.z <= 0.0 || (rv.z < 1.0 && rv.z <= bay)) return vec4(0.0);
+    if (rv.z <= 0.0 || (rv.z < 1.0 && rv.z <= bay)) {
+        // Plain water (the sea): only rain rings, drawn as lighter water (this layer hides vanilla's
+        // water wherever it draws).
+        float ring = rainRingAt(wp);
+        if (ring > bay * 0.8) { vec4 sw = waterStill(wt); return vec4(min(sw.rgb * 1.22 + 20.0 / 255.0, vec3(1.0)), sw.a * Look.z); }
+        return vec4(0.0);
+    }
     vec4 decor = texelFetch(RiverDecorSampler, ivec2(texel), 0);
     float bank = distanceToBlock(texel, false), sh = rv.w;
     float shq = sh + (bay - 0.5) * 0.5, stp = shq > 0.66 ? 1.0 : shq > 0.33 ? 0.5 : 0.0;
@@ -237,6 +300,22 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         alpha *= 1.0 - 0.4 * a; // clearer: the bed shows through more
     } else {
         col *= 1.0 - 0.08 * min(1.0, bank / 32.0);
+    }
+    // Wind ripples on still water: straight crests at right angles to the wind moving downwind,
+    // bigger and longer the more open water lies upwind; gusts (patches moving with the wind) carry
+    // them, and a strong wind over a long fetch tips them white.
+    if (decor.a > 0.5 / 255.0 && Still.x > 0.0 && Wind.z > 0.0) {
+        float fr = min(1.0, fetchAt(texel) / Still.z);
+        float amp = Still.x * Wind.z * fr * (decor.a * 255.0 - 1.0) / 254.0;
+        if (amp > 0.02) {
+            float fp = ripplePhase(wp, fr, wt);
+            float gust = vnoise(ivec2(0), (wp - Wind.xy * Origin.z * 14.0) / 40.0, 77);
+            if (fp < 0.1 + 0.08 * amp && amp * (0.4 + gust) > bay * 0.9) {
+                if (amp > 0.65 && fp < 0.035 && hash3(int(floor(wp.x / 2.0)), int(floor(wp.y / 2.0)), int(floor(Origin.z * 3.0))) < (amp - 0.65) * 2.0)
+                    return vec4(foamBright(), 1.0);
+                col = col * 1.2 + 16.0 / 255.0;
+            }
+        }
     }
     float sp = length(rv.xy), v = 0.0;
     if (sp > 0.5 && River.x > 0.0) {
@@ -269,6 +348,9 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     if (decor.r > 0.0 && decor.r > 0.25 + 0.35 * bay + 0.15 * sin(T * 5.0 + float(wt.x + wt.y) * 0.4)) {
         col = col * 1.2 + 24.0 / 255.0; // the wake shimmers
     }
+    // Rain rings, where the water is calm enough to show them.
+    float ring = rainRingAt(wp) * (1.0 - min(1.0, sp / 20.0));
+    if (ring > bay * 0.8) col = col * 1.22 + 20.0 / 255.0;
     return vec4(min(col, vec3(1.0)), alpha);
 }
 

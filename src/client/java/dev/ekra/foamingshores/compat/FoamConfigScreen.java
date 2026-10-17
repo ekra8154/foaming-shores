@@ -78,6 +78,16 @@ public final class FoamConfigScreen {
 			new Opt("riverRock", 0, 1, 0.05f, "none"),
 			new Opt("riverWake", 0, 8, 0.5f, "blocks"),
 			new Opt("riverTrail", 0, 12, 0.5f, "blocks"))),
+		new Group("still", List.of(
+			new Opt("backwater", 0.5f, 8, 0.5f, "blocks"),
+			new Opt("windDir", 0, 355, 5, "degrees"),
+			new Opt("windShift", 0, 90, 5, "degrees"),
+			new Opt("windStrength", 0, 1, 0.05f, "none"),
+			new Opt("chop", 0, 1, 0.05f, "none"),
+			new Opt("chopPeriod", 0.8f, 5, 0.1f, "seconds"),
+			new Opt("fetchFull", 2, 32, 1, "blocks"),
+			new Opt("chopRunup", 0, 8, 0.5f, "texels"),
+			new Opt("rainRings", 0, 1, 0.05f, "none"))),
 		new Group("wet", List.of(
 			new Opt("wetDark", 0, 0.6f, 0.01f, "none"),
 			new Opt("dryTime", 0.5f, 20, 0.5f, "seconds"))),

@@ -22,6 +22,7 @@ public final class FoamPipelines {
 		.withUniform("DipSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("RiverSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("RiverDecorSampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("FetchSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("AtlasSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("RegionSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.build();

@@ -57,6 +57,8 @@ public final class ShoreRegion {
 	public final boolean[] low;
 	/** Per column: water at the body's layer in a river biome, and how deep it is (1 to 4 blocks). */
 	public final boolean[] river;
+	/** Per column: still water (at the body's layer, neither river nor ocean or beach: lakes, ponds, side pockets). */
+	public final boolean[] still;
 	public final byte[] depth;
 	/**
 	 * Rivers (null when the region has none; see {@link Rivers}): per field sample the current
@@ -65,6 +67,14 @@ public final class ShoreRegion {
 	 */
 	public float[] riverFx, riverFy, riverBlend, riverShallow;
 	public byte[] riverDecor;
+	/**
+	 * Still water's fetch (see {@link Rivers}): per field sample, for 16 wind directions (the
+	 * direction the wind blows toward, i * 22.5 degrees from +x toward +z), how much open water lies
+	 * upwind, as 0..255 of {@link #FETCH_MAX} texels; null when the region has no inland water.
+	 */
+	public byte[] fetch;
+	public static final int FETCH_DIRS = 16;
+	public static final float FETCH_MAX = 24 * 16;
 	/** Whether each column's water at the body's layer lies in an ocean or beach biome. */
 	public final boolean[] ocean;
 	/**
@@ -102,6 +112,7 @@ public final class ShoreRegion {
 		this.low = new boolean[size * size];
 		this.river = new boolean[size * size];
 		this.ocean = new boolean[size * size];
+		this.still = new boolean[size * size];
 		this.depth = snap.depth.clone();
 		this.sea = new boolean[size * size];
 		this.dipId = new short[size * size];
@@ -121,7 +132,7 @@ public final class ShoreRegion {
 	 */
 	public record Settings(int minBodyBlocks, float openWaterBlocks, float downhill, int smoothingTexels,
 		float farSmoothBlocks, float wrapAngle, int minIsland, float runupReachTexels,
-		float riverSpeed, float riverRock, float riverWake, float riverTrail) {
+		float riverSpeed, float riverRock, float riverWake, float riverTrail, float backwater) {
 	}
 
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings) {
@@ -142,6 +153,7 @@ public final class ShoreRegion {
 			r.low[i] = snap.water[i] && snap.topY[i] < waterY;
 			r.river[i] = surfaceWater[i] && snap.river[i];
 			r.ocean[i] = surfaceWater[i] && snap.ocean[i];
+			r.still[i] = surfaceWater[i] && !r.river[i] && !r.ocean[i];
 			// A lower pool is never stepped into, however shallow the step: as deep as a drop.
 			r.level[i] = (byte) (r.low[i] ? -4 : Math.max(-4, Math.min(1, lv)));
 		}

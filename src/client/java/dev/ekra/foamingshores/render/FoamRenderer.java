@@ -97,6 +97,7 @@ public final class FoamRenderer {
 	private static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.putVec4().putVec4().putVec4().putVec4()
+		.putVec4().putVec4().putVec4()
 		.get() + 16 * 2 * MAX_WAVES;
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
@@ -118,8 +119,8 @@ public final class FoamRenderer {
 	/** Chunks missing from the snapshot behind the current region, and behind the one being built. */
 	private Set<Long> missing = Set.of(), buildingMissing = Set.of();
 
-	private GpuTexture fieldTexture, field2Texture, noiseTexture, faceDataTexture, dipTexture, riverTexture, riverDecorTexture;
-	private GpuTextureView fieldView, field2View, noiseView, faceDataView, dipView, riverView, riverDecorView;
+	private GpuTexture fieldTexture, field2Texture, noiseTexture, faceDataTexture, dipTexture, riverTexture, riverDecorTexture, fetchTexture;
+	private GpuTextureView fieldView, field2View, noiseView, faceDataView, dipView, riverView, riverDecorView, fetchView;
 	/** Which way the current world's rivers run, kept between visits. */
 	private RiverMemory rivers = new RiverMemory(null);
 	private byte[] noiseBytes;
@@ -157,7 +158,7 @@ public final class FoamRenderer {
 	public void settingsChanged() {
 		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth",
 			"splashHeight", "fallFade", "farSmooth", "wrapAngle", "minIsland", "waveVary", "travelFade", "wrap", "wrapLag",
-			"riverSpeed", "riverRock", "riverWake", "riverTrail")) {
+			"riverSpeed", "riverRock", "riverWake", "riverTrail", "backwater")) {
 			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
@@ -225,7 +226,7 @@ public final class FoamRenderer {
 			buildingMissing = snap.missingChunks;
 			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing,
 				settings.farSmooth, settings.wrapAngle, settings.minIsland, settings.runup * 16 * (1 + settings.waveVary) + settings.jag + 4,
-				settings.riverSpeed, settings.riverRock, settings.riverWake, settings.riverTrail);
+				settings.riverSpeed, settings.riverRock, settings.riverWake, settings.riverTrail, settings.backwater);
 			RiverMemory memory = rivers;
 			building = CompletableFuture.supplyAsync(() -> {
 				try {
@@ -298,7 +299,7 @@ public final class FoamRenderer {
 		return out;
 	}
 
-	/** Whether a block is river water or land at the water's level right beside some. */
+	/** Whether a block is river or still water, or land at the water's level right beside some. */
 	private static boolean riverNear(ShoreRegion r, int bx, int bz) {
 		int bi = bz * r.size + bx;
 		if (r.water[bi]) {
@@ -310,7 +311,7 @@ public final class FoamRenderer {
 		for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) {
 			int nx = bx + dx, nz = bz + dz;
 			if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) continue;
-			if (r.river[nz * r.size + nx]) return true;
+			if (r.river[nz * r.size + nx] || r.still[nz * r.size + nx]) return true;
 		}
 		return false;
 	}
@@ -354,7 +355,15 @@ public final class FoamRenderer {
 		} finally {
 			MemoryUtil.memFree(buf);
 		}
-		// Rocks' wake, pillow and foam trails, per region texel.
+		// Still water's fetch: per field sample, 16 directions, as four RGBA texels side by side.
+		ByteBuffer fetch = MemoryUtil.memCalloc(S * S * ShoreRegion.FETCH_DIRS);
+		try {
+			if (r.fetch != null) fetch.put(r.fetch).flip();
+			RenderSystem.getDevice().createCommandEncoder().writeToTexture(fetchTexture, fetch, 0, 0, 0, 0, S * 4, S);
+		} finally {
+			MemoryUtil.memFree(fetch);
+		}
+		// Rocks' wake, pillow and foam trails, and still water, per region texel.
 		ByteBuffer decor = MemoryUtil.memCalloc(TEXELS * TEXELS * 4);
 		try {
 			if (r.riverDecor != null) decor.put(r.riverDecor).flip();
@@ -558,6 +567,8 @@ public final class FoamRenderer {
 		riverView = device.createTextureView(riverTexture);
 		riverDecorTexture = device.createTexture("Foaming Shores river rocks", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM, TEXELS, TEXELS, 1, 1);
 		riverDecorView = device.createTextureView(riverDecorTexture);
+		fetchTexture = device.createTexture("Foaming Shores fetch", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM, S * 4, S, 1, 1);
+		fetchView = device.createTextureView(fetchTexture);
 		noiseTexture = device.createTexture("Foaming Shores noise", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM, FoamNoise.SIZE, FoamNoise.SIZE, 1, 1);
 		noiseView = device.createTextureView(noiseTexture);
 		uploadNoise(device);
@@ -651,6 +662,15 @@ public final class FoamRenderer {
 			double lx = region.originX / (double) Math.max(1, s.peelScale), lz = region.originZ / (double) Math.max(1, s.peelScale);
 			b.putVec4((float) Math.floor(lx), (float) Math.floor(lz), (float) (lx - Math.floor(lx)), (float) (lz - Math.floor(lz)));
 			b.putVec4(s.riverStreaks, s.riverLen, s.riverShallow, s.riverBank);
+			// The wind: one for the whole world, wandering slowly about its set direction and strength,
+			// following the world's time (so every player sees the same), stronger in rain.
+			float rain = level == null ? 0 : level.getRainLevel(1);
+			double ang = Math.toRadians(s.windDir + s.windShift * (WaveMath.vnoise(now / 90, 0.5, 501) * 2 - 1));
+			double strength = Math.min(1.5, s.windStrength * (0.75 + 0.5 * WaveMath.vnoise(now / 40, 3.5, 503)) * (1 + 0.5 * rain));
+			double dirIndex = ((ang / (Math.PI * 2) * ShoreRegion.FETCH_DIRS) % ShoreRegion.FETCH_DIRS + ShoreRegion.FETCH_DIRS) % ShoreRegion.FETCH_DIRS;
+			b.putVec4((float) Math.cos(ang), (float) Math.sin(ang), (float) strength, (float) dirIndex);
+			b.putVec4(s.chop, s.chopPeriod, s.fetchFull * 16, s.chopRunup);
+			b.putVec4(rain, s.rainRings, region.originX * 16f, region.originZ * 16f);
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {
 					WaveSchedule.Wave w = waves.get(i);
@@ -673,6 +693,7 @@ public final class FoamRenderer {
 			pass.setUniform("DipSampler", dipView, nearest);
 			pass.setUniform("RiverSampler", riverView, nearest);
 			pass.setUniform("RiverDecorSampler", riverDecorView, nearest);
+			pass.setUniform("FetchSampler", fetchView, nearest);
 			pass.setUniform("AtlasSampler", water.atlas(), nearest);
 			pass.setUniform("RegionSampler", mode == 1 ? output.getTextureView() : noiseView, nearest);
 			pass.draw(3, 1, 0, 0);

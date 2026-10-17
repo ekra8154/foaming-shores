@@ -123,7 +123,7 @@ public final class WaveMath {
 	}
 
 	/** Smooth value noise on the integer lattice, the same as the bake shader's vnoise. */
-	static double vnoise(double x, double z, int seed) {
+	public static double vnoise(double x, double z, int seed) {
 		double fx = Math.floor(x), fz = Math.floor(z);
 		int ix = (int) fx, iz = (int) fz;
 		double tx = x - fx, tz = z - fz;
