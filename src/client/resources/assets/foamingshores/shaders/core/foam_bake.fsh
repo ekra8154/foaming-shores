@@ -209,8 +209,10 @@ float distanceToBlock(vec2 texel, bool river) {
     return best;
 }
 
-// A river at a texel, all of it under the waves' own foam: shallows lighter, the deep a touch
-// darker toward the middle; flow lines (dots carried by the current, each drawn as a short streak
+// A river at a texel, all of it under the waves' own foam. Whatever this layer covers hides vanilla's
+// water there (the quads are drawn before translucent terrain and write depth), so it draws the
+// water itself, with vanilla's own texture and opacity, and every effect is a change to that water:
+// shallows clearer, lighter and a little greener, the deep a touch darker toward the middle; flow lines (dots carried by the current, each drawn as a short streak
 // whose bright head leads; two copies half a cycle apart, each starting over once a cycle,
 // crossfaded by dithering so the restart never shows); the edge lapping in slow pulses; foam piled
 // on rocks' upstream faces, their wakes and foam trails. On land beside a river, the wet bank.
@@ -226,9 +228,16 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     vec4 decor = texelFetch(RiverDecorSampler, ivec2(texel), 0);
     float bank = distanceToBlock(texel, false), sh = rv.w;
     float shq = sh + (bay - 0.5) * 0.5, stp = shq > 0.66 ? 1.0 : shq > 0.33 ? 0.5 : 0.0;
-    vec4 c = stp > 0.0 ? vec4(mix(Water.rgb, vec3(0.62, 0.95, 0.85), 0.5), River.z * stp * 0.4)
-                       : vec4(0.0, 0.0, 0.0, 0.1 * min(1.0, bank / 32.0));
-    vec3 light = mix(Water.rgb, vec3(1.0), 0.5);
+    vec4 w = waterStill(wt);
+    vec3 col = w.rgb;
+    float alpha = w.a * Look.z;
+    if (stp > 0.0) {
+        float a = River.z * stp, k = 1.0 + 0.3 * a;
+        col = col * vec3(0.94 * k, 1.1 * k, k) + vec3(12.0, 20.0, 8.0) / 255.0 * a;
+        alpha *= 1.0 - 0.4 * a; // clearer: the bed shows through more
+    } else {
+        col *= 1.0 - 0.08 * min(1.0, bank / 32.0);
+    }
     float sp = length(rv.xy), v = 0.0;
     if (sp > 0.5 && River.x > 0.0) {
         float per = 2.2, ph = fract(T / per), wA = 1.0 - abs(2.0 * ph - 1.0);
@@ -245,20 +254,22 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         }
     }
     if (v > 0.0) {
-        c = over(vec4(light, v > 0.6 ? 0.8 : 0.45), c);
         // Foam carried down from a rock, and sparkle on the shallows, as white.
-        if ((decor.b > 0.2 && v > 0.35) || (sh > 0.6 && v > 0.8 && hash3(wt.x, wt.y, 71) < 0.35)) c = vec4(foamBright(), 1.0);
+        if ((decor.b > 0.2 && v > 0.35) || (sh > 0.6 && v > 0.8 && hash3(wt.x, wt.y, 71) < 0.35)) return vec4(foamBright(), 1.0);
+        col = v > 0.6 ? col * 1.34 + 30.0 / 255.0 : col * 1.16 + 12.0 / 255.0;
+        alpha = max(alpha, w.a * Look.z);
     }
     if (bank < 1.6 && River.w > 0.0) {
         float lap = 0.5 + 0.5 * sin(T * 1.7 + hash3(wt.x >> 2, wt.y >> 2, 5) * 6.283);
-        if (lap > 1.0 - River.w * 0.45) c = over(vec4(light, 0.55), c);
+        if (lap > 1.0 - River.w * 0.45) col = col * 1.18 + 16.0 / 255.0;
     }
     if (decor.g > 0.0 && decor.g * 1.3 > hash3(wt.x >> 1, wt.y >> 1, int(floor(T * 6.0)))) {
-        c = vec4(decor.g > 0.5 ? foamBright() : foamShadow(), 1.0);
-    } else if (decor.r > 0.0 && decor.r > 0.25 + 0.35 * bay + 0.15 * sin(T * 5.0 + float(wt.x + wt.y) * 0.4)) {
-        c = over(vec4(light, 0.6), c); // the wake shimmers
+        return vec4(decor.g > 0.5 ? foamBright() : foamShadow(), 1.0);
     }
-    return c;
+    if (decor.r > 0.0 && decor.r > 0.25 + 0.35 * bay + 0.15 * sin(T * 5.0 + float(wt.x + wt.y) * 0.4)) {
+        col = col * 1.2 + 24.0 / 255.0; // the wake shimmers
+    }
+    return vec4(min(col, vec3(1.0)), alpha);
 }
 
 // Vanilla flowing water on a face (it already scrolls downward), column u, row down from the top.
