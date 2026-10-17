@@ -268,10 +268,10 @@ public final class FoamRenderer {
 	private static Path riverFile(Minecraft mc, ClientLevel lvl) {
 		String dim = lvl.dimension().identifier().toString().replaceAll("[^A-Za-z0-9._-]", "_");
 		IntegratedServer local = mc.getSingleplayerServer();
-		if (local != null) return local.getWorldPath(LevelResource.ROOT).resolve("foamingshores").resolve("rivers_" + dim + ".txt");
+		if (local != null) return local.getWorldPath(LevelResource.ROOT).resolve("foamingshores").resolve("rivers_" + dim + ".json");
 		ServerData server = mc.getCurrentServer();
 		String name = (server != null ? server.ip : "unknown").replaceAll("[^A-Za-z0-9._-]", "_");
-		return FabricLoader.getInstance().getConfigDir().resolve("foamingshores").resolve("rivers").resolve(name).resolve(dim + ".txt");
+		return FabricLoader.getInstance().getConfigDir().resolve("foamingshores").resolve("rivers").resolve(name).resolve(dim + ".json");
 	}
 
 	/** Blocks whose top lies within reach of the waves or on a river (and its banks), with the level they sit at. */

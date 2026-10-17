@@ -1,6 +1,12 @@
 package dev.ekra.foamingshores.shore;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParseException;
+
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,10 +20,25 @@ import java.util.Map;
  * Which way each river runs, remembered per world (and dimension) so it never changes between
  * visits or sessions: one direction per chunk a river crosses, taken at the river's point nearest
  * the chunk's middle, and whether it was worked out from the sea (sure) or only picked because the
- * sea was out of sight (a guess, which the sea may correct once). A text file of
- * "chunkX chunkZ dirX dirZ sure" lines.
+ * sea was out of sight (a guess, which the sea may correct once). Kept as JSON:
+ * {@code {"version": 1, "chunks": [{"x", "z", "dirX", "dirZ", "sure"}, ...]}}.
  */
 public final class RiverMemory {
+	private static final int VERSION = 1;
+	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+	/** The file's shape. */
+	private static final class Stored {
+		int version = VERSION;
+		List<Chunk> chunks = new ArrayList<>();
+	}
+
+	private static final class Chunk {
+		int x, z;
+		float dirX, dirZ;
+		boolean sure;
+	}
+
 	private final Path file;
 	private final Map<Long, float[]> dirs = new HashMap<>();
 	private boolean dirty;
@@ -26,19 +47,12 @@ public final class RiverMemory {
 	public RiverMemory(Path file) {
 		this.file = file;
 		if (file == null || !Files.isRegularFile(file)) return;
-		try {
-			for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-				String[] f = line.trim().split("\\s+");
-				if (f.length < 4) continue;
-				try {
-					float sure = f.length > 4 ? Float.parseFloat(f[4]) : 0;
-					dirs.put(key(Integer.parseInt(f[0]), Integer.parseInt(f[1])), new float[] {Float.parseFloat(f[2]), Float.parseFloat(f[3]), sure});
-				} catch (NumberFormatException ignored) {
-					// a damaged line: forget it
-				}
-			}
-		} catch (IOException ignored) {
-			// unreadable: start afresh
+		try (Reader in = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+			Stored stored = GSON.fromJson(in, Stored.class);
+			if (stored == null || stored.chunks == null) return;
+			for (Chunk c : stored.chunks) if (c != null) dirs.put(key(c.x, c.z), new float[] {c.dirX, c.dirZ, c.sure ? 1 : 0});
+		} catch (IOException | JsonParseException ignored) {
+			// unreadable or damaged: start afresh
 		}
 	}
 
@@ -61,15 +75,23 @@ public final class RiverMemory {
 	/** Writes the file if anything changed (atomically, so a crash never leaves half a file). */
 	public synchronized void save() {
 		if (!dirty || file == null) return;
-		List<String> lines = new ArrayList<>(dirs.size());
+		Stored stored = new Stored();
 		for (Map.Entry<Long, float[]> e : dirs.entrySet()) {
-			int cx = (int) (e.getKey() >> 32), cz = (int) (e.getKey() & 0xFFFFFFFFL);
-			lines.add(cx + " " + cz + " " + e.getValue()[0] + " " + e.getValue()[1] + " " + (int) e.getValue()[2]);
+			Chunk c = new Chunk();
+			c.x = (int) (e.getKey() >> 32);
+			c.z = (int) (e.getKey() & 0xFFFFFFFFL);
+			c.dirX = Math.round(e.getValue()[0] * 1000) / 1000f; // three places are plenty for a direction
+			c.dirZ = Math.round(e.getValue()[1] * 1000) / 1000f;
+			c.sure = e.getValue()[2] > 0.5f;
+			stored.chunks.add(c);
 		}
+		stored.chunks.sort((a, b) -> a.x != b.x ? Integer.compare(a.x, b.x) : Integer.compare(a.z, b.z));
 		try {
 			Files.createDirectories(file.getParent());
 			Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-			Files.write(tmp, lines, StandardCharsets.UTF_8);
+			try (Writer out = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8)) {
+				GSON.toJson(stored, out);
+			}
 			Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 			dirty = false;
 		} catch (IOException ignored) {
