@@ -1,0 +1,347 @@
+package dev.ekra.foamingshores.shore;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * River currents and the foam around rocks (see the playground's rivers). River water is the body's
+ * water lying in a river biome.
+ * <ul>
+ * <li>The axis: the distance to the nearest bank rises from both banks to the middle, so its slope
+ *     points across the channel; averaged as a line rather than an arrow (a structure tensor, so
+ *     opposite banks do not cancel) it gives the way along the river, bending round rocks and bends.</li>
+ * <li>Which way along it: down a smooth "how far up the river" field (the distance to the sea along
+ *     the water, or, for a stretch whose sea is out of reach, away from its far end), and then,
+ *     stretch by stretch, whatever the {@link RiverMemory} remembers for its chunks: once a river
+ *     has a direction it keeps it.</li>
+ * <li>Speed: faster where narrow and over the shallows, slower toward the banks.</li>
+ * <li>Rocks (land sticking up with river on two sides or more): foam piled on the upstream face, a
+ *     V-shaped wake, and foam trails carried downstream, at texel resolution.</li>
+ * </ul>
+ */
+final class Rivers {
+	private Rivers() {
+	}
+
+	static void build(ShoreRegion r, ShoreRegion.Settings settings, RiverMemory memory) {
+		int size = r.size, S = r.samples, n = S * S, RES = ShoreRegion.RES;
+		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
+		boolean[] water = new boolean[n], land = new boolean[n], rivS = new boolean[n];
+		boolean any = false;
+		for (int p = 0; p < n; p++) {
+			int bi = ((p / S) / RES) * size + (p % S) / RES;
+			water[p] = r.water[bi];
+			land[p] = !water[p];
+			rivS[p] = water[p] && r.river[bi];
+			any |= rivS[p];
+		}
+		if (!any) return;
+
+		float[] bank = Fields.distanceTo(land, S, S), toRiver = Fields.distanceTo(rivS, S, S);
+		for (int p = 0; p < n; p++) {
+			bank[p] = Math.max(0, bank[p] * tps - tps / 2);
+			toRiver[p] = Math.max(0, toRiver[p] * tps - tps / 2);
+		}
+		// How much river (fading into the sea at its mouth) and how shallow.
+		float[] rv = new float[n], sv = new float[n];
+		for (int p = 0; p < n; p++) {
+			int bi = ((p / S) / RES) * size + (p % S) / RES;
+			rv[p] = rivS[p] ? 1 : 0;
+			sv[p] = rivS[p] ? (r.depth[bi] <= 1 ? 1 : r.depth[bi] == 2 ? 0.5f : 0) : 0;
+		}
+		float[] rvB = Fields.boxBlur(Fields.boxBlur(rv, S, S, 1), S, S, 1), svB = Fields.boxBlur(sv, S, S, 1);
+		float[] blend = new float[n], shallow = new float[n];
+		for (int p = 0; p < n; p++) {
+			if (land[p]) continue;
+			blend[p] = rivS[p] ? Math.min(1, Math.max(Math.max(0.5f, rvB[p]) * 2 - 1, rvB[p] * 1.6f)) : Math.max(0, rvB[p] * 2 - 1) * 0.6f;
+			shallow[p] = svB[p];
+		}
+
+		// The axis.
+		boolean[] dom = new boolean[n];
+		for (int p = 0; p < n; p++) dom[p] = water[p] && toRiver[p] <= 40;
+		float[] jxx = new float[n], jxy = new float[n], jyy = new float[n];
+		for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
+			int p = y * S + x;
+			if (!dom[p]) continue;
+			float gx = (bank[p + 1] - bank[p - 1]) * 0.5f, gy = (bank[p + S] - bank[p - S]) * 0.5f;
+			jxx[p] = gx * gx;
+			jxy[p] = gx * gy;
+			jyy[p] = gy * gy;
+		}
+		float[] Jxx = Fields.boxBlur(Fields.boxBlur(jxx, S, S, 2), S, S, 2), Jxy = Fields.boxBlur(Fields.boxBlur(jxy, S, S, 2), S, S, 2),
+			Jyy = Fields.boxBlur(Fields.boxBlur(jyy, S, S, 2), S, S, 2);
+		float[] ax = new float[n], ay = new float[n];
+		for (int p = 0; p < n; p++) {
+			if (!dom[p]) continue;
+			double th = 0.5 * Math.atan2(2 * Jxy[p], Jxx[p] - Jyy[p]); // across the river
+			ax[p] = (float) -Math.sin(th);
+			ay[p] = (float) Math.cos(th);
+		}
+
+		// Which way: down the distance to the sea along the water (the sea being the body's water
+		// that is not river), or away from the far end of a stretch that cannot reach it.
+		float[] pot = new float[n];
+		java.util.Arrays.fill(pot, -1);
+		int[] queue = new int[n];
+		int qh = 0, qt = 0;
+		for (int p = 0; p < n; p++) {
+			int bi = ((p / S) / RES) * size + (p % S) / RES;
+			if (water[p] && !rivS[p] && r.sea[bi]) { pot[p] = 0; queue[qt++] = p; }
+		}
+		while (qh < qt) {
+			int p = queue[qh++];
+			for (int k = 0; k < 4; k++) {
+				int q = neighbour(p, k, S);
+				if (q >= 0 && water[q] && pot[q] < 0) { pot[q] = pot[p] + 1; queue[qt++] = q; }
+			}
+		}
+		boolean[] seen = new boolean[n];
+		int[] order = new int[n], dist = new int[n];
+		for (int s0 = 0; s0 < n; s0++) {
+			if (!dom[s0] || seen[s0] || pot[s0] >= 0) continue;
+			int far = order[walkAll(s0, dom, pot, S, order, dist) - 1];
+			int count = walkAll(far, dom, pot, S, order, dist);
+			for (int i = 0; i < count; i++) { seen[order[i]] = true; pot[order[i]] = 100000 - dist[order[i]]; }
+		}
+		float[] pv = new float[n], pm = new float[n];
+		for (int p = 0; p < n; p++) if (dom[p] && pot[p] >= 0) { pv[p] = pot[p]; pm[p] = 1; }
+		float[] PV = Fields.boxBlur(Fields.boxBlur(pv, S, S, 1), S, S, 1), PM = Fields.boxBlur(Fields.boxBlur(pm, S, S, 1), S, S, 1);
+		float[] sm = new float[n];
+		for (int p = 0; p < n; p++) sm[p] = PM[p] > 1e-4f ? PV[p] / PM[p] : 0;
+		for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
+			int p = y * S + x;
+			if (!dom[p]) continue;
+			float gx = (dom[p + 1] ? sm[p + 1] : sm[p]) - (dom[p - 1] ? sm[p - 1] : sm[p]);
+			float gy = (dom[p + S] ? sm[p + S] : sm[p]) - (dom[p - S] ? sm[p - S] : sm[p]);
+			if (ax[p] * gx + ay[p] * gy > 0) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
+		}
+		if (memory != null) remember(r, dom, rivS, pot, ax, ay, memory);
+
+		// Speed.
+		float[] bankR = new float[n];
+		for (int p = 0; p < n; p++) bankR[p] = rivS[p] ? bank[p] : 0;
+		float[] halfW = Fields.maxFilter(bankR, S, S, 6);
+		float[] fx = new float[n], fy = new float[n];
+		for (int p = 0; p < n; p++) {
+			if (!dom[p]) continue;
+			float width = Math.max(8, 2 * halfW[p]);
+			float sp = (float) (settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, 40 / width)) * (1 + 0.4 * shallow[p])
+				* Math.sqrt(Math.min(1, bank[p] / 12)) * blend[p]);
+			fx[p] = ax[p] * sp;
+			fy[p] = ay[p] * sp;
+		}
+		fx = Fields.boxBlur(fx, S, S, 1);
+		fy = Fields.boxBlur(fy, S, S, 1);
+		for (int p = 0; p < n; p++) if (land[p]) { fx[p] = 0; fy[p] = 0; }
+		r.riverFx = fx;
+		r.riverFy = fy;
+		r.riverBlend = blend;
+		r.riverShallow = shallow;
+		r.riverDecor = decor(r, settings, dom, rivS, fx, fy);
+	}
+
+	private static int neighbour(int p, int k, int S) {
+		int x = p % S, y = p / S;
+		return switch (k) {
+			case 0 -> x > 0 ? p - 1 : -1;
+			case 1 -> x < S - 1 ? p + 1 : -1;
+			case 2 -> y > 0 ? p - S : -1;
+			default -> y < S - 1 ? p + S : -1;
+		};
+	}
+
+	/**
+	 * Breadth-first from {@code from} over a stretch cut off from the sea: fills the visiting order
+	 * (the last is the point furthest away) and each point's distance; returns how many it reached.
+	 */
+	private static int walkAll(int from, boolean[] dom, float[] pot, int S, int[] order, int[] dist) {
+		boolean[] visited = new boolean[dom.length];
+		int h = 0, t = 0;
+		order[t++] = from;
+		visited[from] = true;
+		dist[from] = 0;
+		while (h < t) {
+			int p = order[h++];
+			for (int k = 0; k < 4; k++) {
+				int q = neighbour(p, k, S);
+				if (q < 0 || !dom[q] || pot[q] >= 0 || visited[q]) continue;
+				visited[q] = true;
+				dist[q] = dist[p] + 1;
+				order[t++] = q;
+			}
+		}
+		return t;
+	}
+
+	/**
+	 * Keeps each stretch of river running the way it ran before: per chunk, the direction at the
+	 * river point nearest the chunk's middle. A stretch whose remembered chunks mostly disagree with
+	 * the way just worked out is turned round; then every chunk it crosses is remembered. A way worked
+	 * out from the sea is sure: it is only turned round by other sure memories, and it corrects
+	 * guesses made while the sea was out of sight (once; after that they are sure too).
+	 */
+	private static void remember(ShoreRegion r, boolean[] dom, boolean[] rivS, float[] pot, float[] ax, float[] ay, RiverMemory memory) {
+		int S = r.samples, n = S * S;
+		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
+		boolean[] seen = new boolean[n];
+		ArrayDeque<Integer> q = new ArrayDeque<>();
+		List<Integer> comp = new ArrayList<>();
+		for (int s0 = 0; s0 < n; s0++) {
+			if (!dom[s0] || seen[s0]) continue;
+			comp.clear();
+			q.add(s0);
+			seen[s0] = true;
+			while (!q.isEmpty()) {
+				int p = q.poll();
+				comp.add(p);
+				for (int k = 0; k < 4; k++) {
+					int nb = neighbour(p, k, S);
+					if (nb >= 0 && dom[nb] && !seen[nb]) { seen[nb] = true; q.add(nb); }
+				}
+			}
+			// The river point nearest each chunk's middle.
+			Map<Long, int[]> nearest = new HashMap<>();
+			Map<Long, Float> best = new HashMap<>();
+			for (int p : comp) {
+				if (!rivS[p]) continue;
+				double wx = r.originX + ((p % S) + 0.5) * tps / 16, wz = r.originZ + ((p / S) + 0.5) * tps / 16;
+				int cx = Math.floorDiv((int) Math.floor(wx), 16), cz = Math.floorDiv((int) Math.floor(wz), 16);
+				double dx = wx - (cx * 16 + 8), dz = wz - (cz * 16 + 8);
+				float d2 = (float) (dx * dx + dz * dz);
+				long key = RiverMemory.key(cx, cz);
+				Float b = best.get(key);
+				if (b == null || d2 < b) { best.put(key, d2); nearest.put(key, new int[] {cx, cz, p}); }
+			}
+			if (nearest.isEmpty()) continue;
+			// Sure memories outrank guesses; only when there are none do guesses vote.
+			boolean sure = false, anySure = false;
+			for (int p : comp) if (rivS[p] && pot[p] >= 0 && pot[p] < 50000) { sure = true; break; }
+			for (int[] c : nearest.values()) { float[] saved = memory.get(c[0], c[1]); if (saved != null && saved[2] > 0.5f) anySure = true; }
+			int votes = 0;
+			for (int[] c : nearest.values()) {
+				float[] saved = memory.get(c[0], c[1]);
+				if (saved == null || ((sure || anySure) && saved[2] < 0.5f)) continue;
+				votes += saved[0] * ax[c[2]] + saved[1] * ay[c[2]] >= 0 ? 1 : -1;
+			}
+			if (votes < 0) for (int p : comp) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
+			for (int[] c : nearest.values()) memory.put(c[0], c[1], ax[c[2]], ay[c[2]], sure || anySure);
+		}
+	}
+
+	/** Wake (R), pillow (G) and foam trails (B) per region texel, 0..255. */
+	private static byte[] decor(ShoreRegion r, ShoreRegion.Settings s, boolean[] dom, boolean[] rivS, float[] fx, float[] fy) {
+		int size = r.size, S = r.samples, T = size * 16;
+		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
+		byte[] out = new byte[T * T * 4];
+		float rockFoam = s.riverRock();
+		if (rockFoam <= 0) return out;
+		List<int[]> rocks = new ArrayList<>();
+		for (int bz = 0; bz < size; bz++) for (int bx = 0; bx < size; bx++) {
+			int i = bz * size + bx;
+			if (r.water[i] || r.level[i] < 1) continue;
+			int wet = 0;
+			if (bx > 0 && r.water[i - 1] && r.river[i - 1]) wet++;
+			if (bx < size - 1 && r.water[i + 1] && r.river[i + 1]) wet++;
+			if (bz > 0 && r.water[i - size] && r.river[i - size]) wet++;
+			if (bz < size - 1 && r.water[i + size] && r.river[i + size]) wet++;
+			if (wet >= 2) rocks.add(new int[] {bx, bz});
+		}
+		if (rocks.isEmpty()) return out;
+		float[] pillow = new float[T * T], wake = new float[T * T];
+		float Lw = s.riverWake() * 16, tan = 0.34f;
+		for (int[] rock : rocks) {
+			int cx = rock[0] * 16 + 8, cz = rock[1] * 16 + 8;
+			// The river's way past the rock, from its current in a ring round it.
+			double sx = 0, sz = 0;
+			for (int p = 0; p < S * S; p++) {
+				if (!rivS[p]) continue;
+				double px = ((p % S) + 0.5) * tps - cx, pz = ((p / S) + 0.5) * tps - cz, r2 = px * px + pz * pz;
+				if (r2 < 144 || r2 > 1024) continue;
+				sx += fx[p];
+				sz += fy[p];
+			}
+			double sl = Math.hypot(sx, sz);
+			if (sl < 1e-3) continue;
+			double dx = sx / sl, dz = sz / sl;
+			int R = (int) Math.ceil(Math.max(14, Lw + 12));
+			for (int tz = Math.max(0, cz - R); tz < Math.min(T, cz + R + 1); tz++) {
+				for (int tx = Math.max(0, cx - R); tx < Math.min(T, cx + R + 1); tx++) {
+					int bi = (tz / 16) * size + tx / 16, sp = (tz / (int) tps) * S + tx / (int) tps;
+					if (!r.water[bi] || !dom[sp]) continue;
+					double ox = tx + 0.5 - cx, oz = tz + 0.5 - cz;
+					// Distance from the rock block's side.
+					double rdx = Math.max(0, Math.abs(ox) - 8), rdz = Math.max(0, Math.abs(oz) - 8), rd = Math.hypot(rdx, rdz);
+					int ti = tz * T + tx;
+					if (rd <= 6) {
+						double ol = Math.hypot(ox, oz);
+						double up = ol > 0 ? -(ox * dx + oz * dz) / ol : 0;
+						if (up > 0.15) pillow[ti] = (float) Math.max(pillow[ti], rockFoam * (1 - rd / 6) * Math.min(1, up * 1.4));
+					}
+					if (Lw > 0) {
+						double along = ox * dx + oz * dz, across = Math.abs(-ox * dz + oz * dx);
+						if (along >= 6 && along <= Lw + 8) {
+							double line = Math.max(0, 1 - Math.abs(across - (8 + (along - 6) * tan)) / 1.3);
+							if (line > 0) wake[ti] = (float) Math.max(wake[ti], line * rockFoam * (1 - (along - 6) / (Lw + 2)));
+						}
+					}
+				}
+			}
+		}
+		// Foam trails: what the rocks throw up drifts downstream, thinning as it goes. Only texels near
+		// a rock can carry any.
+		float trail = s.riverTrail() * 16;
+		float[] foam = new float[T * T];
+		if (trail > 0) {
+			List<Integer> cells = new ArrayList<>();
+			int reach = (int) Math.ceil(trail + 16);
+			boolean[] near = new boolean[T * T];
+			for (int[] rock : rocks) {
+				int cx = rock[0] * 16 + 8, cz = rock[1] * 16 + 8;
+				for (int tz = Math.max(0, cz - reach); tz < Math.min(T, cz + reach + 1); tz++)
+					for (int tx = Math.max(0, cx - reach); tx < Math.min(T, cx + reach + 1); tx++) {
+						int ti = tz * T + tx, bi = (tz / 16) * size + tx / 16, sp = (tz / (int) tps) * S + tx / (int) tps;
+						if (near[ti] || !r.water[bi] || !dom[sp]) continue;
+						near[ti] = true;
+						cells.add(ti);
+					}
+			}
+			System.arraycopy(pillow, 0, foam, 0, foam.length);
+			double decay = Math.exp(-2 / trail);
+			int iters = (int) Math.ceil(trail / 2);
+			float[] flow = new float[2];
+			for (int it = 0; it < iters; it++) {
+				for (int ti : cells) {
+					int tx = ti % T, tz = ti / T;
+					flowAt(fx, fy, S, tps, tx + 0.5f, tz + 0.5f, flow);
+					double sp = Math.hypot(flow[0], flow[1]);
+					if (sp < 0.5) continue;
+					int ux = (int) Math.round(tx - flow[0] / sp * 2), uz = (int) Math.round(tz - flow[1] / sp * 2);
+					if (ux < 0 || uz < 0 || ux >= T || uz >= T) continue;
+					float v = (float) (foam[uz * T + ux] * decay);
+					if (v > foam[ti]) foam[ti] = v;
+				}
+			}
+			for (int i = 0; i < foam.length; i++) foam[i] = Math.max(0, foam[i] - pillow[i] * 0.5f);
+		}
+		for (int i = 0; i < T * T; i++) {
+			out[i * 4] = (byte) Math.round(Math.min(1, wake[i]) * 255);
+			out[i * 4 + 1] = (byte) Math.round(Math.min(1, pillow[i]) * 255);
+			out[i * 4 + 2] = (byte) Math.round(Math.min(1, foam[i]) * 255);
+		}
+		return out;
+	}
+
+	/** The current at a region texel position, blended between field samples. */
+	static void flowAt(float[] fx, float[] fy, int S, float tps, float tx, float tz, float[] out) {
+		float sx = tx / tps - 0.5f, sz = tz / tps - 0.5f;
+		int ix = Math.max(0, Math.min(S - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(S - 2, (int) Math.floor(sz)));
+		float u = Math.max(0, Math.min(1, sx - ix)), v = Math.max(0, Math.min(1, sz - iz));
+		int p = iz * S + ix;
+		out[0] = (fx[p] * (1 - u) + fx[p + 1] * u) * (1 - v) + (fx[p + S] * (1 - u) + fx[p + S + 1] * u) * v;
+		out[1] = (fy[p] * (1 - u) + fy[p + 1] * u) * (1 - v) + (fy[p + S] * (1 - u) + fy[p + S + 1] * u) * v;
+	}
+}

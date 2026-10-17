@@ -55,6 +55,16 @@ public final class ShoreRegion {
 	 * reach it; whatever reaches its edge pours in and is gone.
 	 */
 	public final boolean[] low;
+	/** Per column: water at the body's layer in a river biome, and how deep it is (1 to 4 blocks). */
+	public final boolean[] river;
+	public final byte[] depth;
+	/**
+	 * Rivers (null when the region has none; see {@link Rivers}): per field sample the current
+	 * (texels per second), how much river it is (fading into the sea at a mouth) and how shallow;
+	 * per region texel the rocks' wake, foam pillow and foam trails (RGBA, 0..255).
+	 */
+	public float[] riverFx, riverFy, riverBlend, riverShallow;
+	public byte[] riverDecor;
 	/** Whether each block column is water that belongs to a body big enough to have waves. */
 	public final boolean[] sea;
 	/**
@@ -84,6 +94,8 @@ public final class ShoreRegion {
 		this.corners = snap.corners.clone();
 		this.surfY = snap.surfY.clone();
 		this.low = new boolean[size * size];
+		this.river = new boolean[size * size];
+		this.depth = snap.depth.clone();
 		this.sea = new boolean[size * size];
 		this.dipId = new short[size * size];
 		this.dipEntry = new float[samples * samples];
@@ -101,10 +113,16 @@ public final class ShoreRegion {
 	 * shape the waves.
 	 */
 	public record Settings(int minBodyBlocks, float openWaterBlocks, float downhill, int smoothingTexels,
-		float farSmoothBlocks, float wrapAngle, int minIsland, float runupReachTexels) {
+		float farSmoothBlocks, float wrapAngle, int minIsland, float runupReachTexels,
+		float riverSpeed, float riverRock, float riverWake, float riverTrail) {
 	}
 
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings) {
+		return build(snap, settings, null);
+	}
+
+	/** {@code memory} keeps rivers running the way they ran before (null: worked out afresh). */
+	public static ShoreRegion build(ShoreSnapshot snap, Settings settings, RiverMemory memory) {
 		int size = snap.size;
 		int waterY = snap.waterY;
 		ShoreRegion r = new ShoreRegion(snap, waterY);
@@ -115,12 +133,14 @@ public final class ShoreRegion {
 			r.water[i] = surfaceWater[i];
 			int lv = surfaceWater[i] ? 0 : snap.topY[i] - waterY;
 			r.low[i] = snap.water[i] && snap.topY[i] < waterY;
+			r.river[i] = surfaceWater[i] && snap.river[i];
 			// A lower pool is never stepped into, however shallow the step: as deep as a drop.
 			r.level[i] = (byte) (r.low[i] ? -4 : Math.max(-4, Math.min(1, lv)));
 		}
 		markBodies(r, surfaceWater, settings.minBodyBlocks());
 		buildFields(r, settings);
 		markDips(r);
+		Rivers.build(r, settings, memory);
 		return r;
 	}
 
@@ -233,7 +253,9 @@ public final class ShoreRegion {
 		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
 		float sourceAt = Math.min(open, widest * 0.9f);
 		float[] way = Fields.openWay(rawW, seaS, S, S);
-		for (int p = 0; p < n; p++) cost[p] = seaS[p] && rawW[p] >= sourceAt && way[p] >= sourceAt && rawW[p] <= way[p] + tps ? -rawW[p] : Fields.FAR;
+		// Never in a river either: waves come in from the sea and fade travelling up its mouth.
+		for (int p = 0; p < n; p++) cost[p] = seaS[p] && !r.river[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt && way[p] >= sourceAt
+			&& rawW[p] <= way[p] + tps ? -rawW[p] : Fields.FAR;
 		int[] pred = new int[n], order = new int[n];
 		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
 			if (seaS[q] && !seaS[p]) return -1;

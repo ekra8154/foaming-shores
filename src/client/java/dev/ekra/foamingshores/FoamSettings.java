@@ -74,6 +74,16 @@ public final class FoamSettings {
 	public float spill = 0.5f;
 	public float fallFade = 12f;    // texels
 
+	// Rivers
+	public float riverSpeed = 1.2f;  // blocks per second
+	public float riverStreaks = 0.6f;
+	public float riverLen = 9f;      // texels
+	public float riverShallow = 0.45f;
+	public float riverBank = 0.5f;
+	public float riverRock = 0.7f;
+	public float riverWake = 3f;     // blocks
+	public float riverTrail = 4f;    // blocks
+
 	// Wet sand
 	public float wetDark = 0.28f;
 	public float dryTime = 7f;

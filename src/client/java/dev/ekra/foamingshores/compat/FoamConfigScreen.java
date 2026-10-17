@@ -69,6 +69,15 @@ public final class FoamConfigScreen {
 			new Opt("puddleSpread", 0, 16, 1, "texels"),
 			new Opt("spill", 0, 1, 0.05f, "none"),
 			new Opt("fallFade", 2, 48, 1, "texels"))),
+		new Group("rivers", List.of(
+			new Opt("riverSpeed", 0.2f, 4, 0.1f, "blocks_per_second"),
+			new Opt("riverStreaks", 0, 1, 0.05f, "none"),
+			new Opt("riverLen", 2, 24, 1, "texels"),
+			new Opt("riverShallow", 0, 1, 0.05f, "none"),
+			new Opt("riverBank", 0, 1, 0.05f, "none"),
+			new Opt("riverRock", 0, 1, 0.05f, "none"),
+			new Opt("riverWake", 0, 8, 0.5f, "blocks"),
+			new Opt("riverTrail", 0, 12, 0.5f, "blocks"))),
 		new Group("wet", List.of(
 			new Opt("wetDark", 0, 0.6f, 0.01f, "none"),
 			new Opt("dryTime", 0.5f, 20, 0.5f, "seconds"))),

@@ -29,6 +29,11 @@ uniform sampler2D DipSampler;
 uniform sampler2D AtlasSampler;
 // In the face pass, the tops just baked: a ledge or step carries foam on its edge over its top row.
 uniform sampler2D RegionSampler;
+// Per field sample: a river's current (texels per second, x and z), how much river it is (1 in a
+// river, fading into the sea at its mouth, 0 elsewhere) and how shallow (1 a block deep, 0.5 two).
+uniform sampler2D RiverSampler;
+// Per region texel, round rocks in rivers: the wake (r), the foam pillow (g) and foam trails (b).
+uniform sampler2D RiverDecorSampler;
 
 layout(std140) uniform FoamBake {
     vec4 Region;   // region size in texels, field samples per block, field size in samples, -
@@ -45,6 +50,7 @@ layout(std140) uniform FoamBake {
     vec4 Swell;    // straighter fronts at sea, peel (s), peel scale (blocks), waves differ along the coast
     vec4 Swell2;   // travel fade (texels), crossing strength, crossing fades within (texels), -
     vec4 SwellOrigin; // region origin on the swell's noise lattice: whole cells (x, z), fraction (x, z)
+    vec4 River;    // flow lines, flow line length (texels), lighter shallows, lapping at the banks
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -157,6 +163,102 @@ vec3 foamShadow() { return mix(vec3(236.0, 242.0, 240.0) / 255.0, Water.rgb, Mot
 vec4 waterStill(ivec2 wt) {
     vec4 t = texelFetch(AtlasSampler, ivec2(Sprites.xy) + ivec2(wt.x & 15, wt.y & 15), 0);
     return vec4(t.rgb * Water.rgb, t.a);
+}
+
+// ---- Rivers -----------------------------------------------------------------------------------------
+
+// The river fields at a region texel, blended between samples.
+vec4 riverAt(vec2 texel) {
+    float perSample = 16.0 / Region.y;
+    vec2 s = (texel + 0.5) / perSample - 0.5;
+    int n = int(Region.z);
+    ivec2 i = clamp(ivec2(floor(s)), ivec2(0), ivec2(n - 2));
+    vec2 f = clamp(s - vec2(i), 0.0, 1.0);
+    vec4 a = texelFetch(RiverSampler, i, 0), b = texelFetch(RiverSampler, i + ivec2(1, 0), 0);
+    vec4 c = texelFetch(RiverSampler, i + ivec2(0, 1), 0), d = texelFetch(RiverSampler, i + ivec2(1, 1), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Whether a block (region block coordinates) is water, or with `river` river water. Beyond the
+// region counts as water and not river, so its edge makes no false banks.
+bool blockIs(ivec2 bk, bool river) {
+    int blocks = int(Region.x) / 16;
+    if (bk.x < 0 || bk.y < 0 || bk.x >= blocks || bk.y >= blocks) return !river;
+    int per = int(Region.y);
+    ivec2 smp = bk * per + per / 2;
+    bool wet = texelFetch(FieldSampler, smp, 0).w > 7.5;
+    return river ? wet && texelFetch(RiverSampler, smp, 0).z > 0.5 : wet;
+}
+
+// Texels from a texel's centre to the nearest block beside it that is land (or, with `river`, river
+// water); 99 if there is none within a block.
+float distanceToBlock(vec2 texel, bool river) {
+    ivec2 b = ivec2(floor(texel / 16.0));
+    vec2 l = texel - vec2(b) * 16.0 + 0.5;
+    float best = 99.0;
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dz == 0) continue;
+            ivec2 nb = b + ivec2(dx, dz);
+            if (river ? !blockIs(nb, true) : blockIs(nb, false)) continue;
+            float ex = dx < 0 ? l.x : dx > 0 ? 16.0 - l.x : 0.0;
+            float ez = dz < 0 ? l.y : dz > 0 ? 16.0 - l.y : 0.0;
+            best = min(best, length(vec2(ex, ez)));
+        }
+    }
+    return best;
+}
+
+// A river at a texel, all of it under the waves' own foam: shallows lighter, the deep a touch
+// darker toward the middle; flow lines (dots carried by the current, each drawn as a short streak
+// whose bright head leads; two copies half a cycle apart, each starting over once a cycle,
+// crossfaded by dithering so the restart never shows); the edge lapping in slow pulses; foam piled
+// on rocks' upstream faces, their wakes and foam trails. On land beside a river, the wet bank.
+vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
+    float T = Origin.z;
+    if (!isWater) {
+        if (abs(levelAt(texel)) > 0.5) return vec4(0.0);
+        float dr = distanceToBlock(texel, true);
+        return dr < 2.5 && (dr < 1.5 || bay < 0.5) ? vec4(0.0, 0.0, 0.0, Look.y * 0.8) : vec4(0.0);
+    }
+    vec4 rv = riverAt(texel);
+    if (rv.z <= 0.0 || (rv.z < 1.0 && rv.z <= bay)) return vec4(0.0);
+    vec4 decor = texelFetch(RiverDecorSampler, ivec2(texel), 0);
+    float bank = distanceToBlock(texel, false), sh = rv.w;
+    float shq = sh + (bay - 0.5) * 0.5, stp = shq > 0.66 ? 1.0 : shq > 0.33 ? 0.5 : 0.0;
+    vec4 c = stp > 0.0 ? vec4(mix(Water.rgb, vec3(0.62, 0.95, 0.85), 0.5), River.z * stp * 0.4)
+                       : vec4(0.0, 0.0, 0.0, 0.1 * min(1.0, bank / 32.0));
+    vec3 light = mix(Water.rgb, vec3(1.0), 0.5);
+    float sp = length(rv.xy), v = 0.0;
+    if (sp > 0.5 && River.x > 0.0) {
+        float per = 2.2, ph = fract(T / per), wA = 1.0 - abs(2.0 * ph - 1.0);
+        bool useA = wA > (BAYER[((wt.y >> 2) & 3) * 4 + ((wt.x >> 2) & 3)] + 0.5) / 16.0;
+        float tt = useA ? ph : fract(ph + 0.5);
+        int seed = useA ? 11 : 29;
+        vec2 q = vec2(wt) - rv.xy * tt * per, dir = rv.xy / sp;
+        int len = max(2, int(floor(River.y * (1.0 - 0.45 * sh) + 0.5)));
+        float dens = River.x * (0.01 + 0.018 * sh) + decor.b * 0.1;
+        for (int j = 0; j < 24; j++) {
+            if (j >= len) break;
+            ivec2 sq = ivec2(floor(q + dir * float(j) + 0.5));
+            if (hash3(sq.x & 255, sq.y & 255, seed) < dens) { v = 1.0 - float(j) / float(len); break; }
+        }
+    }
+    if (v > 0.0) {
+        c = over(vec4(light, v > 0.6 ? 0.8 : 0.45), c);
+        // Foam carried down from a rock, and sparkle on the shallows, as white.
+        if ((decor.b > 0.2 && v > 0.35) || (sh > 0.6 && v > 0.8 && hash3(wt.x, wt.y, 71) < 0.35)) c = vec4(foamBright(), 1.0);
+    }
+    if (bank < 1.6 && River.w > 0.0) {
+        float lap = 0.5 + 0.5 * sin(T * 1.7 + hash3(wt.x >> 2, wt.y >> 2, 5) * 6.283);
+        if (lap > 1.0 - River.w * 0.45) c = over(vec4(light, 0.55), c);
+    }
+    if (decor.g > 0.0 && decor.g * 1.3 > hash3(wt.x >> 1, wt.y >> 1, int(floor(T * 6.0)))) {
+        c = vec4(decor.g > 0.5 ? foamBright() : foamShadow(), 1.0);
+    } else if (decor.r > 0.0 && decor.r > 0.25 + 0.35 * bay + 0.15 * sin(T * 5.0 + float(wt.x + wt.y) * 0.4)) {
+        c = over(vec4(light, 0.6), c); // the wake shimmers
+    }
+    return c;
 }
 
 // Vanilla flowing water on a face (it already scrolls downward), column u, row down from the top.
@@ -286,7 +388,8 @@ vec4 bakeTop(vec2 texel) {
     float lipW = Shape.x, jag = Shape.y, offshore = Shape.z, thr = 1.0 - Shape.w;
     float approach = Motion.x, runup = Motion.y;
     float lo = -(runup * (1.0 + Swell.w) + jag + 10.0), hi = approach + jag + lipW * 2.0 + 10.0;
-    if (dp <= UNREACHABLE || dp > hi || xl < lo || travelLeft(dwl) <= 0.0) return vec4(0.0);
+    vec4 river = riverLayer(texel, wt, isWater, bay);
+    if (dp <= UNREACHABLE || dp > hi || xl < lo || travelLeft(dwl) <= 0.0) return river;
     float e = 1.0 + (expo - 1.0) * Look.w;
 
     // Out at sea a front follows the far field, nearly straight; it bends to the coast's real shape
@@ -493,7 +596,7 @@ vec4 bakeTop(vec2 texel) {
     float fv = foam + (bay - 0.5) * 0.1;
     if (foam > 0.004 && fv > thr) color = vec4(fv > thr + (1.0 - thr) * 0.45 ? foamBright() : foamShadow(), 1.0);
     if (lip > 0 || pile) color = vec4(lip == 2 || pile ? foamBright() : foamShadow(), 1.0);
-    return color;
+    return over(color, river);
 }
 
 // ---- Faces -----------------------------------------------------------------------------------------

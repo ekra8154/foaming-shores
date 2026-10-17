@@ -1,6 +1,7 @@
 package dev.ekra.foamingshores.shore;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.tags.BiomeTags;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.ChunkPos;
@@ -42,6 +43,10 @@ public final class ShoreSnapshot {
 	 */
 	final int[] surfY;
 	public static final int NO_SURFACE = Integer.MIN_VALUE;
+	/** Whether a column's water at the body's layer lies in a river biome. */
+	final boolean[] river;
+	/** How deep that water is, in blocks (1 to 4, 4 meaning 4 or more). */
+	final byte[] depth;
 	/** The water surface the waves belong to: the most common surface height among water columns. */
 	int waterY;
 	/**
@@ -60,6 +65,8 @@ public final class ShoreSnapshot {
 		this.topY = new int[size * size];
 		this.water = new boolean[size * size];
 		this.surfY = new int[size * size];
+		this.river = new boolean[size * size];
+		this.depth = new byte[size * size];
 		this.corners = new float[size * size * 4];
 	}
 
@@ -123,6 +130,19 @@ public final class ShoreSnapshot {
 				s.topY[i] = y;
 				s.water[i] = level.getFluidState(pos.set(x, y, z)).is(FluidTags.WATER);
 				if (s.water[i]) s.surfY[i] = y; // water all the way down to the body's layer: the body's own
+			}
+		}
+
+		// Rivers: the biome says which water is river; the shallows are where it is a block or two deep.
+		for (int dz = 0; dz < size; dz++) {
+			for (int dx = 0; dx < size; dx++) {
+				int x = originX + dx, z = originZ + dz, i = dz * size + dx;
+				if (!s.water[i] || s.topY[i] != layer || s.missingChunks.contains(ChunkPos.pack(x >> 4, z >> 4))) continue;
+				s.river[i] = level.getBiome(pos.set(x, layer, z)).is(BiomeTags.IS_RIVER);
+				if (!s.river[i]) continue;
+				int d = 1;
+				while (d < 4 && level.getFluidState(pos.set(x, layer - d, z)).is(FluidTags.WATER)) d++;
+				s.depth[i] = (byte) d;
 			}
 		}
 
