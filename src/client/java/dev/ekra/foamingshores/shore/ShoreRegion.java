@@ -34,6 +34,11 @@ public final class ShoreRegion {
 	public static final float TEXELS_PER_SAMPLE = 16f / RES;
 	/** Points unreachable by water get this arrival value. */
 	public static final float UNREACHABLE = -1000f;
+	/**
+	 * How far (texels) the far field may lead or lag the arrival. Fronts take {@code straight} of it
+	 * at most, and below about 60 texels of lag a front still always runs toward the shore.
+	 */
+	private static final float FAR_PULL = 32f;
 
 	public final int originX, originZ, size, waterY;
 	public final int samples; // size * RES
@@ -78,6 +83,14 @@ public final class ShoreRegion {
 	/** Whether each column's water at the body's layer lies in an ocean or beach biome. */
 	public final boolean[] ocean;
 	/**
+	 * Ocean or beach water joined to the open ocean: a stretch of it reaching the region's edge, or
+	 * big enough to be the sea itself. Waves start only here; a patch of beach biome water inland
+	 * (on a lake or a river's bank) is not the sea, however wide.
+	 */
+	final boolean[] openSea;
+	/** Ocean or beach water stretches of at least this many blocks count as the open sea even clear of the region's edge. */
+	private static final int OPEN_SEA_BLOCKS = 512;
+	/**
 	 * Whether each block column is water that belongs to a body with waves: one with ocean (or
 	 * beach) water in it, big enough or reaching beyond the region. Lakes, ponds and rivers on their
 	 * own stay calm; a river or lake joined to the sea gets waves coming in from it, fading.
@@ -112,6 +125,7 @@ public final class ShoreRegion {
 		this.low = new boolean[size * size];
 		this.river = new boolean[size * size];
 		this.ocean = new boolean[size * size];
+		this.openSea = new boolean[size * size];
 		this.still = new boolean[size * size];
 		this.depth = snap.depth.clone();
 		this.sea = new boolean[size * size];
@@ -128,11 +142,12 @@ public final class ShoreRegion {
 	 * What the fields depend on. {@code runupReachTexels}: how far up a beach a wave can run (the
 	 * strip where crossing fronts matter on land); {@code wrapAngle}: how head-on (degrees) two
 	 * fronts must meet to cross; {@code minIsland}: land bodies smaller than this (blocks) do not
-	 * shape the waves.
+	 * shape the waves; {@code approachTexels}, {@code straight}: where fronts start and how much they
+	 * follow the far field at sea (as the bake shader draws them).
 	 */
 	public record Settings(int minBodyBlocks, float openWaterBlocks, float downhill, int smoothingTexels,
 		float farSmoothBlocks, float wrapAngle, int minIsland, float runupReachTexels,
-		float riverSpeed, float riverRock, float riverWake, float riverTrail, float backwater) {
+		float riverSpeed, float riverRock, float riverWake, float riverTrail, float backwater, float approachTexels, float straight) {
 	}
 
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings) {
@@ -158,6 +173,7 @@ public final class ShoreRegion {
 			r.level[i] = (byte) (r.low[i] ? -4 : Math.max(-4, Math.min(1, lv)));
 		}
 		markBodies(r, surfaceWater, settings.minBodyBlocks());
+		markOpenSea(r);
 		buildFields(r, settings);
 		markDips(r);
 		Rivers.build(r, settings, memory);
@@ -189,6 +205,30 @@ public final class ShoreRegion {
 			boolean ocean = false;
 			for (int i : comp) if (r.ocean[i]) { ocean = true; break; }
 			if (ocean && (edge || comp.size() >= minBody)) for (int i : comp) r.sea[i] = true;
+		}
+	}
+
+	private static void markOpenSea(ShoreRegion r) {
+		int size = r.size;
+		boolean[] seen = new boolean[size * size];
+		int[] queue = new int[size * size];
+		for (int s0 = 0; s0 < size * size; s0++) {
+			if (!r.ocean[s0] || seen[s0]) continue;
+			int h = 0, t = 0;
+			boolean edge = false;
+			queue[t++] = s0;
+			seen[s0] = true;
+			while (h < t) {
+				int i = queue[h++], x = i % size, z = i / size;
+				if (x == 0 || z == 0 || x == size - 1 || z == size - 1) edge = true;
+				for (int k = 0; k < 4; k++) {
+					int nx = x + (k == 0 ? 1 : k == 1 ? -1 : 0), nz = z + (k == 2 ? 1 : k == 3 ? -1 : 0);
+					if (nx < 0 || nz < 0 || nx >= size || nz >= size) continue;
+					int j = nz * size + nx;
+					if (r.ocean[j] && !seen[j]) { seen[j] = true; queue[t++] = j; }
+				}
+			}
+			if (edge || t >= OPEN_SEA_BLOCKS) for (int k = 0; k < t; k++) r.openSea[queue[k]] = true;
 		}
 	}
 
@@ -275,8 +315,8 @@ public final class ShoreRegion {
 		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
 		float sourceAt = Math.min(open, widest * 0.9f);
 		float[] way = Fields.openWay(rawW, seaS, S, S);
-		// Only in ocean water: waves come in from the sea and fade travelling up a river or into a lake.
-		for (int p = 0; p < n; p++) cost[p] = seaS[p] && r.ocean[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt && way[p] >= sourceAt
+		// Only in the open sea: waves come in from it and fade travelling up a river or into a lake.
+		for (int p = 0; p < n; p++) cost[p] = seaS[p] && r.openSea[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt && way[p] >= sourceAt
 			&& rawW[p] <= way[p] + tps ? -rawW[p] : Fields.FAR;
 		int[] pred = new int[n], order = new int[n];
 		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
@@ -342,15 +382,19 @@ public final class ShoreRegion {
 		}
 
 		// Far field: the arrival blurred over farSmooth blocks, over land too (its signed distance)
-		// so the blur stays centred on the coast instead of being pulled out to sea.
+		// so the blur stays centred on the coast instead of being pulled out to sea. Kept within
+		// FAR_PULL of the arrival: where land fills most of the blur (a cove, an inlet, water among
+		// islands) it would sink far below the arrival, and a front following it would run the wrong
+		// way, bulging or breaking off into rings as it comes in.
 		{
 			int rr = Math.max(1, Math.round(settings.farSmoothBlocks() * 16f / 2f / tps));
 			float[] a2 = new float[n];
 			for (int p = 0; p < n; p++) a2[p] = arr[p] > UNREACHABLE ? arr[p] : Math.max(-200, r.shoreDist[p]);
 			float[] A2 = Fields.boxBlur(Fields.boxBlur(a2, S, S, rr), S, S, rr);
-			for (int p = 0; p < n; p++) r.far[p] = seaS[p] && arr[p] > UNREACHABLE ? A2[p] : arr[p];
+			for (int p = 0; p < n; p++) r.far[p] = seaS[p] && arr[p] > UNREACHABLE ? arr[p] + Math.max(-FAR_PULL, Math.min(FAR_PULL, A2[p] - arr[p])) : arr[p];
 		}
 
+		frontField(r, pred, order, settled, settings);
 		crossing(r, settings, seaS, lvl, dirX, dirY);
 
 		// Exposure: the largest sea distance within 4 blocks; narrow inlets score low. A small
@@ -363,6 +407,30 @@ public final class ShoreRegion {
 		for (int p = 0; p < n; p++) {
 			int k = isleSize[((p / S) / RES) * size + (p % S) / RES];
 			if (k > 0) r.exposure[p] = Math.min(r.exposure[p], 0.25f + 0.5f * k / settings.minIsland());
+		}
+	}
+
+	/**
+	 * The field a front follows (the arrival, pulled toward the far field at sea, as the bake shader
+	 * works it out) never rises along the way the water travels, so no stretch of front is born late,
+	 * as a ring or a bulge, after the rest has come in; and a front starting in a pocket of open water
+	 * starts with the rest, where fronts start. Kept by adjusting the far field the shader reads.
+	 */
+	private static void frontField(ShoreRegion r, int[] pred, int[] order, int settled, Settings st) {
+		float ap = st.approachTexels(), str = st.straight();
+		if (ap <= 0 || str <= 0) return;
+		float[] arr = r.arrival, far = r.far, front = new float[arr.length];
+		for (int i = 0; i < settled; i++) {
+			int q = order[i], p = pred[q];
+			float dp = arr[q];
+			if (dp <= UNREACHABLE) continue;
+			float k = dp > 0 ? Math.min(1, dp / ap) * str : 0;
+			float f = dp + (far[q] - dp) * k;
+			if (k < 0.05f) { front[q] = f; continue; }
+			if (p < 0 || arr[p] <= UNREACHABLE) f = Math.max(f, ap);
+			else f = Math.min(f, front[p]);
+			front[q] = f;
+			far[q] = dp + (f - dp) / k;
 		}
 	}
 
@@ -415,7 +483,9 @@ public final class ShoreRegion {
 	 * front carries on into the other's side, as if the other were not there (Huygens' construction),
 	 * never back the way the water came, with the first front's rules for where water may go; on land
 	 * only within the strip a wave can run up. Each side of a seam starts the other side's front, with
-	 * the other side's waterline.
+	 * the other side's waterline. Only over the sea's own water (ocean or beach) and its shores: fronts
+	 * coming into a river mouth or a lake from both sides meet and fade as they go, without a second
+	 * front following each up it.
 	 */
 	private static void crossing(ShoreRegion r, Settings settings, boolean[] seaS, byte[] lvl, float[] dirX, float[] dirY) {
 		int S = r.samples, n = S * S;
@@ -427,12 +497,17 @@ public final class ShoreRegion {
 		float[] partW = new float[n];
 		// The second front's own travel direction: it starts as the other side's and carries on.
 		float[] d2x = new float[n], d2y = new float[n];
+		boolean[] inland = new boolean[n];
+		for (int p = 0; p < n; p++) {
+			int bi = ((p / S) / RES) * r.size + (p % S) / RES;
+			inland[p] = r.water[bi] && !r.ocean[bi];
+		}
 		for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
 			int p = y * S + x;
-			if (arr[p] <= UNREACHABLE || (dirX[p] == 0 && dirY[p] == 0) || (!seaS[p] && arr[p] - dW[p] < reach)) continue;
+			if (inland[p] || arr[p] <= UNREACHABLE || (dirX[p] == 0 && dirY[p] == 0) || (!seaS[p] && arr[p] - dW[p] < reach)) continue;
 			int[] qs = {x + 1 < S ? p + 1 : -1, y + 1 < S ? p + S : -1, x + 1 < S && y + 1 < S ? p + S + 1 : -1};
 			for (int q : qs) {
-				if (q < 0 || arr[q] <= UNREACHABLE || (dirX[q] == 0 && dirY[q] == 0) || seaS[p] != seaS[q]) continue;
+				if (q < 0 || inland[q] || arr[q] <= UNREACHABLE || (dirX[q] == 0 && dirY[q] == 0) || seaS[p] != seaS[q]) continue;
 				if (!seaS[q] && arr[q] - dW[q] < reach) continue;
 				if (dirX[p] * dirX[q] + dirY[p] * dirY[q] < cos) {
 					seam[p] = true;
@@ -451,7 +526,7 @@ public final class ShoreRegion {
 		int[] pred = new int[n], order = new int[n];
 		double maxLag = 12 * 16;
 		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
-			if (arr[q] <= UNREACHABLE || (seaS[q] && !seaS[p])) return -1;
+			if (arr[q] <= UNREACHABLE || inland[q] || (seaS[q] && !seaS[p])) return -1;
 			int lp = lvl[p], lq = lvl[q];
 			if (lq > lp || lq > 0 || lq < -1) return -1;
 			if (!seaS[q] && arr[q] - dW[q] < reach) return -1;

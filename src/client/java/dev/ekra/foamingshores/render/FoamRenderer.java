@@ -163,7 +163,7 @@ public final class FoamRenderer {
 	public void settingsChanged() {
 		if (settings.differs(applied, "smoothing", "minBody", "openWater", "downhill", "runup", "approach", "jag", "lipWidth",
 			"splashHeight", "fallFade", "farSmooth", "wrapAngle", "minIsland", "waveVary", "travelFade", "wrap", "wrapLag",
-			"riverSpeed", "riverRock", "riverWake", "riverTrail", "backwater")) {
+			"riverSpeed", "riverRock", "riverWake", "riverTrail", "backwater", "straight")) {
 			wantRebuild = true; // rebuilt on the next tick, keeping the current one until then
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
@@ -231,7 +231,7 @@ public final class FoamRenderer {
 			buildingMissing = snap.missingChunks;
 			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing,
 				settings.farSmooth, settings.wrapAngle, settings.minIsland, settings.runup * 16 * (1 + settings.waveVary) + settings.jag + 4,
-				settings.riverSpeed, settings.riverRock, settings.riverWake, settings.riverTrail, settings.backwater);
+				settings.riverSpeed, settings.riverRock, settings.riverWake, settings.riverTrail, settings.backwater, settings.approach * 16, settings.straight);
 			RiverMemory memory = rivers;
 			building = CompletableFuture.supplyAsync(() -> {
 				try {
