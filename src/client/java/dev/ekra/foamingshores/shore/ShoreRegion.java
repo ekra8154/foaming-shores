@@ -9,8 +9,10 @@ import java.util.ArrayDeque;
  *
  * <ul>
  * <li>{@code arrival}: where along a wave's path each point lies; the wave front is a contour of it.
- *     Equals the distance to the shore along open coast, but is measured through water from open
- *     water, so narrow straits fill from their mouths. Negative inland.</li>
+ *     Over the open sea it is the distance to the shore smoothed over farSmooth blocks, so a front
+ *     keeps one simple shape all the way in instead of taking on every headland and bay as it
+ *     nears them; elsewhere it is measured through water from there, so narrow straits and coves
+ *     fill from their mouths. Negative inland.</li>
  * <li>{@code shoreDist}: plain signed distance to the waterline (for the wet line and shading).</li>
  * <li>{@code exposure}: 0..1, how much open water lies nearby; coves get smaller waves.</li>
  * <li>{@code level}: per block, the height of its top relative to the water surface in blocks
@@ -305,9 +307,13 @@ public final class ShoreRegion {
 
 		// Arrival: waves start only in open water and travel through water from there. Water never
 		// steps up a level, never enters a wall or a drop of two or more, and runs further downhill.
-		// Open water behind a narrower gap (a cove) is not where waves start either: only water whose
-		// whole way out is open water, and no wider than its way out, so a wave never appears from
-		// nowhere as a ring inside a cove before the real one comes through the mouth.
+		// Open water is water at least openWater blocks from land whose way out to the sea is as
+		// wide, and no wider than its way out, so a wave never appears from nowhere as a ring
+		// inside a cove before the real one comes through the mouth. There, and on the strip
+		// between it and the shore it faces, its arrival is the distance to the
+		// shore smoothed over farSmooth blocks: a front is a contour of that all the way in, so it
+		// never gains a bulge it did not start with, and each beach's run-up starts when that same
+		// front reaches it (a bay's head a little early, a headland's tip a little late).
 		float open = settings.openWaterBlocks() * 16f;
 		double downCost = 1.0 / settings.downhill();
 		double[] cost = new double[n];
@@ -315,9 +321,17 @@ public final class ShoreRegion {
 		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
 		float sourceAt = Math.min(open, widest * 0.9f);
 		float[] way = Fields.openWay(rawW, seaS, S, S);
+		int rrF = Math.max(1, Math.round(settings.farSmoothBlocks() * 16f / 2f / tps));
+		float[] smooth = Fields.boxBlur(Fields.boxBlur(rawW, S, S, rrF), S, S, rrF);
 		// Only in the open sea: waves come in from it and fade travelling up a river or into a lake.
-		for (int p = 0; p < n; p++) cost[p] = seaS[p] && r.openSea[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt && way[p] >= sourceAt
-			&& rawW[p] <= way[p] + tps ? -rawW[p] : Fields.FAR;
+		// Its open water, and the strip between that and the shore it faces: any water within
+		// openWater blocks of it through water (a cove behind a narrow mouth lies further).
+		double[] near = new double[n];
+		for (int p = 0; p < n; p++) near[p] = seaS[p] && r.openSea[((p / S) / RES) * size + (p % S) / RES] && rawW[p] >= sourceAt
+			&& way[p] >= sourceAt && rawW[p] <= way[p] + tps ? 0 : Fields.FAR;
+		Fields.dijkstra(near, S, S, (p, q, diag) -> seaS[p] && seaS[q] ? (diag ? Math.sqrt(2) : 1) * tps : -1, null, null,
+			(p, q, nc) -> nc <= sourceAt * 1.1 + 2 * tps);
+		for (int p = 0; p < n; p++) cost[p] = near[p] < Fields.FAR ? -smooth[p] : Fields.FAR;
 		int[] pred = new int[n], order = new int[n];
 		int settled = Fields.dijkstra(cost, S, S, (p, q, diag) -> {
 			if (seaS[q] && !seaS[p]) return -1;
@@ -326,6 +340,23 @@ public final class ShoreRegion {
 			double step = (diag ? Math.sqrt(2) : 1) * tps;
 			return lq < 0 ? step * downCost : step;
 		}, pred, order, null);
+		// Where each point's front comes from: the point before it on its path or, in open water
+		// (where every point starts its own), the neighbour it is highest toward.
+		int[] up = new int[n];
+		for (int i = 0; i < settled; i++) {
+			int q = order[i], best = pred[q];
+			if (best < 0) {
+				int x = q % S, y = q / S;
+				double hi = cost[q];
+				for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+					int X = x + dx, Y = y + dy;
+					if ((dx == 0 && dy == 0) || X < 0 || Y < 0 || X >= S || Y >= S) continue;
+					int o = Y * S + X;
+					if (cost[o] < hi) { hi = cost[o]; best = o; }
+				}
+			}
+			up[q] = best;
+		}
 		// Smooth only over points water can reach, so walls and drops stay sharp.
 		float[] a = new float[n], m = new float[n];
 		for (int p = 0; p < n; p++) if (cost[p] < Fields.FAR) { a[p] = (float) Math.max(-200, Math.min(200, -cost[p])); m[p] = 1; }
@@ -338,11 +369,11 @@ public final class ShoreRegion {
 		}
 		float[] arr = r.arrival;
 
-		// Which way the front travels at each point: the step from the previous point on its path,
-		// smoothed along the path.
+		// Which way the front travels at each point: the step from where its front comes from,
+		// smoothed along the way.
 		float[] dirX = new float[n], dirY = new float[n];
 		for (int i = 0; i < settled; i++) {
-			int q = order[i], pp = pred[q];
+			int q = order[i], pp = up[q];
 			if (pp < 0) continue;
 			float vx = (q % S) - (pp % S), vy = (q / S) - (pp / S), l0 = (float) Math.hypot(vx, vy);
 			vx /= l0;
@@ -394,7 +425,7 @@ public final class ShoreRegion {
 			for (int p = 0; p < n; p++) r.far[p] = seaS[p] && arr[p] > UNREACHABLE ? arr[p] + Math.max(-FAR_PULL, Math.min(FAR_PULL, A2[p] - arr[p])) : arr[p];
 		}
 
-		frontField(r, pred, order, settled, settings);
+		frontField(r, up, order, settled, settings);
 		crossing(r, settings, seaS, lvl, dirX, dirY);
 
 		// Exposure: the largest sea distance within 4 blocks; narrow inlets score low. A small
@@ -416,12 +447,12 @@ public final class ShoreRegion {
 	 * as a ring or a bulge, after the rest has come in; and a front starting in a pocket of open water
 	 * starts with the rest, where fronts start. Kept by adjusting the far field the shader reads.
 	 */
-	private static void frontField(ShoreRegion r, int[] pred, int[] order, int settled, Settings st) {
+	private static void frontField(ShoreRegion r, int[] up, int[] order, int settled, Settings st) {
 		float ap = st.approachTexels(), str = st.straight();
 		if (ap <= 0 || str <= 0) return;
 		float[] arr = r.arrival, far = r.far, front = new float[arr.length];
 		for (int i = 0; i < settled; i++) {
-			int q = order[i], p = pred[q];
+			int q = order[i], p = up[q];
 			float dp = arr[q];
 			if (dp <= UNREACHABLE) continue;
 			float k = dp > 0 ? Math.min(1, dp / ap) * str : 0;
