@@ -60,6 +60,7 @@ layout(std140) uniform FoamBake {
     vec4 RainW;    // rain (0..1), rain rings, region origin in world texels (x, z)
     vec4 WindB;    // wind pattern B, as WindA
     vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
+    vec4 Calm2;    // edge rings, -, -, -
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -260,6 +261,23 @@ int glintAt(vec2 wp) {
     return (dd == 0 && e > 0.15) || (dd == 1 && e > 0.8) ? 1 : 0;
 }
 
+// Edge rings on calm water: a faint line hugging every edge (the shore, a rock, an island), the
+// small disturbances bouncing off it. It drifts in and out slowly, each stretch of shore at its own
+// pace, and breaks here and there; now and then a fainter ring leaves the edge and fades as it
+// spreads. `bank` is the distance to the nearest land in texels, `on` how strongly they show.
+// 0 for none, 1 a fading ring, 2 the line.
+int edgeRingAt(vec2 wp, float bank, float on, float bay) {
+    if (on <= 0.0 || bank > 10.0) return 0;
+    float T = Origin.z;
+    float r1 = 1.5 + 3.0 * (0.5 + 0.5 * sin(T * 0.9 + vnoise(ivec2(0), wp / 64.0, 141) * 6.283));
+    float gap = vnoise(ivec2(0), wp / 10.0 + vec2(T / 13.0, -T / 17.0), 143);
+    if (abs(bank - r1) < 0.5 && gap < 0.3 + 0.6 * on) return 2;
+    float ph = fract(T / 3.5 + vnoise(ivec2(0), wp / 32.0, 145) * 0.6);
+    float amp = smoothstep(0.45, 0.75, vnoise(ivec2(0), wp / 20.0 + vec2(T * 0.07, -T * 0.05), 147));
+    if (abs(bank - (1.0 + ph * 8.0)) < 0.5 && amp * (1.0 - ph) * on > bay * 0.9) return 1;
+    return 0;
+}
+
 // Rises at a world texel: now and then a fish or a bug touches calm still water and a ring or two
 // spreads, slow and small. Each 32x32 texel cell has at most one per 6 s, kept inside its cell,
 // and only where its middle is calm still water. How strong the ring is here (0 for none).
@@ -388,6 +406,9 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
             float fl = hash3(g.x, g.y, 107);
             if (fl < 0.2 && fract(T / 1.4 + fl * 37.0) < 0.25) col = col * 1.16 + 12.0 / 255.0;
         }
+        int er = edgeRingAt(wp, bank, Calm2.x * calm * (1.0 - 0.6 * min(1.0, wd.z * Still.x)), bay);
+        if (er == 2) col = col * 1.14 + 12.0 / 255.0;
+        else if (er == 1) col = col * 1.08 + 7.0 / 255.0;
         int gl = glintAt(wp);
         if (gl == 2) return vec4(foamBright(), 1.0);
         if (gl == 1) col = col * 1.25 + 22.0 / 255.0;

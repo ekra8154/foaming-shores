@@ -97,6 +97,7 @@ public final class FoamSettings {
 	public float glints = 0.4f;
 	public float paws = 0.5f;
 	public float rises = 0.3f;
+	public float edgeRings = 0.6f;
 
 	// Wet sand
 	public float wetDark = 0.28f;

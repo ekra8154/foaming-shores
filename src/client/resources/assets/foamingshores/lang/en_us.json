@@ -145,6 +145,8 @@
 	"tooltip.foamingshores.paws": "How much of calm water is crossed by patches of ruffled water (cat's paws): a shade darker, with flecks of light, drifting downwind. Shows whatever the wind.",
 	"option.foamingshores.rises": "Rings from fish and bugs",
 	"tooltip.foamingshores.rises": "How often a small ring spreads where a fish or a bug touches calm still water.",
+	"option.foamingshores.edgeRings": "Rings along the edges",
+	"tooltip.foamingshores.edgeRings": "A faint line hugging every edge of calm still water (the shore, rocks, islands) that drifts slowly in and out, with now and then a fainter ring spreading from the edge. Fades as the wind picks up.",
 	"option.foamingshores.wetDark": "Wet darkness",
 	"tooltip.foamingshores.wetDark": "How much darker wet sand looks.",
 	"option.foamingshores.dryTime": "Drying time",

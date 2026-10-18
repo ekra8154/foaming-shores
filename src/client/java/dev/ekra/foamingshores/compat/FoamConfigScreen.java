@@ -90,7 +90,8 @@ public final class FoamConfigScreen {
 			new Opt("rainRings", 0, 1, 0.05f, "none"),
 			new Opt("glints", 0, 1, 0.05f, "none"),
 			new Opt("paws", 0, 1, 0.05f, "none"),
-			new Opt("rises", 0, 1, 0.05f, "none"))),
+			new Opt("rises", 0, 1, 0.05f, "none"),
+			new Opt("edgeRings", 0, 1, 0.05f, "none"))),
 		new Group("wet", List.of(
 			new Opt("wetDark", 0, 0.6f, 0.01f, "none"),
 			new Opt("dryTime", 0.5f, 20, 0.5f, "seconds"))),
