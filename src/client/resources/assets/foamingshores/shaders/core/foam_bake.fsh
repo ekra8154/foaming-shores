@@ -246,10 +246,26 @@ float rainRingAt(vec2 wp) {
     return ring;
 }
 
-// The wind's ripple phase at a world texel position (0..1, crests near 0), for a fetch fraction.
-float ripplePhase(vec2 wp, float fr, ivec2 wt) {
-    float lam = 18.0 + 22.0 * fr;
-    return fract(dot(wp, Wind.xy) / lam - Origin.z / Still.y + (noiseAt(0, wt) - 0.5) * 0.35);
+// Wind ripples are short-crested, as real wind waves are: four wave trains spread about the wind
+// (each at its own angle and wavelength, the longer ones faster, as on deep water) add up, and each
+// train's crest is drawn as a thin line only where the trains coincide, so ripples are many short
+// dashes at slightly different angles. They come in groups drifting downwind at half the crests'
+// speed, so each crest appears at the back of a group and fades at its front. At a world texel
+// position, for a fetch fraction: (summed height -1..1, group envelope 0..1, crest line 0..1 over
+// `width` of a wavelength).
+const vec3 TRAINS[4] = vec3[](vec3(-0.44, 1.0, 0.13), vec3(-0.14, 0.82, 0.57), vec3(0.17, 1.18, 0.31), vec3(0.47, 0.9, 0.79));
+vec3 rippleAt(vec2 wp, float fr, float width) {
+    float lam0 = 16.0 + 18.0 * fr, T0 = Still.y, T = Origin.z, ang = atan(Wind.y, Wind.x);
+    float h = 0.0, line = 0.0;
+    for (int k = 0; k < 4; k++) {
+        float a = ang + TRAINS[k].x, lam = lam0 * TRAINS[k].y, per = T0 * sqrt(TRAINS[k].y);
+        float fp = fract(dot(wp, vec2(cos(a), sin(a))) / lam - T / per + TRAINS[k].z);
+        h += cos(fp * 6.2832); // the fraction only: cos of a large angle loses precision on some GPUs
+        if (fp < width) line = max(line, 1.0 - fp / width);
+    }
+    float cg = 0.5 * lam0 / T0; // group speed: half the crests'
+    float env = vnoise(ivec2(0), (wp - Wind.xy * cg * T) / (lam0 * 3.0), 79);
+    return vec3(h * 0.25, env, line);
 }
 
 // A river at a texel, all of it under the waves' own foam. Whatever this layer covers hides vanilla's
@@ -269,7 +285,8 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0 && Wind.z > 0.0) {
             float fr = min(1.0, fetchAt(texel) / Still.z), reach = Still.x * Wind.z * fr * Still.w;
             if (reach > 0.3) {
-                float run = reach * max(0.0, sin(ripplePhase(wp, fr, wt) * 6.2832));
+                vec3 rp = rippleAt(wp, fr, 0.08);
+                float run = reach * clamp((rp.x * (0.55 + 0.9 * rp.y) - 0.1) / 0.8, 0.0, 1.0);
                 if (dr < run) {
                     if (run - dr < 1.1) return vec4(run > reach * 0.6 ? foamBright() : foamShadow(), 1.0);
                     vec4 sw = waterStill(wt);
@@ -301,19 +318,19 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     } else {
         col *= 1.0 - 0.08 * min(1.0, bank / 32.0);
     }
-    // Wind ripples on still water: straight crests at right angles to the wind moving downwind,
-    // bigger and longer the more open water lies upwind; gusts (patches moving with the wind) carry
-    // them, and a strong wind over a long fetch tips them white.
+    // Wind ripples on still water (see rippleAt): bigger and longer the more open water lies upwind,
+    // rougher in gusts (patches moving with the wind), tipped white in a strong wind over a long fetch.
     if (decor.a > 0.5 / 255.0 && Still.x > 0.0 && Wind.z > 0.0) {
         float fr = min(1.0, fetchAt(texel) / Still.z);
-        float amp = Still.x * Wind.z * fr * (decor.a * 255.0 - 1.0) / 254.0;
+        float gust = vnoise(ivec2(0), (wp - Wind.xy * Origin.z * 14.0) / 48.0, 77);
+        float amp = Still.x * Wind.z * fr * (decor.a * 255.0 - 1.0) / 254.0 * (0.6 + 0.8 * gust);
         if (amp > 0.02) {
-            float fp = ripplePhase(wp, fr, wt);
-            float gust = vnoise(ivec2(0), (wp - Wind.xy * Origin.z * 14.0) / 40.0, 77);
-            if (fp < 0.1 + 0.08 * amp && amp * (0.4 + gust) > bay * 0.9) {
-                if (amp > 0.65 && fp < 0.035 && hash3(int(floor(wp.x / 2.0)), int(floor(wp.y / 2.0)), int(floor(Origin.z * 3.0))) < (amp - 0.65) * 2.0)
+            vec3 rp = rippleAt(wp, fr, 0.06 + 0.05 * min(1.0, amp));
+            float crest = rp.x * (0.55 + 0.9 * rp.y);
+            if (rp.z > 0.0 && crest > 0.3 - 0.2 * min(1.0, amp) && amp * (0.5 + rp.y) > bay * 0.8) {
+                if (amp > 0.6 && crest > 0.75 && rp.z > 0.5 && hash3(int(floor(wp.x / 2.0)), int(floor(wp.y / 2.0)), int(floor(Origin.z * 3.0))) < (amp - 0.6) * 2.0)
                     return vec4(foamBright(), 1.0);
-                col = col * 1.2 + 16.0 / 255.0;
+                col = rp.z > 0.5 ? col * 1.24 + 20.0 / 255.0 : col * 1.12 + 10.0 / 255.0;
             }
         }
     }
