@@ -428,7 +428,7 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
             }
         }
     }
-    float sp = length(rv.xy), v = 0.0;
+    float sp = length(rv.xy), v = 0.0, spark = 1.0;
     if (sp > 0.5 && River.x > 0.0) {
         float per = 2.2, ph = fract(T / per), wA = 1.0 - abs(2.0 * ph - 1.0);
         bool useA = wA > (BAYER[((wt.y >> 2) & 3) * 4 + ((wt.x >> 2) & 3)] + 0.5) / 16.0;
@@ -445,14 +445,20 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
             if (j >= len) break;
             ivec2 sq = ivec2(floor(q + dir * float(j) + 0.5));
             if (hash3(sq.x & 255, sq.y & 255, seed) < dens) {
-                if (hash3(sq.x & 255, sq.y & 255, seed + 5) < live) v = 1.0 - float(j) / float(len);
+                if (hash3(sq.x & 255, sq.y & 255, seed + 5) < live) {
+                    v = 1.0 - float(j) / float(len);
+                    spark = hash3(sq.x & 255, sq.y & 255, seed + 9);
+                }
                 break;
             }
         }
     }
     if (v > 0.0) {
-        // Foam carried down from a rock, and sparkle on the shallows, as white.
-        if ((decor.b > 0.2 && v > 0.35) || (sh > 0.6 && v > 0.8 && hash3(wt.x, wt.y, 71) < 0.35)) return vec4(foamBright(), 1.0);
+        // Foam carried down from a rock, as white; and now and then a flow line's head sparkles
+        // white as it passes (twinkling over the pixels it crosses). A line's chance is cut where
+        // lines are denser (the shallows), so sparkles are as common everywhere.
+        bool sparkle = v > 0.8 && spark < 0.12 * 0.01 / (0.01 + 0.018 * sh) && hash3(wt.x, wt.y, 71) < 0.5;
+        if ((decor.b > 0.2 && v > 0.35) || sparkle) return vec4(foamBright(), 1.0);
         col = v > 0.6 ? col * 1.34 + 30.0 / 255.0 : col * 1.16 + 12.0 / 255.0;
         alpha = max(alpha, w.a * Look.z);
     }
