@@ -112,7 +112,7 @@ public final class FoamSettings {
 	// Water bodies
 	public int minIsland = 10;      // blocks
 	public int minBody = 30;        // blocks
-	public float openWater = 2f;
+	public float openWater = 4f;
 
 	// Sound: listen
 	public boolean soundOn = true;

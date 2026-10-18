@@ -103,7 +103,7 @@ public final class FoamConfigScreen {
 		new Group("bodies", List.of(
 			new Opt("minIsland", 1, 60, 1, "blocks"),
 			new Opt("minBody", 1, 200, 1, "blocks"),
-			new Opt("openWater", 0.5f, 4, 0.25f, "blocks_from_land"))),
+			new Opt("openWater", 0.5f, 8, 0.25f, "blocks_from_land"))),
 		new Group("sound", List.of(
 			new Opt("volume", 0f, 1.5f, 0.05f, "none"),
 			new Opt("hearing", 4f, 48f, 1f, "blocks"))),

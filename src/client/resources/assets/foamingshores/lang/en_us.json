@@ -166,7 +166,7 @@
 	"option.foamingshores.minBody": "Smallest body with waves",
 	"tooltip.foamingshores.minBody": "Waves come only from ocean and beach water. A body of it smaller than this stays calm, unless it reaches past the area around you. Lakes and rivers get waves only where they join the sea, fading as they come in.",
 	"option.foamingshores.openWater": "Open water from",
-	"tooltip.foamingshores.openWater": "Waves start only this far from land and travel into narrower water from its mouth.",
+	"tooltip.foamingshores.openWater": "Waves start only this far from land and travel into narrower water from its mouth. Below the width of an inlet or a lagoon, waves start inside it instead of coming in through its mouth.",
 
 	"category.foamingshores.sound": "Sound",
 	"option.foamingshores.volume": "Volume",
