@@ -437,10 +437,17 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         vec2 q = vec2(wt) - rv.xy * tt * per, dir = rv.xy / sp;
         int len = max(2, int(floor(River.y * (1.0 - 0.45 * sh) + 0.5)));
         float dens = River.x * (0.01 + 0.018 * sh) + decor.b * 0.1;
+        // In still water each flow line dies out as the current spends itself, each at its own
+        // point (a hashed share of the current it needs, and a wobble along the water), so they
+        // thin out instead of stopping on a line.
+        float live = still ? smoothstep(0.08, 0.7, (1.0 - calm) * (0.55 + 0.9 * vnoise(ivec2(0), wp / 20.0, 151))) : 1.0;
         for (int j = 0; j < 24; j++) {
             if (j >= len) break;
             ivec2 sq = ivec2(floor(q + dir * float(j) + 0.5));
-            if (hash3(sq.x & 255, sq.y & 255, seed) < dens) { v = 1.0 - float(j) / float(len); break; }
+            if (hash3(sq.x & 255, sq.y & 255, seed) < dens) {
+                if (hash3(sq.x & 255, sq.y & 255, seed + 5) < live) v = 1.0 - float(j) / float(len);
+                break;
+            }
         }
     }
     if (v > 0.0) {

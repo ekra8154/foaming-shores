@@ -6,6 +6,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import dev.ekra.foamingshores.wave.WaveMath;
+
 /**
  * River currents and the foam around rocks (see the playground's rivers). River water is the body's
  * water lying in a river biome.
@@ -166,6 +168,20 @@ final class Rivers {
 					* Math.sqrt(Math.min(1, bank[p] / 12)) * flowB[p]);
 				fx[p] = ax[p] * sp;
 				fy[p] = ay[p] * sp;
+				// As a river's current spends itself in still water it breaks into slow swirls:
+				// eddies (the curl of a noise fixed in the world, so they keep their place) strongest
+				// halfway out, where the current is half spent.
+				if (stillS[p]) {
+					double e = 4 * pull[p] * (1 - pull[p]);
+					if (e > 0.01) {
+						double bx = r.originX + (p % S + 0.5) / RES, bz = r.originZ + (p / S + 0.5) / RES, d = 0.1;
+						double cx = (WaveMath.vnoise(bx / 3, (bz + d) / 3, 601) - WaveMath.vnoise(bx / 3, (bz - d) / 3, 601)) / (2 * d);
+						double cz = -(WaveMath.vnoise((bx + d) / 3, bz / 3, 601) - WaveMath.vnoise((bx - d) / 3, bz / 3, 601)) / (2 * d);
+						double k = settings.riverSpeed() * 16 * 0.3 * 3 * e * blend[p];
+						fx[p] += (float) (cx * k);
+						fy[p] += (float) (cz * k);
+					}
+				}
 			}
 			fx = Fields.boxBlur(fx, S, S, 1);
 			fy = Fields.boxBlur(fy, S, S, 1);
