@@ -118,7 +118,7 @@
 	"option.foamingshores.riverBank": "Lapping at the banks",
 	"tooltip.foamingshores.riverBank": "How often the water's edge along a river's banks brightens.",
 	"option.foamingshores.riverRock": "Foam at rocks",
-	"tooltip.foamingshores.riverRock": "Foam churned up on the upstream side of blocks sticking up out of a river, and their wakes.",
+	"tooltip.foamingshores.riverRock": "Foam churned up where a river's current runs into something: rocks and blocks in the water (even flush with it), or a point of the bank jutting into a fast current. Also how strong rocks' wakes are.",
 	"option.foamingshores.riverWake": "Wake behind rocks",
 	"tooltip.foamingshores.riverWake": "How far the V-shaped wake behind a rock reaches.",
 	"option.foamingshores.riverTrail": "Foam trails last",

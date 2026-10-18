@@ -53,7 +53,10 @@ final class Rivers {
 		// The banks as the river's shape sees them: small land standing in the water (a rock, a
 		// placed block) is left out, so the current runs along the river past it instead of
 		// circling it.
-		float[] shoreBank = Fields.distanceTo(shoreLand(r, land, S, RES), S, S);
+		boolean[] smallLand = smallLand(r);
+		boolean[] shore = new boolean[n];
+		for (int p = 0; p < n; p++) shore[p] = land[p] && !smallLand[((p / S) / RES) * size + (p % S) / RES];
+		float[] shoreBank = Fields.distanceTo(shore, S, S);
 		for (int p = 0; p < n; p++) shoreBank[p] = Math.max(0, shoreBank[p] * tps - tps / 2);
 		// How much of a river's current reaches still water: along the water from the river, fading.
 		float[] pull = new float[n];
@@ -99,7 +102,7 @@ final class Rivers {
 		r.riverShallow = shallow;
 		r.fetch = fetch(r, water, rivS, stillS);
 
-		float[] fx = new float[n], fy = new float[n];
+		float[] fx = new float[n], fy = new float[n], hx = new float[n], hy = new float[n], hb = new float[n];
 		boolean[] dom = new boolean[n];
 		if (anyRiver) {
 			// The axis.
@@ -169,10 +172,13 @@ final class Rivers {
 			for (int p = 0; p < n; p++) {
 				if (!dom[p]) continue;
 				float width = Math.max(8, 2 * halfW[p]);
-				float sp = (float) (settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, 40 / width)) * (1 + 0.4 * shallow[p])
-					* Math.sqrt(Math.min(1, bank[p] / 12)) * flowB[p]);
+				double base = settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, 40 / width)) * (1 + 0.4 * shallow[p]) * flowB[p];
+				float sp = (float) (base * Math.sqrt(Math.min(1, bank[p] / 12)));
 				fx[p] = ax[p] * sp;
 				fy[p] = ay[p] * sp;
+				hx[p] = ax[p];
+				hy[p] = ay[p];
+				hb[p] = (float) base;
 				// As a river's current spends itself in still water it breaks into slow swirls:
 				// eddies (the curl of a noise fixed in the world, so they keep their place) strongest
 				// halfway out, where the current is half spent.
@@ -187,6 +193,17 @@ final class Rivers {
 						fy[p] += (float) (cz * k);
 					}
 				}
+			}
+			// The current as it comes at land: the river's way averaged over a few blocks (so it
+			// does not bend round a rock or a point of the bank before reaching it), at its speed
+			// out in the stream.
+			hx = Fields.boxBlur(Fields.boxBlur(hx, S, S, 8), S, S, 8);
+			hy = Fields.boxBlur(Fields.boxBlur(hy, S, S, 8), S, S, 8);
+			for (int p = 0; p < n; p++) {
+				float l = (float) Math.hypot(hx[p], hy[p]);
+				if (!dom[p] || l < 1e-4f) { hx[p] = 0; hy[p] = 0; continue; }
+				hx[p] = hx[p] / l * hb[p];
+				hy[p] = hy[p] / l * hb[p];
 			}
 			// Past a rock the current parts: near land, whatever would run into it is turned along
 			// it, keeping its speed.
@@ -210,7 +227,7 @@ final class Rivers {
 		}
 		r.riverFx = fx;
 		r.riverFy = fy;
-		byte[] decor = anyRiver ? decor(r, settings, dom, rivS, fx, fy) : new byte[size * 16 * size * 16 * 4];
+		byte[] decor = anyRiver ? decor(r, settings, dom, rivS, fx, fy, hx, hy, bank, smallLand) : new byte[size * 16 * size * 16 * 4];
 		// Still water in the decor's last channel: 0 for none, else 1..255 for how much the wind's
 		// ripples show there (none where a river's current rules).
 		int T = size * 16;
@@ -221,8 +238,8 @@ final class Rivers {
 		r.riverDecor = decor;
 	}
 
-	/** Blocks of land that make up banks, per field sample: all land but small pieces standing in the water. */
-	private static boolean[] shoreLand(ShoreRegion r, boolean[] land, int S, int RES) {
+	/** Per block, small land standing in the water: pieces of land not touching the region's edge. */
+	private static boolean[] smallLand(ShoreRegion r) {
 		int size = r.size;
 		boolean[] small = new boolean[size * size], seen = new boolean[size * size];
 		int[] queue = new int[size * size];
@@ -244,9 +261,7 @@ final class Rivers {
 			}
 			if (!edge && t <= ROCK_BLOCKS) for (int k = 0; k < t; k++) small[queue[k]] = true;
 		}
-		boolean[] out = new boolean[S * S];
-		for (int p = 0; p < S * S; p++) out[p] = land[p] && !small[((p / S) / RES) * size + (p % S) / RES];
-		return out;
+		return small;
 	}
 
 	/** Land pieces of at most this many blocks are rocks to a river's shape, not banks. */
@@ -384,28 +399,74 @@ final class Rivers {
 		}
 	}
 
-	/** Wake (R), pillow (G) and foam trails (B) per region texel, 0..255. */
-	private static byte[] decor(ShoreRegion r, ShoreRegion.Settings s, boolean[] dom, boolean[] rivS, float[] fx, float[] fy) {
+	/**
+	 * Wake (R), pillow (G) and foam trails (B) per region texel, 0..255. The foam piles on whatever
+	 * the water runs into, as hard as it runs into it: a rock or a slab at the waterline head on, a
+	 * point of the bank jutting into a fast current, never a bank the current runs along. How hard:
+	 * the river's way averaged over a few blocks, at the stream's speed ({@code hx}, {@code hy}),
+	 * against the land's face, taken from the distance to land smoothed over a couple of blocks so a
+	 * staircase bank reads as the slope it is. Wakes (a V of light lines) trail behind small land
+	 * standing in the river.
+	 */
+	private static byte[] decor(ShoreRegion r, ShoreRegion.Settings s, boolean[] dom, boolean[] rivS, float[] fx, float[] fy,
+		float[] hx, float[] hy, float[] bank, boolean[] small) {
 		int size = r.size, S = r.samples, T = size * 16;
 		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
 		byte[] out = new byte[T * T * 4];
 		float rockFoam = s.riverRock();
 		if (rockFoam <= 0) return out;
+		// How hard the current hits land, per field sample beside it (texels per second).
+		float[] face = Fields.boxBlur(Fields.boxBlur(bank, S, S, 2), S, S, 2);
+		float[] hit = new float[S * S];
+		for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
+			int p = y * S + x;
+			if (!dom[p] || bank[p] > 8) continue;
+			float gx = (face[p + 1] - face[p - 1]) * 0.5f, gy = (face[p + S] - face[p - S]) * 0.5f, gl = (float) Math.hypot(gx, gy);
+			if (gl < 1e-4f) continue;
+			hit[p] = Math.max(0, -(hx[p] * gx + hy[p] * gy) / gl);
+		}
+		// The pillow: on water within 6 texels of land, as hard as the current hits it there.
+		float[] pillow = new float[T * T], wake = new float[T * T];
+		boolean[] foamy = new boolean[size * size];
+		for (int bz = 0; bz < size; bz++) for (int bx = 0; bx < size; bx++) {
+			if (!r.water[bz * size + bx]) continue;
+			boolean nearLand = false;
+			for (int dz = -1; dz <= 1 && !nearLand; dz++) for (int dx = -1; dx <= 1; dx++) {
+				int nx = bx + dx, nz = bz + dz;
+				if (nx >= 0 && nz >= 0 && nx < size && nz < size && !r.water[nz * size + nx]) { nearLand = true; break; }
+			}
+			if (!nearLand) continue;
+			for (int tz = bz * 16; tz < bz * 16 + 16; tz++) for (int tx = bx * 16; tx < bx * 16 + 16; tx++) {
+				int sp = (tz / (int) tps) * S + tx / (int) tps;
+				if (!dom[sp] || hit[sp] <= 0) continue;
+				// Distance from the texel's centre to the nearest land block beside it.
+				double lx = tx - bx * 16 + 0.5, lz = tz - bz * 16 + 0.5, d = 99;
+				for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) {
+					int nx = bx + dx, nz = bz + dz;
+					if ((dx == 0 && dz == 0) || nx < 0 || nz < 0 || nx >= size || nz >= size || r.water[nz * size + nx]) continue;
+					double ex = dx < 0 ? lx : dx > 0 ? 16 - lx : 0, ez = dz < 0 ? lz : dz > 0 ? 16 - lz : 0;
+					d = Math.min(d, Math.hypot(ex, ez));
+				}
+				if (d > 6) continue;
+				float v = (float) (rockFoam * Math.min(1, Math.max(0, (hit[sp] - 2.5) / 6)) * (1 - d / 6));
+				if (v > 0) {
+					pillow[tz * T + tx] = v;
+					foamy[bz * size + bx] = true;
+				}
+			}
+		}
+		// Wakes behind small land standing in the river.
 		List<int[]> rocks = new ArrayList<>();
 		for (int bz = 0; bz < size; bz++) for (int bx = 0; bx < size; bx++) {
 			int i = bz * size + bx;
-			if (r.water[i] || r.level[i] < 1) continue;
-			int wet = 0;
-			if (bx > 0 && r.water[i - 1] && r.river[i - 1]) wet++;
-			if (bx < size - 1 && r.water[i + 1] && r.river[i + 1]) wet++;
-			if (bz > 0 && r.water[i - size] && r.river[i - size]) wet++;
-			if (bz < size - 1 && r.water[i + size] && r.river[i + size]) wet++;
-			if (wet >= 2) rocks.add(new int[] {bx, bz});
+			if (r.water[i] || !small[i]) continue;
+			boolean wet = (bx > 0 && r.water[i - 1] && r.river[i - 1]) || (bx < size - 1 && r.water[i + 1] && r.river[i + 1])
+				|| (bz > 0 && r.water[i - size] && r.river[i - size]) || (bz < size - 1 && r.water[i + size] && r.river[i + size]);
+			if (wet) rocks.add(new int[] {bx, bz});
 		}
-		if (rocks.isEmpty()) return out;
-		float[] pillow = new float[T * T], wake = new float[T * T];
 		float Lw = s.riverWake() * 16, tan = 0.34f;
 		for (int[] rock : rocks) {
+			if (Lw <= 0) break;
 			int cx = rock[0] * 16 + 8, cz = rock[1] * 16 + 8;
 			// The river's way past the rock, from its current in a ring round it.
 			double sx = 0, sz = 0;
@@ -419,40 +480,32 @@ final class Rivers {
 			double sl = Math.hypot(sx, sz);
 			if (sl < 1e-3) continue;
 			double dx = sx / sl, dz = sz / sl;
-			int R = (int) Math.ceil(Math.max(14, Lw + 12));
+			int R = (int) Math.ceil(Lw + 12);
 			for (int tz = Math.max(0, cz - R); tz < Math.min(T, cz + R + 1); tz++) {
 				for (int tx = Math.max(0, cx - R); tx < Math.min(T, cx + R + 1); tx++) {
 					int bi = (tz / 16) * size + tx / 16, sp = (tz / (int) tps) * S + tx / (int) tps;
 					if (!r.water[bi] || !dom[sp]) continue;
 					double ox = tx + 0.5 - cx, oz = tz + 0.5 - cz;
-					// Distance from the rock block's side.
-					double rdx = Math.max(0, Math.abs(ox) - 8), rdz = Math.max(0, Math.abs(oz) - 8), rd = Math.hypot(rdx, rdz);
-					int ti = tz * T + tx;
-					if (rd <= 6) {
-						double ol = Math.hypot(ox, oz);
-						double up = ol > 0 ? -(ox * dx + oz * dz) / ol : 0;
-						if (up > 0.15) pillow[ti] = (float) Math.max(pillow[ti], rockFoam * (1 - rd / 6) * Math.min(1, up * 1.4));
-					}
-					if (Lw > 0) {
-						double along = ox * dx + oz * dz, across = Math.abs(-ox * dz + oz * dx);
-						if (along >= 6 && along <= Lw + 8) {
-							double line = Math.max(0, 1 - Math.abs(across - (8 + (along - 6) * tan)) / 1.3);
-							if (line > 0) wake[ti] = (float) Math.max(wake[ti], line * rockFoam * (1 - (along - 6) / (Lw + 2)));
-						}
+					double along = ox * dx + oz * dz, across = Math.abs(-ox * dz + oz * dx);
+					if (along >= 6 && along <= Lw + 8) {
+						double line = Math.max(0, 1 - Math.abs(across - (8 + (along - 6) * tan)) / 1.3);
+						int ti = tz * T + tx;
+						if (line > 0) wake[ti] = (float) Math.max(wake[ti], line * rockFoam * (1 - (along - 6) / (Lw + 2)));
 					}
 				}
 			}
 		}
-		// Foam trails: what the rocks throw up drifts downstream, thinning as it goes. Only texels near
-		// a rock can carry any.
+		// Foam trails: what piles up drifts downstream, thinning as it goes. Only texels near foam can
+		// carry any.
 		float trail = s.riverTrail() * 16;
 		float[] foam = new float[T * T];
 		if (trail > 0) {
 			List<Integer> cells = new ArrayList<>();
 			int reach = (int) Math.ceil(trail + 16);
 			boolean[] near = new boolean[T * T];
-			for (int[] rock : rocks) {
-				int cx = rock[0] * 16 + 8, cz = rock[1] * 16 + 8;
+			for (int fb = 0; fb < size * size; fb++) {
+				if (!foamy[fb]) continue;
+				int cx = (fb % size) * 16 + 8, cz = (fb / size) * 16 + 8;
 				for (int tz = Math.max(0, cz - reach); tz < Math.min(T, cz + reach + 1); tz++)
 					for (int tx = Math.max(0, cx - reach); tx < Math.min(T, cx + reach + 1); tx++) {
 						int ti = tz * T + tx, bi = (tz / 16) * size + tx / 16, sp = (tz / (int) tps) * S + tx / (int) tps;
