@@ -60,7 +60,7 @@ layout(std140) uniform FoamBake {
     vec4 RainW;    // rain (0..1), rain rings, region origin in world texels (x, z)
     vec4 WindB;    // wind pattern B, as WindA
     vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
-    vec4 Calm2;    // edge rings, sparkles on flow lines, -, -
+    vec4 Calm2;    // edge rings, sparkles on flow lines, water recolouring (1 on), -
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -385,11 +385,14 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     vec4 w = waterStill(wt);
     vec3 col = w.rgb;
     float alpha = w.a * Look.z;
-    if (stp > 0.0) {
+    // Water recolouring off: the water keeps vanilla's colour, and only pixels with something on
+    // them are drawn (in the plain water's colour, changed as usual).
+    bool tint = Calm2.z > 0.5;
+    if (tint && stp > 0.0) {
         float a = River.z * stp, k = 1.0 + 0.3 * a;
         col = col * vec3(0.94 * k, 1.1 * k, k) + vec3(12.0, 20.0, 8.0) / 255.0 * a;
         alpha *= 1.0 - 0.4 * a; // clearer: the bed shows through more
-    } else {
+    } else if (tint) {
         col *= 1.0 - 0.08 * min(1.0, bank / 32.0);
     }
     // Still water: calm life whatever the wind, then the wind's ripples.
@@ -476,6 +479,7 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     float ring = rainRingAt(wp) * (1.0 - min(1.0, sp / 20.0));
     if (ring > bay * 0.8) col = col * 1.22 + 20.0 / 255.0;
     else if (still && riseAt(wp, texel) > bay * 0.8) col = col * 1.2 + 18.0 / 255.0;
+    if (!tint && col == w.rgb) return vec4(0.0);
     return vec4(min(col, vec3(1.0)), alpha);
 }
 

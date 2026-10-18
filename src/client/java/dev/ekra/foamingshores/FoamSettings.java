@@ -116,6 +116,8 @@ public final class FoamSettings {
 
 	// Sound: listen
 	public boolean soundOn = true;
+	/** Whether river and lake water is drawn in its own shades (lighter shallows, a darker middle), or left to vanilla wherever nothing is drawn on it. */
+	public boolean recolorWater = true;
 	public float volume = 0.7f;
 	public float hearing = 16f;
 	// Sound: layer levels

@@ -323,6 +323,8 @@
 	"tooltip.foamingshores.verbSize": "How long the reverb lasts.",
 	"option.foamingshores.verbDamp": "Reverb darkness",
 	"tooltip.foamingshores.verbDamp": "How dark the reverb is.",
+	"option.foamingshores.recolorWater": "Water recolouring",
+	"tooltip.foamingshores.recolorWater": "River and lake water in its own shades: lighter, greener shallows and a darker middle. Off, vanilla's water shows everywhere except the pixels a flow line, ripple, ring or foam is drawn on.",
 	"option.foamingshores.soundOn": "Sound",
 	"tooltip.foamingshores.soundOn": "Synthesised shore sounds, timed to the waves. Nothing is recorded."
 }
