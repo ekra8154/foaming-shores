@@ -88,12 +88,15 @@ public final class FoamSettings {
 	public float backwater = 2f;     // blocks
 	public float windDir = 120f;     // degrees the wind blows toward, from east toward south
 	public float windShift = 30f;    // degrees
-	public float windStrength = 0.6f;
+	public float windStrength = 0.35f;
 	public float chop = 0.8f;
 	public float chopPeriod = 2.2f;  // seconds
 	public float fetchFull = 8f;     // blocks
 	public float chopRunup = 3f;     // texels
 	public float rainRings = 0.7f;
+	public float glints = 0.4f;
+	public float paws = 0.5f;
+	public float rises = 0.3f;
 
 	// Wet sand
 	public float wetDark = 0.28f;

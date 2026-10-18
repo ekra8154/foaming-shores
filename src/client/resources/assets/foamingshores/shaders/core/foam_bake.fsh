@@ -55,9 +55,11 @@ layout(std140) uniform FoamBake {
     vec4 Swell2;   // travel fade (texels), crossing strength, crossing fades within (texels), -
     vec4 SwellOrigin; // region origin on the swell's noise lattice: whole cells (x, z), fraction (x, z)
     vec4 River;    // flow lines, flow line length (texels), lighter shallows, lapping at the banks
-    vec4 Wind;     // the way the wind blows (x, z, unit), its strength, its direction as 0..16 of the fetch's directions
-    vec4 Still;    // wind ripples, time between ripples (s), ripples full size over (texels), lapping run-up (texels)
+    vec4 WindA;    // wind pattern A: the way the wind blows (x, z, unit), its strength, its direction as 0..16 of the fetch's directions
+    vec4 Still;    // wind ripples, time between ripples in a full wind (s), ripples full size over (texels), lapping run-up (texels)
     vec4 RainW;    // rain (0..1), rain rings, region origin in world texels (x, z)
+    vec4 WindB;    // wind pattern B, as WindA
+    vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -216,14 +218,65 @@ float distanceToBlock(vec2 texel, bool river) {
     return best;
 }
 
-// Still water's fetch at a region texel for the wind now, in texels, between the two nearest of
-// the 16 directions.
-float fetchAt(vec2 texel) {
+// Still water's fetch at a region texel for a wind, in texels, between the two nearest of the 16
+// directions.
+float fetchAt(vec2 texel, vec4 wind) {
     ivec2 smp = ivec2(floor((texel + 0.5) / (16.0 / Region.y)));
-    int i0 = int(floor(Wind.w)) % 16, i1 = (i0 + 1) % 16;
+    int i0 = int(floor(wind.w)) % 16, i1 = (i0 + 1) % 16;
     float a = texelFetch(FetchSampler, ivec2(smp.x * 4 + i0 / 4, smp.y), 0)[i0 % 4];
     float b = texelFetch(FetchSampler, ivec2(smp.x * 4 + i1 / 4, smp.y), 0)[i1 % 4];
-    return mix(a, b, fract(Wind.w)) * 384.0;
+    return mix(a, b, fract(wind.w)) * 384.0;
+}
+
+// Which wind pattern a world texel shows (see FoamRenderer.pass): patches fixed in the world go
+// over to pattern A as its weight rises and back as it falls, so neither is seen taking up its new
+// wind.
+vec4 windFor(vec2 wp, float bay) {
+    return Calm.x > vnoise(ivec2(0), wp / 40.0, 131) + (bay - 0.5) * 0.08 ? WindA : WindB;
+}
+
+// Gusts at a world texel: patches of rougher water drifting downwind (cat's paws), slower in a
+// lighter wind, slowly changing shape as they go. 0..1.
+float gustAt(vec2 wp, vec4 wind) {
+    float T = Origin.z, v = 1.5 + 6.0 * min(1.0, wind.z);
+    vec2 g = wp - wind.xy * v * T;
+    return vnoise(ivec2(0), g / 48.0, 77) * 0.75 + vnoise(ivec2(0), g / 20.0 + vec2(T / 17.0, -T / 23.0), 83) * 0.25;
+}
+
+// Glints on calm water at a world texel: the sky caught on the surface, a pixel that twinkles (a
+// little cross at its brightest) and is gone. Each 6x6 texel cell has at most one per 3.2 s, at a
+// hashed spot and moment. 0 for none, 1 lighter, 2 white.
+int glintAt(vec2 wp) {
+    if (Calm.y <= 0.0) return 0;
+    ivec2 g = ivec2(floor(wp)), c = ivec2(floor(vec2(g) / 6.0));
+    float T = Origin.z, off = hash3(c.x, c.y, 111) * 3.2;
+    int k = int(floor((T + off) / 3.2));
+    float age = T + off - float(k) * 3.2;
+    if (age >= 0.8 || hash3(c.x, c.y, 113 + (k & 1023)) >= Calm.y * 0.15) return 0;
+    ivec2 at = c * 6 + 1 + ivec2(floor(vec2(hash3(c.x, c.y, 117 + (k & 1023)), hash3(c.x, c.y, 119 + (k & 1023))) * 4.0));
+    float e = sin(age / 0.8 * 3.14159);
+    int dd = abs(g.x - at.x) + abs(g.y - at.y);
+    if (dd == 0 && e > 0.7) return 2;
+    return (dd == 0 && e > 0.15) || (dd == 1 && e > 0.8) ? 1 : 0;
+}
+
+// Rises at a world texel: now and then a fish or a bug touches calm still water and a ring or two
+// spreads, slow and small. Each 32x32 texel cell has at most one per 6 s, kept inside its cell,
+// and only where its middle is calm still water. How strong the ring is here (0 for none).
+float riseAt(vec2 wp, vec2 texel) {
+    if (Calm.w <= 0.0) return 0.0;
+    ivec2 c = ivec2(floor(wp / 32.0));
+    float T = Origin.z, off = hash3(c.x, c.y, 121) * 6.0;
+    int k = int(floor((T + off) / 6.0));
+    float age = T + off - float(k) * 6.0;
+    if (age > 1.8 || hash3(c.x, c.y, 123 + (k & 1023)) > Calm.w * 0.12) return 0.0;
+    vec2 at = vec2(c) * 32.0 + 9.0 + vec2(hash3(c.x, c.y, 125 + (k & 1023)), hash3(c.x, c.y, 127 + (k & 1023))) * 14.0;
+    ivec2 mid = ivec2(floor(texel + at - wp));
+    if (any(lessThan(mid, ivec2(0))) || any(greaterThanEqual(mid, ivec2(Region.x)))) return 0.0;
+    if (texelFetch(RiverDecorSampler, mid, 0).a * 255.0 < 128.0) return 0.0;
+    float rad = 1.0 + age * 4.0, fade = 1.0 - age / 1.8, dd = length(floor(wp) + 0.5 - at);
+    if (abs(dd - rad) < 0.6) return fade;
+    return rad > 4.0 && abs(dd - rad + 3.0) < 0.6 ? fade * 0.6 : 0.0;
 }
 
 // Rain rings at a world texel position: each 5x5 cell has at most one drop per 0.9 s, at a hashed
@@ -253,9 +306,11 @@ float rainRingAt(vec2 wp) {
 // speed, so each crest appears at the back of a group and fades at its front. At a world texel
 // position, for a fetch fraction: (summed height -1..1, group envelope 0..1, crest line 0..1 over
 // `width` of a wavelength).
+// A light wind makes short ripples that creep; a full one, long ripples that run.
 const vec3 TRAINS[4] = vec3[](vec3(-0.44, 1.0, 0.13), vec3(-0.14, 0.82, 0.57), vec3(0.17, 1.18, 0.31), vec3(0.47, 0.9, 0.79));
-vec3 rippleAt(vec2 wp, float fr, float width) {
-    float lam0 = 16.0 + 18.0 * fr, T0 = Still.y, T = Origin.z, ang = atan(Wind.y, Wind.x);
+vec3 rippleAt(vec2 wp, float fr, float width, vec4 wind) {
+    float s = min(1.0, wind.z), lam0 = (6.0 + 10.0 * s) * (1.0 + 1.1 * fr), T0 = Still.y / (0.3 + 0.7 * s);
+    float T = Origin.z, ang = atan(wind.y, wind.x);
     float h = 0.0, line = 0.0;
     for (int k = 0; k < 4; k++) {
         float a = ang + TRAINS[k].x, lam = lam0 * TRAINS[k].y, per = T0 * sqrt(TRAINS[k].y);
@@ -264,7 +319,7 @@ vec3 rippleAt(vec2 wp, float fr, float width) {
         if (fp < width) line = max(line, 1.0 - fp / width);
     }
     float cg = 0.5 * lam0 / T0; // group speed: half the crests'
-    float env = vnoise(ivec2(0), (wp - Wind.xy * cg * T) / (lam0 * 3.0), 79);
+    float env = vnoise(ivec2(0), (wp - wind.xy * cg * T) / (lam0 * 3.0), 79);
     return vec3(h * 0.25, env, line);
 }
 
@@ -282,10 +337,11 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         if (abs(levelAt(texel)) > 0.5) return vec4(0.0);
         float dr = distanceToBlock(texel, true);
         // On a shore the wind blows onto, each ripple laps a little way up as it arrives.
-        if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0 && Wind.z > 0.0) {
-            float fr = min(1.0, fetchAt(texel) / Still.z), reach = Still.x * Wind.z * fr * Still.w;
+        vec4 wd = windFor(wp, bay);
+        if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0 && wd.z > 0.0) {
+            float fr = min(1.0, fetchAt(texel, wd) / Still.z), reach = Still.x * wd.z * fr * Still.w;
             if (reach > 0.3) {
-                vec3 rp = rippleAt(wp, fr, 0.08);
+                vec3 rp = rippleAt(wp, fr, 0.08, wd);
                 float run = reach * clamp((rp.x * (0.55 + 0.9 * rp.y) - 0.1) / 0.8, 0.0, 1.0);
                 if (dr < run) {
                     if (run - dr < 1.1) return vec4(run > reach * 0.6 ? foamBright() : foamShadow(), 1.0);
@@ -318,14 +374,31 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     } else {
         col *= 1.0 - 0.08 * min(1.0, bank / 32.0);
     }
-    // Wind ripples on still water (see rippleAt): bigger and longer the more open water lies upwind,
-    // rougher in gusts (patches moving with the wind), tipped white in a strong wind over a long fetch.
-    if (decor.a > 0.5 / 255.0 && Still.x > 0.0 && Wind.z > 0.0) {
-        float fr = min(1.0, fetchAt(texel) / Still.z);
-        float gust = vnoise(ivec2(0), (wp - Wind.xy * Origin.z * 14.0) / 48.0, 77);
-        float amp = Still.x * Wind.z * fr * (decor.a * 255.0 - 1.0) / 254.0 * (0.6 + 0.8 * gust);
+    // Still water: calm life whatever the wind, then the wind's ripples.
+    bool still = decor.a > 0.5 / 255.0;
+    float calm = still ? (decor.a * 255.0 - 1.0) / 254.0 : 0.0;
+    vec4 wd = windFor(wp, bay);
+    float gust = still ? gustAt(wp, wd) : 0.0;
+    if (calm > 0.3) {
+        // Cat's paws: where a gust crosses calm water it ruffles it, a shade darker (rough water
+        // shows less sky) with fine flecks of light coming and going.
+        if (Calm.z > 0.0 && gust - (0.82 - 0.22 * Calm.z) > (bay - 0.5) * 0.05) {
+            col *= vec3(0.9, 0.9, 0.93);
+            ivec2 g = ivec2(floor(wp));
+            float fl = hash3(g.x, g.y, 107);
+            if (fl < 0.2 && fract(T / 1.4 + fl * 37.0) < 0.25) col = col * 1.16 + 12.0 / 255.0;
+        }
+        int gl = glintAt(wp);
+        if (gl == 2) return vec4(foamBright(), 1.0);
+        if (gl == 1) col = col * 1.25 + 22.0 / 255.0;
+    }
+    // Wind ripples on still water (see rippleAt): bigger and longer the more open water lies upwind
+    // and the stronger the wind, rougher in gusts, tipped white in a strong wind over a long fetch.
+    if (still && Still.x > 0.0 && wd.z > 0.0) {
+        float fr = min(1.0, fetchAt(texel, wd) / Still.z);
+        float amp = Still.x * wd.z * fr * calm * (0.6 + 0.8 * gust);
         if (amp > 0.02) {
-            vec3 rp = rippleAt(wp, fr, 0.06 + 0.05 * min(1.0, amp));
+            vec3 rp = rippleAt(wp, fr, 0.06 + 0.05 * min(1.0, amp), wd);
             float crest = rp.x * (0.55 + 0.9 * rp.y);
             if (rp.z > 0.0 && crest > 0.3 - 0.2 * min(1.0, amp) && amp * (0.5 + rp.y) > bay * 0.8) {
                 if (amp > 0.6 && crest > 0.75 && rp.z > 0.5 && hash3(int(floor(wp.x / 2.0)), int(floor(wp.y / 2.0)), int(floor(Origin.z * 3.0))) < (amp - 0.6) * 2.0)
@@ -368,6 +441,7 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     // Rain rings, where the water is calm enough to show them.
     float ring = rainRingAt(wp) * (1.0 - min(1.0, sp / 20.0));
     if (ring > bay * 0.8) col = col * 1.22 + 20.0 / 255.0;
+    else if (still && riseAt(wp, texel) > bay * 0.8) col = col * 1.2 + 18.0 / 255.0;
     return vec4(min(col, vec3(1.0)), alpha);
 }
 

@@ -97,8 +97,10 @@ public final class FoamRenderer {
 	private static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.putVec4().putVec4().putVec4().putVec4()
-		.putVec4().putVec4().putVec4()
+		.putVec4().putVec4().putVec4().putVec4().putVec4()
 		.get() + 16 * 2 * MAX_WAVES;
+	/** Seconds between the moments each wind pattern takes up (see pass). */
+	private static final double WIND_EPOCH = 24;
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "Foaming Shores fields");
@@ -131,6 +133,9 @@ public final class FoamRenderer {
 	private final Splashes splashes = new Splashes();
 	private final ShoreAudio audio = new ShoreAudio();
 	private long lastBakeStep = Long.MIN_VALUE;
+	/** Each wind pattern's moment and the rain it took up then. */
+	private final long[] windMoment = {Long.MIN_VALUE, Long.MIN_VALUE};
+	private final float[] windRain = new float[2];
 	/** Frames drawn so far, and the frame of the last bake: the bake's uniform buffer is a ring of 3
 	 *  fenced per frame (like vanilla's lightmap), so it may be rotated at most once per frame. */
 	private long frames, lastBakeFrame = -1;
@@ -625,6 +630,22 @@ public final class FoamRenderer {
 	private record WaterSprites(GpuTextureView atlas, int stillX, int stillY, int flowX, int flowY) {
 	}
 
+	/**
+	 * The wind at moment t for pattern i: the way it blows (x, z), its strength and its direction as
+	 * 0..16 of the fetch's directions. The rain is the rain when the pattern took up this moment, so a
+	 * shower coming on never changes a pattern's wind while it shows.
+	 */
+	private void putWind(Std140Builder b, FoamSettings s, int i, long moment, double t, float rainNow) {
+		if (windMoment[i] != moment) {
+			windMoment[i] = moment;
+			windRain[i] = rainNow;
+		}
+		double ang = Math.toRadians(s.windDir + s.windShift * (WaveMath.vnoise(t / 90, 0.5, 501) * 2 - 1));
+		double strength = Math.min(1.5, s.windStrength * (0.75 + 0.5 * WaveMath.vnoise(t / 40, 3.5, 503)) * (1 + 0.5 * windRain[i]));
+		double dirIndex = ((ang / (Math.PI * 2) * ShoreRegion.FETCH_DIRS) % ShoreRegion.FETCH_DIRS + ShoreRegion.FETCH_DIRS) % ShoreRegion.FETCH_DIRS;
+		b.putVec4((float) Math.cos(ang), (float) Math.sin(ang), (float) strength, (float) dirIndex);
+	}
+
 	/** Looked up at every bake: a resource reload can move the sprites. */
 	private static WaterSprites waterSprites() {
 		Minecraft mc = Minecraft.getInstance();
@@ -663,14 +684,20 @@ public final class FoamRenderer {
 			b.putVec4((float) Math.floor(lx), (float) Math.floor(lz), (float) (lx - Math.floor(lx)), (float) (lz - Math.floor(lz)));
 			b.putVec4(s.riverStreaks, s.riverLen, s.riverShallow, s.riverBank);
 			// The wind: one for the whole world, wandering slowly about its set direction and strength,
-			// following the world's time (so every player sees the same), stronger in rain.
+			// following the world's time (so every player sees the same), stronger in rain. Ripples,
+			// gusts and lapping read it through two patterns, each holding one moment's wind fixed:
+			// turning a crest pattern sweeps it the faster the farther it is from where it turns, the
+			// world's origin, so a wind that turned under drawn crests would send them racing. Each
+			// pattern takes up a new moment only while it is hidden (its weight 0), every WIND_EPOCH
+			// seconds; the shader swaps between the two patch by patch.
 			float rain = level == null ? 0 : level.getRainLevel(1);
-			double ang = Math.toRadians(s.windDir + s.windShift * (WaveMath.vnoise(now / 90, 0.5, 501) * 2 - 1));
-			double strength = Math.min(1.5, s.windStrength * (0.75 + 0.5 * WaveMath.vnoise(now / 40, 3.5, 503)) * (1 + 0.5 * rain));
-			double dirIndex = ((ang / (Math.PI * 2) * ShoreRegion.FETCH_DIRS) % ShoreRegion.FETCH_DIRS + ShoreRegion.FETCH_DIRS) % ShoreRegion.FETCH_DIRS;
-			b.putVec4((float) Math.cos(ang), (float) Math.sin(ang), (float) strength, (float) dirIndex);
+			double u = now / WIND_EPOCH;
+			long kA = (long) Math.floor(u), kB = (long) Math.floor(u + 0.5);
+			putWind(b, s, 0, kA, (kA + 0.5) * WIND_EPOCH, rain);
 			b.putVec4(s.chop, s.chopPeriod, s.fetchFull * 16, s.chopRunup);
 			b.putVec4(rain, s.rainRings, region.originX * 16f, region.originZ * 16f);
+			putWind(b, s, 1, kB, kB * WIND_EPOCH, rain);
+			b.putVec4((float) (1 - Math.abs(2 * (u - kA) - 1)), s.glints, s.paws, s.rises);
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {
 					WaveSchedule.Wave w = waves.get(i);
