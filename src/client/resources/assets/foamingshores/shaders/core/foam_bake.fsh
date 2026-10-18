@@ -60,7 +60,7 @@ layout(std140) uniform FoamBake {
     vec4 RainW;    // rain (0..1), rain rings, region origin in world texels (x, z)
     vec4 WindB;    // wind pattern B, as WindA
     vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
-    vec4 Calm2;    // edge rings, -, -, -
+    vec4 Calm2;    // edge rings, sparkles on flow lines, -, -
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -457,7 +457,7 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         // Foam carried down from a rock, as white; and now and then a flow line's head sparkles
         // white as it passes (twinkling over the pixels it crosses). A line's chance is cut where
         // lines are denser (the shallows), so sparkles are as common everywhere.
-        bool sparkle = v > 0.8 && spark < 0.12 * 0.01 / (0.01 + 0.018 * sh) && hash3(wt.x, wt.y, 71) < 0.5;
+        bool sparkle = v > 0.8 && spark < Calm2.y * 0.24 * 0.01 / (0.01 + 0.018 * sh) && hash3(wt.x, wt.y, 71) < 0.5;
         if ((decor.b > 0.2 && v > 0.35) || sparkle) return vec4(foamBright(), 1.0);
         col = v > 0.6 ? col * 1.34 + 30.0 / 255.0 : col * 1.16 + 12.0 / 255.0;
         alpha = max(alpha, w.a * Look.z);

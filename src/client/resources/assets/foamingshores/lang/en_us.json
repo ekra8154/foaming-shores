@@ -109,6 +109,8 @@
 	"tooltip.foamingshores.riverSpeed": "How fast river water flows. It runs faster where the river narrows and over the shallows, and slower toward the banks.",
 	"option.foamingshores.riverStreaks": "Flow lines",
 	"tooltip.foamingshores.riverStreaks": "How many light streaks drift down a river with its current.",
+	"option.foamingshores.riverSparkle": "Sparkles on flow lines",
+	"tooltip.foamingshores.riverSparkle": "How often a flow line's head sparkles white as it passes. As common in the shallows as in deep water.",
 	"option.foamingshores.riverLen": "Flow line length",
 	"tooltip.foamingshores.riverLen": "How long each streak is. Shallows get shorter ones.",
 	"option.foamingshores.riverShallow": "Lighter shallows",

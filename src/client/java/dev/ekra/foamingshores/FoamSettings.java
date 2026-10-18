@@ -77,6 +77,7 @@ public final class FoamSettings {
 	// Rivers
 	public float riverSpeed = 1.2f;  // blocks per second
 	public float riverStreaks = 0.6f;
+	public float riverSparkle = 0.5f;
 	public float riverLen = 9f;      // texels
 	public float riverShallow = 0.45f;
 	public float riverBank = 0.5f;

@@ -50,6 +50,11 @@ final class Rivers {
 			bank[p] = Math.max(0, bank[p] * tps - tps / 2);
 			toRiver[p] = anyRiver ? Math.max(0, toRiver[p] * tps - tps / 2) : 1e9f;
 		}
+		// The banks as the river's shape sees them: small land standing in the water (a rock, a
+		// placed block) is left out, so the current runs along the river past it instead of
+		// circling it.
+		float[] shoreBank = Fields.distanceTo(shoreLand(r, land, S, RES), S, S);
+		for (int p = 0; p < n; p++) shoreBank[p] = Math.max(0, shoreBank[p] * tps - tps / 2);
 		// How much of a river's current reaches still water: along the water from the river, fading.
 		float[] pull = new float[n];
 		{
@@ -103,7 +108,7 @@ final class Rivers {
 			for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
 				int p = y * S + x;
 				if (!dom[p]) continue;
-				float gx = (bank[p + 1] - bank[p - 1]) * 0.5f, gy = (bank[p + S] - bank[p - S]) * 0.5f;
+				float gx = (shoreBank[p + 1] - shoreBank[p - 1]) * 0.5f, gy = (shoreBank[p + S] - shoreBank[p - S]) * 0.5f;
 				jxx[p] = gx * gx;
 				jxy[p] = gx * gy;
 				jyy[p] = gy * gy;
@@ -159,7 +164,7 @@ final class Rivers {
 
 			// Speed.
 			float[] bankR = new float[n];
-			for (int p = 0; p < n; p++) bankR[p] = rivS[p] ? bank[p] : 0;
+			for (int p = 0; p < n; p++) bankR[p] = rivS[p] ? shoreBank[p] : 0;
 			float[] halfW = Fields.maxFilter(bankR, S, S, 6);
 			for (int p = 0; p < n; p++) {
 				if (!dom[p]) continue;
@@ -183,6 +188,22 @@ final class Rivers {
 					}
 				}
 			}
+			// Past a rock the current parts: near land, whatever would run into it is turned along
+			// it, keeping its speed.
+			for (int y = 1; y < S - 1; y++) for (int x = 1; x < S - 1; x++) {
+				int p = y * S + x;
+				float w = 1 - bank[p] / 16;
+				if (!dom[p] || w <= 0) continue;
+				float gx = (bank[p + 1] - bank[p - 1]) * 0.5f, gy = (bank[p + S] - bank[p - S]) * 0.5f, gl = (float) Math.hypot(gx, gy);
+				float sp = (float) Math.hypot(fx[p], fy[p]);
+				if (gl < 1e-4f || sp < 1e-4f) continue;
+				float nx = gx / gl, ny = gy / gl, into = fx[p] * nx + fy[p] * ny;
+				if (into >= 0) continue;
+				float tx = fx[p] - w * into * nx, ty = fy[p] - w * into * ny, tl = (float) Math.hypot(tx, ty);
+				if (tl < 1e-4f) continue;
+				fx[p] = tx / tl * sp;
+				fy[p] = ty / tl * sp;
+			}
 			fx = Fields.boxBlur(fx, S, S, 1);
 			fy = Fields.boxBlur(fy, S, S, 1);
 			for (int p = 0; p < n; p++) if (land[p]) { fx[p] = 0; fy[p] = 0; }
@@ -199,6 +220,37 @@ final class Rivers {
 		}
 		r.riverDecor = decor;
 	}
+
+	/** Blocks of land that make up banks, per field sample: all land but small pieces standing in the water. */
+	private static boolean[] shoreLand(ShoreRegion r, boolean[] land, int S, int RES) {
+		int size = r.size;
+		boolean[] small = new boolean[size * size], seen = new boolean[size * size];
+		int[] queue = new int[size * size];
+		for (int s0 = 0; s0 < size * size; s0++) {
+			if (r.water[s0] || seen[s0]) continue;
+			int h = 0, t = 0;
+			boolean edge = false;
+			queue[t++] = s0;
+			seen[s0] = true;
+			while (h < t) {
+				int i = queue[h++], bx = i % size, bz = i / size;
+				if (bx == 0 || bz == 0 || bx == size - 1 || bz == size - 1) edge = true;
+				for (int k = 0; k < 4; k++) {
+					int nx = bx + (k == 0 ? 1 : k == 1 ? -1 : 0), nz = bz + (k == 2 ? 1 : k == 3 ? -1 : 0);
+					if (nx < 0 || nz < 0 || nx >= size || nz >= size) continue;
+					int j = nz * size + nx;
+					if (!r.water[j] && !seen[j]) { seen[j] = true; queue[t++] = j; }
+				}
+			}
+			if (!edge && t <= ROCK_BLOCKS) for (int k = 0; k < t; k++) small[queue[k]] = true;
+		}
+		boolean[] out = new boolean[S * S];
+		for (int p = 0; p < S * S; p++) out[p] = land[p] && !small[((p / S) / RES) * size + (p % S) / RES];
+		return out;
+	}
+
+	/** Land pieces of at most this many blocks are rocks to a river's shape, not banks. */
+	private static final int ROCK_BLOCKS = 6;
 
 	/**
 	 * Still water's fetch: from each field sample of still water (and of land beside it, for the
