@@ -35,7 +35,6 @@ import net.minecraft.client.renderer.MappableRingBuffer;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
-import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.block.FluidModel;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -738,9 +737,8 @@ public final class FoamRenderer {
 		PoseStack poseStack = context.poseStack();
 		poseStack.pushPose();
 		poseStack.translate(-cam.x, -cam.y, -cam.z);
-		RenderType type = RenderTypes.entityTranslucent(TEXTURE_ID, false);
-		submitQuads(context, poseStack, type, quads);
-		if (!faceQuads.isEmpty()) submitQuads(context, poseStack, RenderTypes.entityTranslucent(FACES_ID, false), faceQuads);
+		submitQuads(context, poseStack, FoamPipelines.surface(TEXTURE_ID), quads, cam);
+		if (!faceQuads.isEmpty()) submitQuads(context, poseStack, FoamPipelines.surface(FACES_ID), faceQuads, cam);
 		if (!splashes.isEmpty() && level != null) {
 			var camState = context.levelState().cameraRenderState;
 			float ft = settings.foamTint;
@@ -754,12 +752,26 @@ public final class FoamRenderer {
 		poseStack.popPose();
 	}
 
-	private static void submitQuads(LevelRenderContext context, PoseStack poseStack, RenderType type, List<Quad> qs) {
+	/**
+	 * How far each vertex is pulled toward the eye, per block of distance squared. Vanilla's reversed
+	 * float depth tells the foam's small lift apart from the block under it at any range, but Iris
+	 * turns reversed depth off while a shaderpack is on, and then one depth step is about
+	 * d² / (near * 2^24) blocks: past ~40 blocks it outgrows the 0.002 lift and the foam z-fights.
+	 * Pulling along the line of sight keeps every vertex where it is on screen and moves shared
+	 * corners alike, so tops and faces stay joined; four depth steps of margin.
+	 */
+	private static final double EYE_PULL = 4.0 / (0.05 * (1 << 24));
+
+	private static void submitQuads(LevelRenderContext context, PoseStack poseStack, RenderType type, List<Quad> qs, Vec3 cam) {
 		context.submitNodeCollector().submitCustomGeometry(poseStack, type, (pose, buffer) -> {
 			for (Quad q : qs) {
 				float[] p = q.xyz(), uv = q.uv();
-				for (int k = 0; k < 4; k++)
-					vertex(buffer, pose, p[k * 3], p[k * 3 + 1], p[k * 3 + 2], uv[k * 2], uv[k * 2 + 1], q.light(), q.nx(), q.ny(), q.nz());
+				for (int k = 0; k < 4; k++) {
+					double dx = p[k * 3] - cam.x, dy = p[k * 3 + 1] - cam.y, dz = p[k * 3 + 2] - cam.z;
+					double keep = 1 - EYE_PULL * Math.sqrt(dx * dx + dy * dy + dz * dz);
+					vertex(buffer, pose, (float) (cam.x + dx * keep), (float) (cam.y + dy * keep), (float) (cam.z + dz * keep),
+						uv[k * 2], uv[k * 2 + 1], q.light(), q.nx(), q.ny(), q.nz());
+				}
 			}
 		});
 	}
