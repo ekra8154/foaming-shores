@@ -75,6 +75,12 @@ public final class FoamRenderer {
 	private static final int MAX_WAVES = 12;
 	/** Rebuild once the player is this far (blocks) from the region's centre. */
 	private static final int REBUILD_DISTANCE = 24;
+	/**
+	 * While chunks round the player are still arriving (joining, teleporting, flying into new land),
+	 * a build waits until none has come for this many ticks, so a burst of chunks costs one build
+	 * instead of a chain of them each waiting for the last; but never longer than MAX_SETTLE ticks.
+	 */
+	private static final int SETTLE_TICKS = 2, MAX_SETTLE = 10;
 	public static final Identifier TEXTURE_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_region");
 	public static final Identifier FACES_ID = Identifier.fromNamespaceAndPath("foamingshores", "foam_faces");
 	/** A single white texel: droplets and flecks are coloured per vertex. */
@@ -132,6 +138,9 @@ public final class FoamRenderer {
 	private final Splashes splashes = new Splashes();
 	private final ShoreAudio audio = new ShoreAudio();
 	private long lastBakeStep = Long.MIN_VALUE;
+	/** Client ticks so far, the tick a chunk round the player last arrived, and since when the region has been stale. */
+	private long ticks, chunkArrivedAt = -1000, staleSince = -1;
+	private int playerX, playerZ;
 	/** Each wind pattern's moment and the rain it took up then. */
 	private final long[] windMoment = {Long.MIN_VALUE, Long.MIN_VALUE};
 	private final float[] windRain = new float[2];
@@ -150,6 +159,19 @@ public final class FoamRenderer {
 	}
 
 	private record Built(ShoreRegion region, List<int[]> bandBlocks) {
+	}
+
+	public FoamRenderer() {
+		// Build a made-up shore a few times while the game starts, so the first build in a world runs
+		// compiled code (the first, interpreted builds take several times as long).
+		worker.execute(() -> {
+			try {
+				ShoreSnapshot snap = ShoreSnapshot.warmUp(REGION);
+				for (int i = 0; i < 3; i++) bandBlocks(ShoreRegion.build(snap, regionSettings()));
+			} catch (Throwable t) {
+				FoamingShoresClient.LOGGER.warn("Warming up the shore fields failed", t);
+			}
+		});
 	}
 
 	// ---- Tick: keep the region current and bake ---------------------------------------------
@@ -188,6 +210,8 @@ public final class FoamRenderer {
 		if (lvl != level) return;
 		long key = pos.pack();
 		if (missing.contains(key) || buildingMissing.contains(key)) wantRebuild = true;
+		int reach = REGION / 2 + REBUILD_DISTANCE + 16;
+		if (Math.abs(pos.getMiddleBlockX() - playerX) <= reach && Math.abs(pos.getMiddleBlockZ() - playerZ) <= reach) chunkArrivedAt = ticks;
 	}
 
 	public void tick(Minecraft mc) {
@@ -221,16 +245,21 @@ public final class FoamRenderer {
 			wantRebuild = true;
 		}
 		int px = mc.player.getBlockX(), pz = mc.player.getBlockZ();
+		ticks++;
+		playerX = px;
+		playerZ = pz;
 		boolean stale = region == null || wantRebuild
 			|| Math.abs(px - (region.originX + REGION / 2)) > REBUILD_DISTANCE
 			|| Math.abs(pz - (region.originZ + REGION / 2)) > REBUILD_DISTANCE;
-		if (stale && building == null) {
+		if (!stale) staleSince = -1;
+		else if (staleSince < 0) staleSince = ticks;
+		boolean settling = ticks - chunkArrivedAt < SETTLE_TICKS && ticks - staleSince < MAX_SETTLE;
+		if (stale && building == null && !settling) {
 			wantRebuild = false;
+			staleSince = -1;
 			ShoreSnapshot snap = ShoreSnapshot.capture(lvl, px - REGION / 2, pz - REGION / 2, REGION);
 			buildingMissing = snap.missingChunks;
-			ShoreRegion.Settings rs = new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing,
-				settings.farSmooth, settings.wrapAngle, settings.minIsland, settings.runup * 16 * (1 + settings.waveVary) + settings.jag + 4,
-				settings.riverSpeed, settings.riverRock, settings.riverWake, settings.riverTrail, settings.backwater, settings.approach * 16, settings.straight);
+			ShoreRegion.Settings rs = regionSettings();
 			RiverMemory memory = rivers;
 			building = CompletableFuture.supplyAsync(() -> {
 				try {
@@ -264,6 +293,12 @@ public final class FoamRenderer {
 			lastBakeFrame = frames;
 			bake(step * every);
 		}
+	}
+
+	private ShoreRegion.Settings regionSettings() {
+		return new ShoreRegion.Settings(settings.minBody, settings.openWater, settings.downhill, settings.smoothing,
+			settings.farSmooth, settings.wrapAngle, settings.minIsland, settings.runup * 16 * (1 + settings.waveVary) + settings.jag + 4,
+			settings.riverSpeed, settings.riverRock, settings.riverWake, settings.riverTrail, settings.backwater, settings.approach * 16, settings.straight);
 	}
 
 	/**

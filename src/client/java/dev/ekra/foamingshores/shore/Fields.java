@@ -1,6 +1,10 @@
 package dev.ekra.foamingshores.shore;
 
 import java.util.Arrays;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.ForkJoinWorkerThread;
 
 /**
  * Grid algorithms behind the shore fields, all on row-major float grids of {@code w * h}.
@@ -11,6 +15,34 @@ final class Fields {
 	}
 
 	static final float FAR = 1e20f;
+
+	/**
+	 * Threads for the parts of a build that do not need each other (the rivers beside the waves'
+	 * fields, the fetch, the blurs at each scale). Every part writes its own arrays, so the result is
+	 * the same as one after the other.
+	 */
+	private static final ForkJoinPool POOL = new ForkJoinPool(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)), pool -> {
+		ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+		t.setName("Foaming Shores fields " + t.getPoolIndex());
+		t.setDaemon(true);
+		return t;
+	}, null, false);
+
+	/** Runs the jobs on the shore threads at once and waits for all of them. */
+	static void inParallel(Runnable... jobs) {
+		ForkJoinTask<?>[] tasks = new ForkJoinTask<?>[jobs.length];
+		for (int i = 0; i < jobs.length; i++) tasks[i] = ForkJoinTask.adapt(jobs[i]);
+		if (ForkJoinTask.getPool() == POOL) ForkJoinTask.invokeAll(tasks);
+		else POOL.invoke(ForkJoinTask.adapt(() -> ForkJoinTask.invokeAll(tasks)));
+	}
+
+	/** Starts a job on the shore threads; {@link ForkJoinTask#join} it for the result. */
+	static <T> ForkJoinTask<T> start(Callable<T> job) {
+		ForkJoinTask<T> task = ForkJoinTask.adapt(job);
+		if (ForkJoinTask.getPool() == POOL) task.fork();
+		else POOL.execute(task);
+		return task;
+	}
 
 	/** Felzenszwalb-Huttenlocher exact Euclidean distance transform; returns distances (not squared). */
 	static float[] distanceTo(boolean[] feature, int w, int h) {
@@ -71,12 +103,17 @@ final class Fields {
 				acc += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
 			}
 		}
-		for (int x = 0; x < w; x++) {
-			float acc = 0;
-			for (int y = -r; y <= r; y++) acc += tmp[clamp(y, 0, h - 1) * w + x];
-			for (int y = 0; y < h; y++) {
-				out[y * w + x] = acc * norm;
-				acc += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+		// Columns side by side, a row at a time (the same sums per column, read along memory).
+		float[] acc = new float[w];
+		for (int y = -r; y <= r; y++) {
+			int o = clamp(y, 0, h - 1) * w;
+			for (int x = 0; x < w; x++) acc[x] += tmp[o + x];
+		}
+		for (int y = 0; y < h; y++) {
+			int o = y * w, in = Math.min(h - 1, y + r + 1) * w, off = Math.max(0, y - r) * w;
+			for (int x = 0; x < w; x++) {
+				out[o + x] = acc[x] * norm;
+				acc[x] += tmp[in + x] - tmp[off + x];
 			}
 		}
 		return out;

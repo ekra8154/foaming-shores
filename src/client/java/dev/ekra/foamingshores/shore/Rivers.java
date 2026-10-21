@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ForkJoinTask;
 
 import dev.ekra.foamingshores.wave.WaveMath;
 
@@ -44,6 +45,7 @@ final class Rivers {
 			anyInland |= inland[p];
 		}
 		if (!anyInland) return;
+		ForkJoinTask<byte[]> fetching = Fields.start(() -> fetch(r, water, rivS, stillS));
 
 		float[] bank = Fields.distanceTo(land, S, S), toRiver = Fields.distanceTo(rivS, S, S);
 		for (int p = 0; p < n; p++) {
@@ -108,7 +110,6 @@ final class Rivers {
 		}
 		r.riverBlend = blend;
 		r.riverShallow = shallow;
-		r.fetch = fetch(r, water, rivS, stillS);
 
 		float[] fx = new float[n], fy = new float[n], hx = new float[n], hy = new float[n], hb = new float[n];
 		boolean[] dom = new boolean[n];
@@ -131,7 +132,12 @@ final class Rivers {
 			// current is turned along it further down. Scales in between are blended as tensors.
 			float[] halfW = halfWidth(shoreBank, S);
 			float[][][] scales = new float[TENSOR_RADII.length][][];
-			for (int k = 0; k < TENSOR_RADII.length; k++) scales[k] = blurTensor(jxx, jxy, jyy, S, TENSOR_RADII[k]);
+			Runnable[] blurs = new Runnable[TENSOR_RADII.length];
+			for (int k = 0; k < TENSOR_RADII.length; k++) {
+				int kk = k;
+				blurs[k] = () -> scales[kk] = blurTensor(jxx, jxy, jyy, S, TENSOR_RADII[kk]);
+			}
+			Fields.inParallel(blurs);
 			float[] ax = new float[n], ay = new float[n], sure = new float[n];
 			for (int p = 0; p < n; p++) {
 				if (!dom[p]) continue;
@@ -281,12 +287,15 @@ final class Rivers {
 		byte[] decor = anyRiver ? decor(r, settings, dom, rivS, fx, fy, hx, hy, bank, smallLand) : new byte[size * 16 * size * 16 * 4];
 		// Still water in the decor's last channel: 0 for none, else 1..255 for how much the wind's
 		// ripples show there (none where a river's current rules).
-		int T = size * 16;
-		for (int tz = 0; tz < T; tz++) for (int tx = 0; tx < T; tx++) {
-			int sp = (tz / (int) tps) * S + tx / (int) tps;
-			if (stillS[sp]) decor[(tz * T + tx) * 4 + 3] = (byte) (1 + Math.round(254 * (1 - pull[sp])));
+		int T = size * 16, step = (int) tps;
+		for (int tz = 0; tz < T; tz++) for (int sx = 0; sx < S; sx++) {
+			int sp = (tz / step) * S + sx;
+			if (!stillS[sp]) continue;
+			byte v = (byte) (1 + Math.round(254 * (1 - pull[sp])));
+			for (int tx = sx * step; tx < sx * step + step; tx++) decor[(tz * T + tx) * 4 + 3] = v;
 		}
 		r.riverDecor = decor;
+		r.fetch = fetching.join();
 	}
 
 	/** Per block, small land standing in the water: pieces of land not touching the region's edge. */
@@ -328,8 +337,21 @@ final class Rivers {
 		float tps = ShoreRegion.TEXELS_PER_SAMPLE, max = ShoreRegion.FETCH_MAX;
 		float[] toStill = Fields.distanceTo(stillS, S, S);
 		byte[] out = new byte[n * D];
-		int steps = (int) (max / tps);
-		for (int d = 0; d < D; d++) {
+		int steps = (int) (max / tps), groups = 4;
+		Runnable[] jobs = new Runnable[groups];
+		for (int g = 0; g < groups; g++) {
+			int first = g * D / groups, last = (g + 1) * D / groups;
+			jobs[g] = () -> fetchDirections(first, last, S, water, rivS, stillS, toStill, steps, tps, max, out);
+		}
+		Fields.inParallel(jobs);
+		return out;
+	}
+
+	/** {@link #fetch} for wind directions {@code first} to {@code last - 1}. */
+	private static void fetchDirections(int first, int last, int S, boolean[] water, boolean[] rivS, boolean[] stillS, float[] toStill,
+		int steps, float tps, float max, byte[] out) {
+		int n = S * S, D = ShoreRegion.FETCH_DIRS;
+		for (int d = first; d < last; d++) {
 			double a = d * Math.PI * 2 / D, ux = -Math.cos(a), uz = -Math.sin(a); // upwind
 			for (int p = 0; p < n; p++) {
 				boolean onLand = !water[p];
@@ -359,7 +381,6 @@ final class Rivers {
 				out[p * D + d] = (byte) Math.round(Math.min(1, f / max) * 255);
 			}
 		}
-		return out;
 	}
 
 	/**
@@ -431,7 +452,12 @@ final class Rivers {
 		int[] radii = {2, 4, 8, 16, 32, 64};
 		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
 		float[][] most = new float[radii.length][];
-		for (int k = 0; k < radii.length; k++) most[k] = Fields.maxFilter(bankD, S, S, radii[k]);
+		Runnable[] filters = new Runnable[radii.length];
+		for (int k = 0; k < radii.length; k++) {
+			int kk = k;
+			filters[k] = () -> most[kk] = Fields.maxFilter(bankD, S, S, radii[kk]);
+		}
+		Fields.inParallel(filters);
 		float[] out = new float[S * S];
 		for (int p = 0; p < S * S; p++) {
 			int k = 0;
@@ -581,7 +607,7 @@ final class Rivers {
 					int nx = bx + dx, nz = bz + dz;
 					if ((dx == 0 && dz == 0) || nx < 0 || nz < 0 || nx >= size || nz >= size || r.water[nz * size + nx]) continue;
 					double ex = dx < 0 ? lx : dx > 0 ? 16 - lx : 0, ez = dz < 0 ? lz : dz > 0 ? 16 - lz : 0;
-					d = Math.min(d, Math.hypot(ex, ez));
+					d = Math.min(d, Math.sqrt(ex * ex + ez * ez));
 				}
 				if (d > 6) continue;
 				float v = (float) (rockFoam * Math.min(1, Math.max(0, (hit[sp] - 2.5) / 6)) * (1 - d / 6));
@@ -653,22 +679,30 @@ final class Rivers {
 			System.arraycopy(pillow, 0, foam, 0, foam.length);
 			double decay = Math.exp(-2 / trail);
 			int iters = (int) Math.ceil(trail / 2);
+			// Each cell's texel two upstream (the current does not change between steps).
+			int[] from = new int[cells.size()], up = new int[cells.size()];
+			int m = 0;
 			float[] flow = new float[2];
+			for (int ti : cells) {
+				int tx = ti % T, tz = ti / T;
+				flowAt(fx, fy, S, tps, tx + 0.5f, tz + 0.5f, flow);
+				double sp = Math.sqrt((double) flow[0] * flow[0] + (double) flow[1] * flow[1]);
+				if (sp < 0.5) continue;
+				int ux = (int) Math.round(tx - flow[0] / sp * 2), uz = (int) Math.round(tz - flow[1] / sp * 2);
+				if (ux < 0 || uz < 0 || ux >= T || uz >= T) continue;
+				from[m] = ti;
+				up[m++] = uz * T + ux;
+			}
 			for (int it = 0; it < iters; it++) {
-				for (int ti : cells) {
-					int tx = ti % T, tz = ti / T;
-					flowAt(fx, fy, S, tps, tx + 0.5f, tz + 0.5f, flow);
-					double sp = Math.hypot(flow[0], flow[1]);
-					if (sp < 0.5) continue;
-					int ux = (int) Math.round(tx - flow[0] / sp * 2), uz = (int) Math.round(tz - flow[1] / sp * 2);
-					if (ux < 0 || uz < 0 || ux >= T || uz >= T) continue;
-					float v = (float) (foam[uz * T + ux] * decay);
-					if (v > foam[ti]) foam[ti] = v;
+				for (int i = 0; i < m; i++) {
+					float v = (float) (foam[up[i]] * decay);
+					if (v > foam[from[i]]) foam[from[i]] = v;
 				}
 			}
 			for (int i = 0; i < foam.length; i++) foam[i] = Math.max(0, foam[i] - pillow[i] * 0.5f);
 		}
 		for (int i = 0; i < T * T; i++) {
+			if (wake[i] == 0 && pillow[i] == 0 && foam[i] == 0) continue; // most of the region: already 0
 			out[i * 4] = (byte) Math.round(Math.min(1, wake[i]) * 255);
 			out[i * 4 + 1] = (byte) Math.round(Math.min(1, pillow[i]) * 255);
 			out[i * 4 + 2] = (byte) Math.round(Math.min(1, foam[i]) * 255);

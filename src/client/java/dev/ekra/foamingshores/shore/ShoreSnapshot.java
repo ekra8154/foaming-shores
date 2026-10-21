@@ -165,6 +165,34 @@ public final class ShoreSnapshot {
 		return s;
 	}
 
+	/**
+	 * A made-up shore (a sea along one side, a river winding in from it, a lake beside the river)
+	 * for building once at start-up, so the first real build in a world runs compiled code rather
+	 * than the interpreter.
+	 */
+	public static ShoreSnapshot warmUp(int size) {
+		ShoreSnapshot s = new ShoreSnapshot(0, 0, size);
+		int waterY = 62;
+		s.waterY = waterY;
+		for (int z = 0; z < size; z++) {
+			for (int x = 0; x < size; x++) {
+				int i = z * size + x;
+				double riverX = size * 0.5 + Math.sin(z * 0.08) * size * 0.15;
+				boolean sea = z < size / 4 + (int) (Math.sin(x * 0.1) * 3);
+				boolean river = Math.abs(x - riverX) < 4 + z % 3;
+				boolean lake = Math.hypot(x - size * 0.8, z - size * 0.7) < size * 0.1;
+				boolean water = sea || river || lake;
+				s.water[i] = water;
+				s.topY[i] = water ? waterY : waterY + 1 + (x * 7 + z * 3) % 2;
+				s.surfY[i] = water ? waterY : NO_SURFACE;
+				s.ocean[i] = sea;
+				s.river[i] = river && !sea;
+				s.depth[i] = (byte) (water ? Math.min(4, 1 + (x + z) % 4) : 0);
+			}
+		}
+		return s;
+	}
+
 	/** The corner heights of the water surface at {@code pos}, worked out as vanilla's FluidRenderer does. */
 	private static void surfaceCorners(Level level, BlockPos pos, float[] out, int o) {
 		Fluid type = level.getFluidState(pos).getType();

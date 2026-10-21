@@ -176,9 +176,11 @@ public final class ShoreRegion {
 		}
 		markBodies(r, surfaceWater, settings.minBodyBlocks());
 		markOpenSea(r);
-		buildFields(r, settings);
-		markDips(r);
-		Rivers.build(r, settings, memory);
+		// The rivers only need the water and its kinds, not the waves' fields: both at once.
+		Fields.inParallel(() -> {
+			buildFields(r, settings);
+			markDips(r);
+		}, () -> Rivers.build(r, settings, memory));
 		return r;
 	}
 
