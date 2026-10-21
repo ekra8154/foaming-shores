@@ -116,14 +116,25 @@ final class Rivers {
 				jxy[p] = gx * gy;
 				jyy[p] = gy * gy;
 			}
-			float[] Jxx = Fields.boxBlur(Fields.boxBlur(jxx, S, S, 2), S, S, 2), Jxy = Fields.boxBlur(Fields.boxBlur(jxy, S, S, 2), S, S, 2),
-				Jyy = Fields.boxBlur(Fields.boxBlur(jyy, S, S, 2), S, S, 2);
-			float[] ax = new float[n], ay = new float[n];
+			// Averaged at a scale that grows away from the banks: over about a block beside them, where
+			// the water follows the bank, about four a little further out, and about ten in the middle
+			// of a wide river, so out in the stream it follows the river's own bends rather than every
+			// bay and bar of its banks. The three are blended as tensors, so the way turns smoothly.
+			float[][] fine = blurTensor(jxx, jxy, jyy, S, 2), mid = blurTensor(jxx, jxy, jyy, S, 8), wide = blurTensor(jxx, jxy, jyy, S, 20);
+			float[] ax = new float[n], ay = new float[n], sure = new float[n];
 			for (int p = 0; p < n; p++) {
 				if (!dom[p]) continue;
-				double th = 0.5 * Math.atan2(2 * Jxy[p], Jxx[p] - Jyy[p]); // across the river
+				float tm = smooth(8, 48, shoreBank[p]), tw = smooth(48, 120, shoreBank[p]);
+				float w0 = 1 - tm, w1 = tm * (1 - tw), w2 = tm * tw;
+				float txx = w0 * fine[0][p] + w1 * mid[0][p] + w2 * wide[0][p];
+				float txy = w0 * fine[1][p] + w1 * mid[1][p] + w2 * wide[1][p];
+				float tyy = w0 * fine[2][p] + w1 * mid[2][p] + w2 * wide[2][p];
+				double th = 0.5 * Math.atan2(2 * txy, txx - tyy); // across the river
 				ax[p] = (float) -Math.sin(th);
 				ay[p] = (float) Math.cos(th);
+				// How clearly the banks give a way here: 1 between straight banks, 0 in a round pool.
+				float sum = txx + tyy;
+				sure[p] = sum > 1e-6f ? (float) (Math.hypot(txx - tyy, 2 * txy) / sum) : 0;
 			}
 
 			// Which way: down the distance to the sea along the water (ocean or beach water), or
@@ -162,6 +173,21 @@ final class Rivers {
 				float gx = (dom[p + 1] ? sm[p + 1] : sm[p]) - (dom[p - 1] ? sm[p - 1] : sm[p]);
 				float gy = (dom[p + S] ? sm[p + S] : sm[p]) - (dom[p - S] ? sm[p - S] : sm[p]);
 				if (ax[p] * gx + ay[p] * gy > 0) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
+			}
+			// Each stretch runs one way, whatever that means for the sea: water running out of the sea
+			// looks better than a river clashing with itself (where the sea is about as far either way,
+			// at a junction, a wide mouth or a channel along the coast with outlets, the way down to it
+			// splits). So the way is spread along the axis, from where the banks give it most clearly
+			// (a flood, clearest first), each sample taking the way of the one it was reached from;
+			// the way down to the sea only picks which way each connected stretch runs as a whole.
+			spreadWay(dom, sure, ax, ay, S);
+			// Then where the flood met itself, a sample running against the ways round it (each
+			// weighted by how clear its axis is) is turned round: over a block, then two, then four.
+			for (int rad : new int[] {4, 8, 16}) {
+				float[] vx = new float[n], vy = new float[n];
+				for (int p = 0; p < n; p++) if (dom[p]) { vx[p] = ax[p] * sure[p]; vy[p] = ay[p] * sure[p]; }
+				float[] VX = Fields.boxBlur(Fields.boxBlur(vx, S, S, rad), S, S, rad), VY = Fields.boxBlur(Fields.boxBlur(vy, S, S, rad), S, S, rad);
+				for (int p = 0; p < n; p++) if (dom[p] && ax[p] * VX[p] + ay[p] * VY[p] < 0) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
 			}
 			if (memory != null) remember(r, dom, rivS, pot, ax, ay, memory);
 
@@ -309,6 +335,72 @@ final class Rivers {
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * Spreads one way through each connected stretch of {@code dom}: a flood that always goes on from
+	 * the clearest axis reached so far ({@code sure} in 64 steps, newest first within a step), each
+	 * sample turned to agree with the one that reached it. Then each stretch as a whole is turned to
+	 * run the way {@code ax}, {@code ay} ran before (down to the sea) over most of it, weighted by
+	 * {@code sure}.
+	 */
+	private static void spreadWay(boolean[] dom, float[] sure, float[] ax, float[] ay, int S) {
+		int n = S * S, B = 64;
+		float[] px = ax.clone(), py = ay.clone();
+		int[] head = new int[B], next = new int[n], comp = new int[n], members = new int[n];
+		java.util.Arrays.fill(head, -1);
+		java.util.Arrays.fill(comp, -1);
+		// Every sample, clearest first, to start each stretch from its clearest point.
+		int[] count = new int[B], starts = new int[n];
+		for (int p = 0; p < n; p++) if (dom[p]) count[bucket(sure[p], B)]++;
+		int[] at = new int[B];
+		for (int b = B - 1, o = 0; b >= 0; b--) { at[b] = o; o += count[b]; }
+		int total = 0;
+		for (int p = 0; p < n; p++) if (dom[p]) { starts[at[bucket(sure[p], B)]++] = p; total++; }
+		for (int si = 0; si < total; si++) {
+			int start = starts[si];
+			if (comp[start] >= 0) continue;
+			comp[start] = start;
+			int top = bucket(sure[start], B), m = 0;
+			next[start] = head[top];
+			head[top] = start;
+			while (true) {
+				while (top >= 0 && head[top] < 0) top--;
+				if (top < 0) break;
+				int p = head[top];
+				head[top] = next[p];
+				members[m++] = p;
+				for (int k = 0; k < 4; k++) {
+					int q = neighbour(p, k, S);
+					if (q < 0 || !dom[q] || comp[q] >= 0) continue;
+					if (ax[q] * ax[p] + ay[q] * ay[p] < 0) { ax[q] = -ax[q]; ay[q] = -ay[q]; }
+					comp[q] = start;
+					int b = bucket(sure[q], B);
+					next[q] = head[b];
+					head[b] = q;
+					if (b > top) top = b;
+				}
+			}
+			double vote = 0;
+			for (int i = 0; i < m; i++) { int p = members[i]; vote += sure[p] * (ax[p] * px[p] + ay[p] * py[p]); }
+			if (vote < 0) for (int i = 0; i < m; i++) { int p = members[i]; ax[p] = -ax[p]; ay[p] = -ay[p]; }
+		}
+	}
+
+	private static int bucket(float sure, int B) {
+		return Math.max(0, Math.min(B - 1, (int) (sure * B)));
+	}
+
+	/** The structure tensor's three parts, each box-blurred twice at radius {@code r}. */
+	private static float[][] blurTensor(float[] jxx, float[] jxy, float[] jyy, int S, int r) {
+		return new float[][] {Fields.boxBlur(Fields.boxBlur(jxx, S, S, r), S, S, r), Fields.boxBlur(Fields.boxBlur(jxy, S, S, r), S, S, r),
+			Fields.boxBlur(Fields.boxBlur(jyy, S, S, r), S, S, r)};
+	}
+
+	/** 0 below {@code a}, 1 above {@code b}, smooth between. */
+	private static float smooth(float a, float b, float v) {
+		float t = Math.max(0, Math.min(1, (v - a) / (b - a)));
+		return t * t * (3 - 2 * t);
 	}
 
 	private static int neighbour(int p, int k, int S) {
