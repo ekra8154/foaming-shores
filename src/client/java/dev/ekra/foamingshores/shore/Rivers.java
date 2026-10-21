@@ -116,19 +116,25 @@ final class Rivers {
 				jxy[p] = gx * gy;
 				jyy[p] = gy * gy;
 			}
-			// Averaged at a scale that grows away from the banks: over about a block beside them, where
-			// the water follows the bank, about four a little further out, and about ten in the middle
-			// of a wide river, so out in the stream it follows the river's own bends rather than every
-			// bay and bar of its banks. The three are blended as tensors, so the way turns smoothly.
-			float[][] fine = blurTensor(jxx, jxy, jyy, S, 2), mid = blurTensor(jxx, jxy, jyy, S, 8), wide = blurTensor(jxx, jxy, jyy, S, 20);
+			// Averaged over the river's own width, all the way across: over about its width each
+			// way, so every slice of a channel gets one way along it, the straight line through the
+			// stretch, rather than following whichever bank is nearer, bay by bay and step by step
+			// (land in a staircase of blocks turned the way a quarter turn at each step). Near land the
+			// current is turned along it further down. Scales in between are blended as tensors.
+			float[] halfW = halfWidth(shoreBank, S);
+			float[][][] scales = new float[TENSOR_RADII.length][][];
+			for (int k = 0; k < TENSOR_RADII.length; k++) scales[k] = blurTensor(jxx, jxy, jyy, S, TENSOR_RADII[k]);
 			float[] ax = new float[n], ay = new float[n], sure = new float[n];
 			for (int p = 0; p < n; p++) {
 				if (!dom[p]) continue;
-				float tm = smooth(8, 48, shoreBank[p]), tw = smooth(48, 120, shoreBank[p]);
-				float w0 = 1 - tm, w1 = tm * (1 - tw), w2 = tm * tw;
-				float txx = w0 * fine[0][p] + w1 * mid[0][p] + w2 * wide[0][p];
-				float txy = w0 * fine[1][p] + w1 * mid[1][p] + w2 * wide[1][p];
-				float tyy = w0 * fine[2][p] + w1 * mid[2][p] + w2 * wide[2][p];
+				float want = Math.max(TENSOR_RADII[0], Math.min(TENSOR_RADII[TENSOR_RADII.length - 1], halfW[p] / tps));
+				int k = 0;
+				while (k < TENSOR_RADII.length - 2 && TENSOR_RADII[k + 1] < want) k++;
+				float t = (want - TENSOR_RADII[k]) / (TENSOR_RADII[k + 1] - TENSOR_RADII[k]), u = 1 - t;
+				float[][] lo = scales[k], hi = scales[k + 1];
+				float txx = u * lo[0][p] + t * hi[0][p];
+				float txy = u * lo[1][p] + t * hi[1][p];
+				float tyy = u * lo[2][p] + t * hi[2][p];
 				double th = 0.5 * Math.atan2(2 * txy, txx - tyy); // across the river
 				ax[p] = (float) -Math.sin(th);
 				ay[p] = (float) Math.cos(th);
@@ -191,15 +197,15 @@ final class Rivers {
 			}
 			if (memory != null) remember(r, dom, rivS, pot, ax, ay, memory);
 
-			// Speed.
-			float[] bankR = new float[n];
-			for (int p = 0; p < n; p++) bankR[p] = rivS[p] ? shoreBank[p] : 0;
-			float[] halfW = Fields.maxFilter(bankR, S, S, 6);
+			// Speed: a narrow river runs faster and a wide one slower (as the square root of how much
+			// narrower or wider than sixteen blocks it is, 0.6 to 1.8 times), and across it from nothing
+			// at the bank (or a rock) to full speed along its middle.
 			for (int p = 0; p < n; p++) {
 				if (!dom[p]) continue;
-				float width = Math.max(8, 2 * halfW[p]);
-				double base = settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, 40 / width)) * (1 + 0.4 * shallow[p]) * flowB[p];
-				float sp = (float) (base * Math.sqrt(Math.min(1, bank[p] / 12)));
+				float half = Math.max(8, halfW[p]);
+				double base = settings.riverSpeed() * 16 * Math.min(1.8, Math.max(0.6, Math.sqrt(128 / half))) * (1 + 0.4 * shallow[p]) * flowB[p];
+				double out = Math.min(1, bank[p] / half);
+				float sp = (float) (base * (1 - (1 - out) * (1 - out)));
 				fx[p] = ax[p] * sp;
 				fy[p] = ay[p] * sp;
 				hx[p] = ax[p];
@@ -391,16 +397,32 @@ final class Rivers {
 		return Math.max(0, Math.min(B - 1, (int) (sure * B)));
 	}
 
+	/** The axis tensor's averaging radii (samples, each blurred twice), from a narrow stream to a wide river. */
+	private static final int[] TENSOR_RADII = {2, 4, 8, 12, 16, 24, 32};
+
+	/**
+	 * The water's half-width at each sample, in texels: the bank distance along its middle line.
+	 * The most bank distance in ever wider squares round the sample, until the most lies well
+	 * inside the square (so the middle line has been reached, not just the square's edge).
+	 */
+	private static float[] halfWidth(float[] bankD, int S) {
+		int[] radii = {2, 4, 8, 16, 32, 64};
+		float tps = ShoreRegion.TEXELS_PER_SAMPLE;
+		float[][] most = new float[radii.length][];
+		for (int k = 0; k < radii.length; k++) most[k] = Fields.maxFilter(bankD, S, S, radii[k]);
+		float[] out = new float[S * S];
+		for (int p = 0; p < S * S; p++) {
+			int k = 0;
+			while (k < radii.length - 1 && most[k][p] - bankD[p] >= radii[k] * tps * 0.8f) k++;
+			out[p] = most[k][p];
+		}
+		return out;
+	}
+
 	/** The structure tensor's three parts, each box-blurred twice at radius {@code r}. */
 	private static float[][] blurTensor(float[] jxx, float[] jxy, float[] jyy, int S, int r) {
 		return new float[][] {Fields.boxBlur(Fields.boxBlur(jxx, S, S, r), S, S, r), Fields.boxBlur(Fields.boxBlur(jxy, S, S, r), S, S, r),
 			Fields.boxBlur(Fields.boxBlur(jyy, S, S, r), S, S, r)};
-	}
-
-	/** 0 below {@code a}, 1 above {@code b}, smooth between. */
-	private static float smooth(float a, float b, float v) {
-		float t = Math.max(0, Math.min(1, (v - a) / (b - a)));
-		return t * t * (3 - 2 * t);
 	}
 
 	private static int neighbour(int p, int k, int S) {
