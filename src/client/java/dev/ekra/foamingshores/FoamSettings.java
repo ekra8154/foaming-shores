@@ -79,6 +79,8 @@ public final class FoamSettings {
 	public float riverStreaks = 0.6f;
 	public float riverSparkle = 0.5f;
 	public float riverLen = 9f;      // texels
+	public float riverLenBySpeed = 0.7f;
+	public float riverCountBySpeed = 0.7f;
 	public float riverShallow = 0.45f;
 	public float riverBank = 0.5f;
 	public float riverRock = 0.7f;

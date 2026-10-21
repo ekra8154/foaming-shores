@@ -58,45 +58,53 @@ final class Rivers {
 		for (int p = 0; p < n; p++) shore[p] = land[p] && !smallLand[((p / S) / RES) * size + (p % S) / RES];
 		float[] shoreBank = Fields.distanceTo(shore, S, S);
 		for (int p = 0; p < n; p++) shoreBank[p] = Math.max(0, shoreBank[p] * tps - tps / 2);
-		// How much of a river's current reaches still water: along the water from the river, fading.
+		// How much of a river's current carries on into the water it runs into (a lake, a backwater,
+		// the sea), and which river sample it came from: along the water from the river, spending
+		// itself block by block until it is gone. It carries the backwater setting plus one and a
+		// half times the river's own half-width (measured on river water only), so a big river
+		// pushes far out and a stream barely past its mouth; (1 - the share of that gone)^2.
 		float[] pull = new float[n];
-		{
-			int[] dist = new int[n];
-			java.util.Arrays.fill(dist, -1);
-			int[] q = new int[n];
-			int h = 0, t = 0;
-			for (int p = 0; p < n; p++) if (rivS[p]) { dist[p] = 0; pull[p] = 1; q[t++] = p; }
-			double reach = Math.max(0.5, settings.backwater()) * 16;
-			while (h < t) {
-				int p = q[h++];
-				if (dist[p] * tps > reach * 4) continue;
-				for (int k = 0; k < 4; k++) {
-					int nb = neighbour(p, k, S);
-					if (nb < 0 || !stillS[nb] || dist[nb] >= 0) continue;
-					dist[nb] = dist[p] + 1;
-					pull[nb] = (float) Math.exp(-dist[nb] * tps / reach);
-					q[t++] = nb;
-				}
+		int[] src = new int[n];
+		java.util.Arrays.fill(src, -1);
+		if (anyRiver) {
+			boolean[] notRiver = new boolean[n];
+			for (int p = 0; p < n; p++) notRiver[p] = !rivS[p];
+			float[] riverBank = Fields.distanceTo(notRiver, S, S);
+			for (int p = 0; p < n; p++) riverBank[p] = Math.max(0, riverBank[p] * tps - tps / 2);
+			float[] riverHalf = halfWidth(riverBank, S), reachOf = new float[n];
+			double[] gone = new double[n];
+			java.util.Arrays.fill(gone, Fields.FAR);
+			double back = Math.max(0.5, settings.backwater()) * 16;
+			for (int p = 0; p < n; p++) {
+				if (!rivS[p]) continue;
+				gone[p] = 0;
+				reachOf[p] = (float) Math.min(MAX_REACH, back + 1.5 * riverHalf[p]);
+				src[p] = p;
+			}
+			Fields.dijkstra(gone, S, S, (p, q, diag) -> water[q] && !rivS[q] ? (diag ? Math.sqrt(2) : 1) * tps / reachOf[p] : -1, null, null,
+				(p, q, c) -> { reachOf[q] = reachOf[p]; src[q] = src[p]; return true; });
+			for (int p = 0; p < n; p++) {
+				if (rivS[p]) pull[p] = 1;
+				else if (gone[p] < 1) pull[p] = (float) ((1 - gone[p]) * (1 - gone[p]));
+				else src[p] = -1;
 			}
 		}
 		// How much river or still water (fading into the sea where they meet) and how shallow.
-		float[] rv = new float[n], sv = new float[n], ro = new float[n];
+		float[] rv = new float[n], sv = new float[n];
 		for (int p = 0; p < n; p++) {
 			int bi = ((p / S) / RES) * size + (p % S) / RES;
 			rv[p] = inland[p] ? 1 : 0;
-			ro[p] = rivS[p] ? 1 : 0;
 			sv[p] = inland[p] ? (r.depth[bi] <= 1 ? 1 : r.depth[bi] == 2 ? 0.5f : 0) : 0;
 		}
 		float[] rvB = Fields.boxBlur(Fields.boxBlur(rv, S, S, 1), S, S, 1), svB = Fields.boxBlur(sv, S, S, 1);
-		float[] roB = Fields.boxBlur(Fields.boxBlur(ro, S, S, 1), S, S, 1);
 		float[] blend = new float[n], shallow = new float[n], flowB = new float[n];
 		for (int p = 0; p < n; p++) {
 			if (land[p]) continue;
-			blend[p] = inland[p] ? Math.min(1, Math.max(Math.max(0.5f, rvB[p]) * 2 - 1, rvB[p] * 1.6f)) : Math.max(0, rvB[p] * 2 - 1) * 0.6f;
+			// At sea, river water shows as far as a river's current carries out (thinning as it goes).
+			blend[p] = inland[p] ? Math.min(1, Math.max(Math.max(0.5f, rvB[p]) * 2 - 1, rvB[p] * 1.6f)) : Math.max(Math.max(0, rvB[p] * 2 - 1) * 0.6f, pull[p]);
 			shallow[p] = svB[p];
-			// Where a current runs: the river, still water as far as its pull reaches, and the sea
-			// just off a river's mouth (not off a lake's).
-			flowB[p] = rivS[p] ? blend[p] : stillS[p] ? pull[p] * blend[p] : Math.max(0, roB[p] * 2 - 1) * 0.6f;
+			// Where a current runs: the river, and lakes and the sea as far as it carries into them.
+			flowB[p] = rivS[p] ? blend[p] : stillS[p] ? pull[p] * blend[p] : pull[p];
 		}
 		r.riverBlend = blend;
 		r.riverShallow = shallow;
@@ -196,6 +204,17 @@ final class Rivers {
 				for (int p = 0; p < n; p++) if (dom[p] && ax[p] * VX[p] + ay[p] * VY[p] < 0) { ax[p] = -ax[p]; ay[p] = -ay[p]; }
 			}
 			if (memory != null) remember(r, dom, rivS, pot, ax, ay, memory);
+			// Where a river runs out into a lake or the sea its current carries on the way it ran where
+			// it left the river, turning to the water's own shape as it spends itself.
+			for (int p = 0; p < n; p++) {
+				int s0 = src[p];
+				if (!dom[p] || rivS[p] || s0 < 0 || pull[p] <= 0) continue;
+				float lx = ax[p], ly = ay[p];
+				if (lx * ax[s0] + ly * ay[s0] < 0) { lx = -lx; ly = -ly; }
+				float w = pull[p], vx = w * ax[s0] + (1 - w) * lx, vy = w * ay[s0] + (1 - w) * ly;
+				float l = (float) Math.hypot(vx, vy);
+				if (l > 1e-4f) { ax[p] = vx / l; ay[p] = vy / l; }
+			}
 
 			// Speed: a narrow river runs faster and a wide one slower (as the square root of how much
 			// narrower or wider than sixteen blocks it is, 0.6 to 1.8 times), and across it from nothing
@@ -396,6 +415,9 @@ final class Rivers {
 	private static int bucket(float sure, int B) {
 		return Math.max(0, Math.min(B - 1, (int) (sure * B)));
 	}
+
+	/** The furthest a river's current carries into other water, in texels (24 blocks). */
+	private static final float MAX_REACH = 384;
 
 	/** The axis tensor's averaging radii (samples, each blurred twice), from a narrow stream to a wide river. */
 	private static final int[] TENSOR_RADII = {2, 4, 8, 12, 16, 24, 32};

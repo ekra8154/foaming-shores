@@ -698,7 +698,7 @@ public final class FoamRenderer {
 			putWind(b, s, 1, kB, kB * WIND_EPOCH, rain);
 			b.putVec4((float) (1 - Math.abs(2 * (u - kA) - 1)), s.glints, s.paws, s.rises);
 			b.putVec4(s.edgeRings, s.riverSparkle, s.recolorWater ? 1 : 0, s.edgeRingLayers);
-			b.putVec4(s.bugRings, 0, 0, 0);
+			b.putVec4(s.bugRings, s.riverLenBySpeed, s.riverCountBySpeed, 0);
 			b.putVec4(s.breeziness, s.breezeOften, s.breezeSize, s.breezeStrength);
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {

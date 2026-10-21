@@ -74,6 +74,8 @@ public final class FoamConfigScreen {
 			new Opt("riverStreaks", 0, 1, 0.05f, "none"),
 			new Opt("riverSparkle", 0, 1, 0.05f, "none"),
 			new Opt("riverLen", 2, 24, 1, "texels"),
+			new Opt("riverLenBySpeed", 0, 1, 0.05f, "none"),
+			new Opt("riverCountBySpeed", 0, 1, 0.05f, "none"),
 			new Opt("riverShallow", 0, 1, 0.05f, "none"),
 			new Opt("riverBank", 0, 1, 0.05f, "none"),
 			new Opt("riverRock", 0, 1, 0.05f, "none"),

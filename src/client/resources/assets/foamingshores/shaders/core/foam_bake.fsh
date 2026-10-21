@@ -61,7 +61,7 @@ layout(std140) uniform FoamBake {
     vec4 WindB;    // wind pattern B, as WindA
     vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
     vec4 Calm2;    // edge rings, sparkles on flow lines, water recolouring (1 on), edge lines (1..4)
-    vec4 Calm3;    // bug rings, -, -, -
+    vec4 Calm3;    // bug rings, flow line length by speed, flow line count by speed, -
     vec4 Breeze;   // breeziness (0 steady wind, 1 wind only in breezes), how often, size, strength
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
@@ -611,8 +611,12 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         float tt = useA ? ph : fract(ph + 0.5);
         int seed = useA ? 11 : 29;
         vec2 q = vec2(wt) - rv.xy * tt * per, dir = rv.xy / sp;
-        int len = max(2, int(floor(River.y * (1.0 - 0.45 * sh) + 0.5)));
-        float dens = River.x * (0.01 + 0.018 * sh) + decor.b * 0.1;
+        // Faster water draws longer lines and more of them, slower water shorter and fewer (as a
+        // share of the current against a block a second, by how much the two settings ask).
+        float rel = sp / 16.0;
+        float lenK = mix(1.0, clamp(rel, 0.4, 2.0), Calm3.y), countK = mix(1.0, clamp(rel * 1.2, 0.15, 1.5), Calm3.z);
+        int len = clamp(int(floor(River.y * (1.0 - 0.45 * sh) * lenK + 0.5)), 2, 24);
+        float dens = River.x * (0.01 + 0.018 * sh) * countK + decor.b * 0.1;
         // In still water each flow line dies out as the current spends itself, each at its own
         // point (a hashed share of the current it needs, and a wobble along the water), so they
         // thin out instead of stopping on a line.
