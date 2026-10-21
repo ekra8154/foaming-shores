@@ -96,7 +96,7 @@ public final class FoamRenderer {
 	private static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.putVec4().putVec4().putVec4().putVec4()
-		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
+		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.get() + 16 * 2 * MAX_WAVES;
 	/** Seconds between the moments each wind pattern takes up (see pass). */
 	private static final double WIND_EPOCH = 24;
@@ -697,7 +697,9 @@ public final class FoamRenderer {
 			b.putVec4(rain, s.rainRings, region.originX * 16f, region.originZ * 16f);
 			putWind(b, s, 1, kB, kB * WIND_EPOCH, rain);
 			b.putVec4((float) (1 - Math.abs(2 * (u - kA) - 1)), s.glints, s.paws, s.rises);
-			b.putVec4(s.edgeRings, s.riverSparkle, s.recolorWater ? 1 : 0, 0);
+			b.putVec4(s.edgeRings, s.riverSparkle, s.recolorWater ? 1 : 0, s.edgeRingLayers);
+			b.putVec4(s.bugRings, 0, 0, 0);
+			b.putVec4(s.breeziness, s.breezeOften, s.breezeSize, s.breezeStrength);
 			for (int i = 0; i < MAX_WAVES; i++) {
 				if (i < waves.size()) {
 					WaveSchedule.Wave w = waves.get(i);

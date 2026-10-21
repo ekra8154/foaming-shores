@@ -60,7 +60,9 @@ layout(std140) uniform FoamBake {
     vec4 RainW;    // rain (0..1), rain rings, region origin in world texels (x, z)
     vec4 WindB;    // wind pattern B, as WindA
     vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
-    vec4 Calm2;    // edge rings, sparkles on flow lines, water recolouring (1 on), -
+    vec4 Calm2;    // edge rings, sparkles on flow lines, water recolouring (1 on), edge lines (1..4)
+    vec4 Calm3;    // bug rings, -, -, -
+    vec4 Breeze;   // breeziness (0 steady wind, 1 wind only in breezes), how often, size, strength
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
 
@@ -244,6 +246,52 @@ float gustAt(vec2 wp, vec4 wind) {
     return vnoise(ivec2(0), g / 48.0, 77) * 0.75 + vnoise(ivec2(0), g / 20.0 + vec2(T / 17.0, -T / 23.0), 83) * 0.25;
 }
 
+// Breezes at a world texel: now and then a breeze comes down on still water, a ragged patch longer
+// along the wind than across it that slides downwind, swells and dies away. Each 32x32 block cell
+// (of a lattice drifting with the wind, faster than the gusts: about a block a second in a moderate wind) has two chances per period at one; the
+// period, the chance, and each breeze's size, strength, length and life are all hashed, so some
+// stretches of water get breezes often and some seldom. How hard the wind blows here, as a share of
+// the wind (0 for none, about 1.6 at most).
+float breezeAt(vec2 wp, vec4 wind) {
+    float T = Origin.z, v = 8.0 + 24.0 * min(1.0, wind.z);
+    vec2 g = wp - wind.xy * v * T, along = wind.xy, across = vec2(-wind.y, wind.x);
+    ivec2 c0 = ivec2(floor(g / 512.0));
+    float best = 0.0;
+    for (int n = 0; n < 18; n++) {
+        ivec2 c = c0 + ivec2(n % 3 - 1, (n / 3) % 3 - 1);
+        int slot = 211 + 20 * (n / 9);
+        float per = 18.0 + 18.0 * hash3(c.x, c.y, slot);
+        float off = hash3(c.x, c.y, slot + 1) * per;
+        int k = int(floor((T + off) / per));
+        float age = T + off - float(k) * per;
+        int kh = k & 1023;
+        float life = (6.0 + 10.0 * hash3(c.x, c.y, slot + 2 + kh)) * (0.7 + 0.3 * Breeze.z);
+        if (age > life) continue;
+        float chance = Breeze.y * (0.3 + 0.9 * hash3(c.x, c.y, slot + 3 + kh)) * (0.5 + 0.5 * min(1.0, wind.z * 2.0));
+        if (hash3(c.x, c.y, slot + 4 + kh) > chance) continue;
+        float rad = Breeze.z * (48.0 + 144.0 * pow(hash3(c.x, c.y, slot + 5 + kh), 1.5));
+        float stretch = 1.3 + 0.9 * hash3(c.x, c.y, slot + 6 + kh);
+        rad = min(rad, 480.0 / stretch);
+        vec2 at = (vec2(c) + vec2(hash3(c.x, c.y, slot + 7 + kh), hash3(c.x, c.y, slot + 8 + kh))) * 512.0;
+        vec2 d = g - at;
+        float e = length(vec2(dot(d, along) / stretch, dot(d, across))) / rad;
+        if (e > 1.3) continue;
+        e += (vnoise(ivec2(0), g / 28.0 + vec2(T / 7.0, -T / 9.0) + vec2(c) * 3.7, 213) - 0.5) * 0.6;
+        float inside = 1.0 - smoothstep(0.45, 1.0, e);
+        float a = age / life, swell = smoothstep(0.0, 0.3, a) * (1.0 - smoothstep(0.55, 1.0, a));
+        float strength = Breeze.w * (0.8 + 0.8 * hash3(c.x, c.y, slot + 9 + kh));
+        best = max(best, inside * swell * strength);
+    }
+    return best;
+}
+
+// The wind a world texel feels: its pattern's, with its strength as a share of the breezes there.
+vec4 windHere(vec2 wp, float bay) {
+    vec4 wd = windFor(wp, bay);
+    if (Breeze.x > 0.0 && wd.z > 0.0) wd.z *= mix(1.0, breezeAt(wp, wd), Breeze.x);
+    return wd;
+}
+
 // Glints on calm water at a world texel: the sky caught on the surface, a pixel that twinkles (a
 // little cross at its brightest) and is gone. Each 6x6 texel cell has at most one per 3.2 s, at a
 // hashed spot and moment. 0 for none, 1 lighter, 2 white.
@@ -261,40 +309,86 @@ int glintAt(vec2 wp) {
     return (dd == 0 && e > 0.15) || (dd == 1 && e > 0.8) ? 1 : 0;
 }
 
-// Edge rings on calm water: a faint line hugging every edge (the shore, a rock, an island), the
-// small disturbances bouncing off it. It drifts in and out slowly, each stretch of shore at its own
-// pace, and breaks here and there; now and then a fainter ring leaves the edge and fades as it
-// spreads. `bank` is the distance to the nearest land in texels, `on` how strongly they show.
-// 0 for none, 1 a fading ring, 2 the line.
+// Edge rings on calm water: faint lines (Calm2.w of them) hugging every edge (the shore, a rock, an island), the
+// small disturbances bouncing off it. They drift in and out slowly, each stretch of shore at its own
+// pace, each outer one a little behind the one inside it, and break here and there; now and then a fainter ring
+// leaves the edge and fades as it spreads. `bank` is the distance to the nearest land in texels,
+// `on` how strongly they show. 0 for none, 1 a fading ring, 2 an outer line, 3 the inner line.
 int edgeRingAt(vec2 wp, float bank, float on, float bay) {
-    if (on <= 0.0 || bank > 10.0) return 0;
-    float T = Origin.z;
-    float r1 = 1.5 + 3.0 * (0.5 + 0.5 * sin(T * 0.9 + vnoise(ivec2(0), wp / 64.0, 141) * 6.283));
+    if (on <= 0.0 || bank > max(9.5, 1.7 + 3.3 * Calm2.w)) return 0;
+    float T = Origin.z, sway = vnoise(ivec2(0), wp / 64.0, 141) * 6.283;
+    float r1 = 1.5 + 3.0 * (0.5 + 0.5 * sin(T * 0.9 + sway));
     float gap = vnoise(ivec2(0), wp / 10.0 + vec2(T / 13.0, -T / 17.0), 143);
-    if (abs(bank - r1) < 0.5 && gap < 0.3 + 0.6 * on) return 2;
+    if (abs(bank - r1) < 0.5 && gap < 0.3 + 0.6 * on) return 3;
+    // How many lines this stretch has: it drifts between one and the most, each outer line coming
+    // in as scattered pieces that join up, and breaking up again as it goes.
+    float have = 1.0 + (Calm2.w - 1.0) * smoothstep(0.2, 0.8, vnoise(ivec2(0), wp / 40.0 + vec2(T / 23.0, -T / 29.0), 153));
+    float r = r1;
+    for (int i = 1; i < 4; i++) {
+        float there = clamp(have - float(i), 0.0, 1.0);
+        if (there <= 0.0) break;
+        r += 2.5 + 0.8 * (0.5 + 0.5 * sin(T * 0.9 + sway - 1.2 * float(i)));
+        float g = vnoise(ivec2(0), wp / 10.0 + vec2(-T, T) / (13.0 + 2.0 * float(i)), 149 + 2 * i);
+        if (abs(bank - r) < 0.5 && g < (0.3 + 0.55 * on - 0.05 * float(i)) * there) return 2;
+    }
     float ph = fract(T / 3.5 + vnoise(ivec2(0), wp / 32.0, 145) * 0.6);
     float amp = smoothstep(0.45, 0.75, vnoise(ivec2(0), wp / 20.0 + vec2(T * 0.07, -T * 0.05), 147));
     if (abs(bank - (1.0 + ph * 8.0)) < 0.5 && amp * (1.0 - ph) * on > bay * 0.9) return 1;
     return 0;
 }
 
-// Rises at a world texel: now and then a fish or a bug touches calm still water and a ring or two
+// Bug rings at a world texel: now and then a bug touches calm still water and a ring or two
 // spreads, slow and small. Each 32x32 texel cell has at most one per 6 s, kept inside its cell,
 // and only where its middle is calm still water. How strong the ring is here (0 for none).
-float riseAt(vec2 wp, vec2 texel) {
-    if (Calm.w <= 0.0) return 0.0;
+float bugRingAt(vec2 wp, vec2 texel) {
+    if (Calm3.x <= 0.0) return 0.0;
     ivec2 c = ivec2(floor(wp / 32.0));
-    float T = Origin.z, off = hash3(c.x, c.y, 121) * 6.0;
+    float T = Origin.z, off = hash3(c.x, c.y, 161) * 6.0;
     int k = int(floor((T + off) / 6.0));
     float age = T + off - float(k) * 6.0;
-    if (age > 1.8 || hash3(c.x, c.y, 123 + (k & 1023)) > Calm.w * 0.12) return 0.0;
-    vec2 at = vec2(c) * 32.0 + 9.0 + vec2(hash3(c.x, c.y, 125 + (k & 1023)), hash3(c.x, c.y, 127 + (k & 1023))) * 14.0;
+    if (age > 1.8 || hash3(c.x, c.y, 163 + (k & 1023)) > Calm3.x * 0.12) return 0.0;
+    vec2 at = vec2(c) * 32.0 + 9.0 + vec2(hash3(c.x, c.y, 165 + (k & 1023)), hash3(c.x, c.y, 167 + (k & 1023))) * 14.0;
     ivec2 mid = ivec2(floor(texel + at - wp));
     if (any(lessThan(mid, ivec2(0))) || any(greaterThanEqual(mid, ivec2(Region.x)))) return 0.0;
     if (texelFetch(RiverDecorSampler, mid, 0).a * 255.0 < 128.0) return 0.0;
     float rad = 1.0 + age * 4.0, fade = 1.0 - age / 1.8, dd = length(floor(wp) + 0.5 - at);
     if (abs(dd - rad) < 0.6) return fade;
     return rad > 4.0 && abs(dd - rad + 3.0) < 0.6 ? fade * 0.6 : 0.0;
+}
+
+// Rises at a world texel: now and then a fish touches calm still water. A dimple flashes
+// where it broke the surface and a ripple spreads from it: a leading ring with two more behind it,
+// further apart the further they have gone (the longer waves outrun the short ones), each crest
+// with a darker trough inside it, all weakening as they widen until they break up and are gone.
+// Each 64x64 texel cell has at most one per 7 s, starting where calm still water is, and spreads
+// over into the cells around it. How strong the crest is here, or minus the trough's (0 for none).
+float riseAt(vec2 wp, vec2 texel) {
+    if (Calm.w <= 0.0) return 0.0;
+    ivec2 c0 = ivec2(floor(wp / 64.0));
+    float T = Origin.z, best = 0.0;
+    for (int n = 0; n < 9; n++) {
+        ivec2 c = c0 + ivec2(n % 3 - 1, n / 3 - 1);
+        float off = hash3(c.x, c.y, 121) * 7.0;
+        int k = int(floor((T + off) / 7.0));
+        float age = T + off - float(k) * 7.0;
+        if (age > 4.0 || hash3(c.x, c.y, 123 + (k & 1023)) > Calm.w * 0.4) continue;
+        vec2 at = vec2(c) * 64.0 + 4.0 + vec2(hash3(c.x, c.y, 125 + (k & 1023)), hash3(c.x, c.y, 127 + (k & 1023))) * 56.0;
+        float dd = length(floor(wp) + 0.5 - at), lead = 1.0 + age * 6.0;
+        if (dd > lead + 1.0) continue;
+        ivec2 mid = ivec2(floor(texel + at - wp));
+        if (any(lessThan(mid, ivec2(0))) || any(greaterThanEqual(mid, ivec2(Region.x)))) continue;
+        if (texelFetch(RiverDecorSampler, mid, 0).a * 255.0 < 128.0) continue;
+        if (age < 0.35 && dd < 1.0) return 1.0 - age / 0.35;
+        float space = 2.0 + age * 1.5, fade = pow(1.0 - age / 4.0, 1.2) / (1.0 + lead / 24.0);
+        for (int i = 0; i < 3; i++) {
+            float r = lead - float(i) * space;
+            if (r < 0.8) break;
+            float a = fade * (1.0 - 0.3 * float(i));
+            if (abs(dd - r) < 0.6) { best = max(best, a); break; }
+            if (abs(dd - r + space * 0.5) < 0.6 && best <= 0.0) { best = min(best, -a * 0.7); break; }
+        }
+    }
+    return best;
 }
 
 // Rain rings at a world texel position: each 5x5 cell has at most one drop per 0.9 s, at a hashed
@@ -355,7 +449,7 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         if (abs(levelAt(texel)) > 0.5) return vec4(0.0);
         float dr = distanceToBlock(texel, true);
         // On a shore the wind blows onto, each ripple laps a little way up as it arrives.
-        vec4 wd = windFor(wp, bay);
+        vec4 wd = windHere(wp, bay);
         if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0 && wd.z > 0.0) {
             float fr = min(1.0, fetchAt(texel, wd) / Still.z), reach = Still.x * wd.z * fr * Still.w;
             if (reach > 0.3) {
@@ -398,8 +492,10 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     // Still water: calm life whatever the wind, then the wind's ripples.
     bool still = decor.a > 0.5 / 255.0;
     float calm = still ? (decor.a * 255.0 - 1.0) / 254.0 : 0.0;
-    vec4 wd = windFor(wp, bay);
+    vec4 wd = still ? windHere(wp, bay) : windFor(wp, bay);
     float gust = still ? gustAt(wp, wd) : 0.0;
+    // Under breezes the paws are the breezes themselves, roughest where the gusts are.
+    if (still && Breeze.x > 0.0) gust = mix(gust, clamp(wd.z / max(windFor(wp, bay).z, 1e-3) * (0.6 + 0.6 * gust), 0.0, 1.0), Breeze.x);
     if (calm > 0.3) {
         // Cat's paws: where a gust crosses calm water it ruffles it, a shade darker (rough water
         // shows less sky) with fine flecks of light coming and going.
@@ -410,7 +506,8 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
             if (fl < 0.2 && fract(T / 1.4 + fl * 37.0) < 0.25) col = col * 1.16 + 12.0 / 255.0;
         }
         int er = edgeRingAt(wp, bank, Calm2.x * calm * (1.0 - 0.6 * min(1.0, wd.z * Still.x)), bay);
-        if (er == 2) col = col * 1.14 + 12.0 / 255.0;
+        if (er == 3) col = col * 1.14 + 12.0 / 255.0;
+        else if (er == 2) col = col * 1.11 + 10.0 / 255.0;
         else if (er == 1) col = col * 1.08 + 7.0 / 255.0;
         int gl = glintAt(wp);
         if (gl == 2) return vec4(foamBright(), 1.0);
@@ -478,7 +575,12 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     // Rain rings, where the water is calm enough to show them.
     float ring = rainRingAt(wp) * (1.0 - min(1.0, sp / 20.0));
     if (ring > bay * 0.8) col = col * 1.22 + 20.0 / 255.0;
-    else if (still && riseAt(wp, texel) > bay * 0.8) col = col * 1.2 + 18.0 / 255.0;
+    else if (still) {
+        float rise = riseAt(wp, texel);
+        if (rise > bay * 0.5) col = col * 1.2 + 18.0 / 255.0;
+        else if (-rise > bay * 0.5) col *= vec3(0.9, 0.91, 0.94);
+        else if (bugRingAt(wp, texel) > bay * 0.8) col = col * 1.2 + 18.0 / 255.0;
+    }
     if (!tint && col == w.rgb) return vec4(0.0);
     return vec4(min(col, vec3(1.0)), alpha);
 }

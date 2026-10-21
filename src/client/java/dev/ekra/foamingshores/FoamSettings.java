@@ -90,6 +90,10 @@ public final class FoamSettings {
 	public float windDir = 120f;     // degrees the wind blows toward, from east toward south
 	public float windShift = 30f;    // degrees
 	public float windStrength = 0.35f;
+	public float breeziness = 0.8f;   // 0 steady wind, 1 wind only in breezes
+	public float breezeOften = 0.5f;
+	public float breezeSize = 1f;
+	public float breezeStrength = 1f;
 	public float chop = 0.8f;
 	public float chopPeriod = 2.2f;  // seconds
 	public float fetchFull = 8f;     // blocks
@@ -98,7 +102,9 @@ public final class FoamSettings {
 	public float glints = 0.4f;
 	public float paws = 0.5f;
 	public float rises = 0.3f;
+	public float bugRings = 0.3f;
 	public float edgeRings = 0.6f;
+	public int edgeRingLayers = 2;
 
 	// Wet sand
 	public float wetDark = 0.28f;
