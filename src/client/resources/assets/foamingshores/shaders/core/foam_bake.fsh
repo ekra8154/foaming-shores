@@ -221,21 +221,12 @@ float distanceToBlock(vec2 texel, bool river) {
     return best;
 }
 
-// Still water's fetch at a region texel for a wind, in texels, between the two nearest of the 16
-// directions.
-float fetchAt(vec2 texel, vec4 wind) {
-    ivec2 smp = ivec2(floor((texel + 0.5) / (16.0 / Region.y)));
-    int i0 = int(floor(wind.w)) % 16, i1 = (i0 + 1) % 16;
-    float a = texelFetch(FetchSampler, ivec2(smp.x * 4 + i0 / 4, smp.y), 0)[i0 % 4];
-    float b = texelFetch(FetchSampler, ivec2(smp.x * 4 + i1 / 4, smp.y), 0)[i1 % 4];
-    return mix(a, b, fract(wind.w)) * 384.0;
-}
-
-// Which wind pattern a world texel shows (see FoamRenderer.pass): patches fixed in the world go
-// over to pattern A as its weight rises and back as it falls, so neither is seen taking up its new
-// wind.
-vec4 windFor(vec2 wp, float bay) {
-    return Calm.x > vnoise(ivec2(0), wp / 40.0, 131) + (bay - 0.5) * 0.08 ? WindA : WindB;
+// How much a world texel shows of wind pattern A rather than B (see FoamRenderer.pass): patches
+// fixed in the world go over to pattern A as its weight rises and back as it falls, through a
+// narrow band where the two blend. All B at weight 0 and all A at 1, so neither is seen taking up
+// its new wind.
+float patternA(vec2 wp) {
+    return smoothstep(-0.07, 0.07, Calm.x * 1.14 - 0.07 - vnoise(ivec2(0), wp / 40.0, 131));
 }
 
 // Gusts at a world texel: patches of rougher water drifting downwind (cat's paws), slower in a
@@ -285,11 +276,46 @@ float breezeAt(vec2 wp, vec4 wind) {
     return best;
 }
 
-// The wind a world texel feels: its pattern's, with its strength as a share of the breezes there.
-vec4 windHere(vec2 wp, float bay) {
-    vec4 wd = windFor(wp, bay);
-    if (Breeze.x > 0.0 && wd.z > 0.0) wd.z *= mix(1.0, breezeAt(wp, wd), Breeze.x);
-    return wd;
+// Still water's fetch at a region texel for a wind, as a share of a full fetch (Still.z): blended
+// between the field samples around the texel, so it never steps at a sample's edge.
+float fetchShare(vec2 texel, vec4 wind) {
+    vec2 q = (texel + 0.5) / (16.0 / Region.y) - 0.5, f = fract(q);
+    ivec2 s0 = ivec2(floor(q)), top = ivec2(int(Region.z) - 1);
+    int i0 = int(floor(wind.w)) % 16, i1 = (i0 + 1) % 16;
+    float acc = 0.0;
+    for (int c = 0; c < 4; c++) {
+        ivec2 o = ivec2(c & 1, c >> 1), smp = clamp(s0 + o, ivec2(0), top);
+        float a = texelFetch(FetchSampler, ivec2(smp.x * 4 + i0 / 4, smp.y), 0)[i0 % 4];
+        float b = texelFetch(FetchSampler, ivec2(smp.x * 4 + i1 / 4, smp.y), 0)[i1 % 4];
+        acc += mix(a, b, fract(wind.w)) * (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+    }
+    return min(1.0, acc * 384.0 / Still.z);
+}
+
+// How ruffled still water is at a world texel: 0 glassy, about 1 under a fresh breeze, a little
+// more in a strong one. Everything the wind does to still water (its darker tone, the ripple marks,
+// white tips, the lapping, the calm life giving way) goes by this one value, and it is smooth in
+// space and time: the wind of both patterns by how much each shows (`wA`), each with its gusts and
+// the open water upwind, times the breezes. The breezes are the same whichever pattern a texel
+// shows: each pattern's (on its own drifting lattice) are faded by its weight in time, so they
+// cross over as the patterns take turns. `capped` leaves out any breeze stronger than the wind
+// itself: white tips go by it, so a breeze adds none the wind would not have.
+float roughAt(vec2 wp, vec2 texel, float wA, out float capped) {
+    float r = 0.0;
+    for (int p = 0; p < 2; p++) {
+        float wt = p == 0 ? wA : 1.0 - wA;
+        vec4 w = p == 0 ? WindA : WindB;
+        if (wt <= 0.0 || w.z <= 0.0) continue;
+        r += wt * w.z * (0.6 + 0.8 * gustAt(wp, w)) * (0.35 + 0.65 * fetchShare(texel, w));
+    }
+    r *= 1.6;
+    float bz = 1.0;
+    if (Breeze.x > 0.0 && r > 0.0) {
+        float a = Calm.x > 0.001 ? breezeAt(wp, WindA) : 0.0, b = Calm.x < 0.999 ? breezeAt(wp, WindB) : 0.0;
+        bz = mix(1.0, mix(b, a, Calm.x), Breeze.x);
+    }
+    capped = r * min(bz, 1.0);
+    return r * bz;
 }
 
 // Glints on calm water at a world texel: the sky caught on the surface, a pixel that twinkles (a
@@ -411,28 +437,68 @@ float rainRingAt(vec2 wp) {
     return ring;
 }
 
-// Wind ripples are short-crested, as real wind waves are: four wave trains spread about the wind
-// (each at its own angle and wavelength, the longer ones faster, as on deep water) add up, and each
-// train's crest is drawn as a thin line only where the trains coincide, so ripples are many short
-// dashes at slightly different angles. They come in groups drifting downwind at half the crests'
-// speed, so each crest appears at the back of a group and fades at its front. At a world texel
-// position, for a fetch fraction: (summed height -1..1, group envelope 0..1, crest line 0..1 over
-// `width` of a wavelength).
-// A light wind makes short ripples that creep; a full one, long ripples that run.
-const vec3 TRAINS[4] = vec3[](vec3(-0.44, 1.0, 0.13), vec3(-0.14, 0.82, 0.57), vec3(0.17, 1.18, 0.31), vec3(0.47, 0.9, 0.79));
-vec3 rippleAt(vec2 wp, float fr, float width, vec4 wind) {
-    float s = min(1.0, wind.z), lam0 = (6.0 + 10.0 * s) * (1.0 + 1.1 * fr), T0 = Still.y / (0.3 + 0.7 * s);
-    float T = Origin.z, ang = atan(wind.y, wind.x);
-    float h = 0.0, line = 0.0;
-    for (int k = 0; k < 4; k++) {
-        float a = ang + TRAINS[k].x, lam = lam0 * TRAINS[k].y, per = T0 * sqrt(TRAINS[k].y);
-        float fp = fract(dot(wp, vec2(cos(a), sin(a))) / lam - T / per + TRAINS[k].z);
-        h += cos(fp * 6.2832); // the fraction only: cos of a large angle loses precision on some GPUs
-        if (fp < width) line = max(line, 1.0 - fp / width);
+// Wind ripples: a simulated wave surface. Six wave trains spread about the wind, each at its own
+// angle, wavelength and height (the longer ones faster, as on deep water), add up into short
+// crests of every shape; and the whole field is warped by slow noise that drifts and changes, so
+// the crests bend, break and wander instead of running straight. They come in groups drifting
+// downwind at half the crests' speed. Their size and speed go by the pattern's wind alone, the
+// same everywhere, so crests never stretch where the wind is stronger: a light wind makes short
+// ripples that creep, a full one long ripples that run, and the roughness only decides how much of
+// the surface shows.
+const vec4 TRAINS[6] = vec4[](vec4(-0.62, 1.12, 0.13, 0.7), vec4(-0.31, 0.86, 0.57, 0.9), vec4(-0.08, 1.0, 0.31, 1.0),
+    vec4(0.17, 0.74, 0.79, 0.85), vec4(0.39, 1.27, 0.46, 0.75), vec4(0.71, 0.93, 0.05, 0.6));
+float rippleLength(vec4 wind) { return (6.0 + 10.0 * min(1.0, wind.z)) * 1.6; }
+float ripplePeriod(vec4 wind) { return Still.y / (0.3 + 0.7 * min(1.0, wind.z)); }
+
+// The surface at a world texel: (height, about -1..1 with crests near 1; group envelope, 0..1).
+vec2 rippleAt(vec2 wp, vec4 wind) {
+    float lam0 = rippleLength(wind), T0 = ripplePeriod(wind), T = Origin.z, ang = atan(wind.y, wind.x);
+    vec2 w = wp / (lam0 * 2.7);
+    vec2 q = wp + (vec2(vnoise(ivec2(0), w + vec2(T / 9.0, T / 13.0), 231),
+        vnoise(ivec2(0), w + vec2(17.3 - T / 11.0, T / 7.0), 233)) - 0.5) * lam0 * 0.9;
+    float h = 0.0;
+    for (int k = 0; k < 6; k++) {
+        float a = ang + TRAINS[k].x, lam = lam0 * TRAINS[k].y;
+        // the fraction only: cos of a large angle loses precision on some GPUs
+        h += TRAINS[k].w * cos(fract(dot(q, vec2(cos(a), sin(a))) / lam - T / (T0 * sqrt(TRAINS[k].y)) + TRAINS[k].z) * 6.2832);
     }
     float cg = 0.5 * lam0 / T0; // group speed: half the crests'
+    return vec2(h / 2.64, vnoise(ivec2(0), (wp - wind.xy * cg * T) / (lam0 * 3.0), 79));
+}
+
+// Ripple marks at a world texel for a wind pattern, at roughness `rough` (`capped` for white
+// tips): (how lit a crest is, 0..1; how shaded the water just behind a crest, 0..1; 1 for a white
+// tip). Each train's crests are drawn as sharp thin lines over the same warped field as the
+// surface, so they bend and wander, and each train shows only in its own drifting patches, so
+// its lines break into pieces of every length and in each stretch of water one or two trains
+// lead: the crests run every which way about the wind, branching where two meet. A crest shows
+// where it stands above a line that sinks as the water roughens (more in a group), so a rising
+// wind brings up the strongest crests first, then more, longer and broader ones; their ends taper.
+vec3 marksAt(vec2 wp, vec4 wind, float rough, float capped) {
+    float lam0 = rippleLength(wind), T0 = ripplePeriod(wind), T = Origin.z, ang = atan(wind.y, wind.x);
+    vec2 w = wp / (lam0 * 2.7);
+    vec2 q = wp + (vec2(vnoise(ivec2(0), w + vec2(T / 9.0, T / 13.0), 231),
+        vnoise(ivec2(0), w + vec2(17.3 - T / 11.0, T / 7.0), 233)) - 0.5) * lam0 * 0.9;
+    float cg = 0.5 * lam0 / T0; // group speed: half the crests'
     float env = vnoise(ivec2(0), (wp - wind.xy * cg * T) / (lam0 * 3.0), 79);
-    return vec3(h * 0.25, env, line);
+    float r = rough * (0.45 + 0.9 * env), c = max(0.3, 0.98 - 0.55 * r);
+    float top = 0.0, lee = 0.0;
+    for (int k = 0; k < 6; k++) {
+        float a = ang + TRAINS[k].x * 0.8, lam = lam0 * TRAINS[k].y;
+        vec2 dir = vec2(cos(a), sin(a));
+        float ph = fract(dot(q, dir) / lam - T / (T0 * sqrt(TRAINS[k].y)) + TRAINS[k].z);
+        float shows = smoothstep(0.35, 0.8, vnoise(ivec2(0), (q - dir * cg * T) / (lam0 * 0.9) + vec2(float(k) * 7.1, float(k) * 3.3), 241 + k));
+        float crest = pow(0.5 + 0.5 * cos(ph * 6.2832), 14.0), behind = pow(0.5 + 0.5 * cos((ph + 0.14) * 6.2832), 14.0); // upwind of the crest: crests travel downwind
+        top = max(top, shows * TRAINS[k].w * crest);
+        lee = max(lee, shows * TRAINS[k].w * behind);
+    }
+    float on = clamp(r * 3.0, 0.0, 1.0);
+    float lit = smoothstep(c, c + 0.15, top) * on;
+    float deep = smoothstep(c, c + 0.3, lee) * on * (1.0 - lit);
+    float cap = capped * (0.45 + 0.9 * env) - 0.9;
+    float white = cap > 0.0 && top > 0.85
+        && hash3(int(floor(wp.x / 2.0)), int(floor(wp.y / 2.0)), int(floor(T * 3.0))) < cap * 3.0 ? 1.0 : 0.0;
+    return vec3(lit, deep, white);
 }
 
 // A river at a texel, all of it under the waves' own foam. Whatever this layer covers hides vanilla's
@@ -448,12 +514,13 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     if (!isWater) {
         if (abs(levelAt(texel)) > 0.5) return vec4(0.0);
         float dr = distanceToBlock(texel, true);
-        // On a shore the wind blows onto, each ripple laps a little way up as it arrives.
-        vec4 wd = windHere(wp, bay);
-        if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0 && wd.z > 0.0) {
-            float fr = min(1.0, fetchAt(texel, wd) / Still.z), reach = Still.x * wd.z * fr * Still.w;
+        // On a shore the wind blows onto, each ripple laps a little way up as it arrives, the
+        // further the rougher the water.
+        if (dr < 10.0 && Still.w > 0.0 && Still.x > 0.0) {
+            float capped, wA = patternA(wp);
+            float reach = Still.x * Still.w * 0.625 * roughAt(wp, texel, wA, capped);
             if (reach > 0.3) {
-                vec3 rp = rippleAt(wp, fr, 0.08, wd);
+                vec2 rp = rippleAt(wp, wA > bay ? WindA : WindB);
                 float run = reach * clamp((rp.x * (0.55 + 0.9 * rp.y) - 0.1) / 0.8, 0.0, 1.0);
                 if (dr < run) {
                     if (run - dr < 1.1) return vec4(run > reach * 0.6 ? foamBright() : foamShadow(), 1.0);
@@ -492,20 +559,25 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
     // Still water: calm life whatever the wind, then the wind's ripples.
     bool still = decor.a > 0.5 / 255.0;
     float calm = still ? (decor.a * 255.0 - 1.0) / 254.0 : 0.0;
-    vec4 wd = still ? windHere(wp, bay) : windFor(wp, bay);
-    float gust = still ? gustAt(wp, wd) : 0.0;
-    // Under breezes the paws are the breezes themselves, roughest where the gusts are.
-    if (still && Breeze.x > 0.0) gust = mix(gust, clamp(wd.z / max(windFor(wp, bay).z, 1e-3) * (0.6 + 0.6 * gust), 0.0, 1.0), Breeze.x);
+    // How ruffled the still water is here (see roughAt); everything the wind does goes by it.
+    float wA = 0.0, capped = 0.0, rough = 0.0;
+    if (still) {
+        wA = patternA(wp);
+        rough = roughAt(wp, texel, wA, capped) * calm;
+        capped *= calm;
+    }
     if (calm > 0.3) {
-        // Cat's paws: where a gust crosses calm water it ruffles it, a shade darker (rough water
-        // shows less sky) with fine flecks of light coming and going.
-        if (Calm.z > 0.0 && gust - (0.82 - 0.22 * Calm.z) > (bay - 0.5) * 0.05) {
-            col *= vec3(0.9, 0.9, 0.93);
+        // The wind's tone: rough water shows less sky, so it is a shade darker, with fine flecks of
+        // light coming and going where it is roughest. In four dithered steps, so it shades on.
+        float tone = Calm.z > 0.0 ? floor(min(1.0, Calm.z * 1.6) * smoothstep(0.3, 1.0, rough) * 4.0 + bay) / 4.0 : 0.0;
+        if (tone > 0.0) {
+            col *= mix(vec3(1.0), vec3(0.9, 0.9, 0.93), tone);
             ivec2 g = ivec2(floor(wp));
             float fl = hash3(g.x, g.y, 107);
-            if (fl < 0.2 && fract(T / 1.4 + fl * 37.0) < 0.25) col = col * 1.16 + 12.0 / 255.0;
+            if (tone > 0.7 && fl < 0.2 && fract(T / 1.4 + fl * 37.0) < 0.25) col = col * 1.16 + 12.0 / 255.0;
         }
-        int er = edgeRingAt(wp, bank, Calm2.x * calm * (1.0 - 0.6 * min(1.0, wd.z * Still.x)), bay);
+        // The calm life gives way as the water roughens.
+        int er = edgeRingAt(wp, bank, Calm2.x * calm * (1.0 - 0.6 * min(1.0, rough * Still.x)), bay);
         if (er == 3) col = col * 1.14 + 12.0 / 255.0;
         else if (er == 2) col = col * 1.11 + 10.0 / 255.0;
         else if (er == 1) col = col * 1.08 + 7.0 / 255.0;
@@ -513,20 +585,24 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         if (gl == 2) return vec4(foamBright(), 1.0);
         if (gl == 1) col = col * 1.25 + 22.0 / 255.0;
     }
-    // Wind ripples on still water (see rippleAt): bigger and longer the more open water lies upwind
-    // and the stronger the wind, rougher in gusts, tipped white in a strong wind over a long fetch.
-    if (still && Still.x > 0.0 && wd.z > 0.0) {
-        float fr = min(1.0, fetchAt(texel, wd) / Still.z);
-        float amp = Still.x * wd.z * fr * calm * (0.6 + 0.8 * gust);
-        if (amp > 0.02) {
-            vec3 rp = rippleAt(wp, fr, 0.06 + 0.05 * min(1.0, amp), wd);
-            float crest = rp.x * (0.55 + 0.9 * rp.y);
-            if (rp.z > 0.0 && crest > 0.3 - 0.2 * min(1.0, amp) && amp * (0.5 + rp.y) > bay * 0.8) {
-                if (amp > 0.6 && crest > 0.75 && rp.z > 0.5 && hash3(int(floor(wp.x / 2.0)), int(floor(wp.y / 2.0)), int(floor(Origin.z * 3.0))) < (amp - 0.6) * 2.0)
-                    return vec4(foamBright(), 1.0);
-                col = rp.z > 0.5 ? col * 1.24 + 20.0 / 255.0 : col * 1.12 + 10.0 / 255.0;
-            }
+    // Ripple marks (see marksAt), each pattern's where it shows, blended by how much it shows; crests
+    // lit in four dithered steps, troughs darkened in three.
+    if (still && Still.x > 0.0 && rough > 0.0) {
+        float mark = 0.0, deep = 0.0;
+        bool cap = false;
+        for (int p = 0; p < 2; p++) {
+            float wt = p == 0 ? wA : 1.0 - wA;
+            vec4 pw = p == 0 ? WindA : WindB;
+            if (wt <= 0.0 || pw.z <= 0.0) continue;
+            vec3 m = marksAt(wp, pw, rough * Still.x * 1.25, capped * Still.x * 1.25);
+            mark += m.x * wt;
+            deep += m.y * wt;
+            if (m.z > 0.0 && wt > bay) cap = true;
         }
+        if (cap) return vec4(foamBright(), 1.0);
+        float q = floor(mark * 4.0 + bay) / 4.0;
+        if (q > 0.0) col = col * (1.0 + 0.24 * q) + 20.0 / 255.0 * q;
+        else col *= 1.0 - 0.06 * floor(deep * 3.0 + bay) / 3.0;
     }
     float sp = length(rv.xy), v = 0.0, spark = 1.0;
     if (sp > 0.5 && River.x > 0.0) {
