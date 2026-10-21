@@ -18,7 +18,7 @@ public final class WaveMath {
 	 * samples water reaches; null if unreachable.
 	 */
 	public static float[] fieldsAt(ShoreRegion r, float tx, float tz) {
-		float per = ShoreRegion.TEXELS_PER_SAMPLE;
+		float per = r.tps;
 		float sx = (tx + 0.5f) / per - 0.5f, sz = (tz + 0.5f) / per - 0.5f;
 		int S = r.samples;
 		int ix = Math.max(0, Math.min(S - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(S - 2, (int) Math.floor(sz)));
@@ -44,7 +44,7 @@ public final class WaveMath {
 	public static float[] crossAt(ShoreRegion r, float tx, float tz, FoamSettings s) {
 		float[] f = fieldsAt(r, tx, tz);
 		if (f == null) return null;
-		float per = ShoreRegion.TEXELS_PER_SAMPLE;
+		float per = r.tps;
 		float sx = (tx + 0.5f) / per - 0.5f, sz = (tz + 0.5f) / per - 0.5f;
 		int S = r.samples;
 		int ix = Math.max(0, Math.min(S - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(S - 2, (int) Math.floor(sz)));

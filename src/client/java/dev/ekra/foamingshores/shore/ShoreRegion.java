@@ -5,7 +5,11 @@ import java.util.ArrayDeque;
 /**
  * The fields the waves are drawn from, for one square region. Built off-thread from a
  * {@link ShoreSnapshot}. Field values are in texels (16 per block) so the bake shader can compare
- * them with texel positions directly; they are sampled at {@link #RES} points per block.
+ * them with texel positions directly; they are sampled at {@link #res} points per block ({@link #RES}
+ * for the finest level). A coarser level covering more ground can be a finer level's parent: the
+ * parent decides what needs the wider view (which water is the open sea, where fronts start, which
+ * way rivers run) and near its edge the finer level's fields are blended into the parent's, so where
+ * the drawing goes over from one to the other nothing jumps.
  *
  * <ul>
  * <li>{@code arrival}: where along a wave's path each point lies; the wave front is a contour of it.
@@ -32,8 +36,8 @@ import java.util.ArrayDeque;
  * </ul>
  */
 public final class ShoreRegion {
+	/** Field samples per block of the finest level. */
 	public static final int RES = 4;
-	public static final float TEXELS_PER_SAMPLE = 16f / RES;
 	/** Points unreachable by water get this arrival value. */
 	public static final float UNREACHABLE = -1000f;
 	/**
@@ -43,7 +47,11 @@ public final class ShoreRegion {
 	private static final float FAR_PULL = 32f;
 
 	public final int originX, originZ, size, waterY;
-	public final int samples; // size * RES
+	/** Field samples per block, texels per field sample, and region texels per river decor texel. */
+	public final int res;
+	public final float tps;
+	public final int decorScale;
+	public final int samples; // size * res
 	public final float[] arrival, shoreDist, exposure;
 	public final byte[] level;
 	/** Y of each column's topmost solid-or-fluid block (leaves ignored), unclamped. */
@@ -108,13 +116,27 @@ public final class ShoreRegion {
 	public final float[] dipEntry;
 	public final float[] waterline, far, cross, crossWaterline;
 	public final boolean[] isle;
+	/** Chunks that were missing from the snapshot (their columns count as open water). */
+	public final java.util.Set<Long> missingChunks;
+	/**
+	 * What a finer level takes from this one: where fronts start (open water this far from land),
+	 * each sea sample's way out, the small islands, and the rocks a river's shape ignores.
+	 */
+	float sourceAt;
+	float[] way;
+	int[] isleBlocks;
+	boolean[] smallLand;
 
-	private ShoreRegion(ShoreSnapshot snap, int waterY) {
+	private ShoreRegion(ShoreSnapshot snap, int waterY, int res, int decorScale) {
 		this.originX = snap.originX;
 		this.originZ = snap.originZ;
 		this.size = snap.size;
 		this.waterY = waterY;
-		this.samples = size * RES;
+		this.res = res;
+		this.tps = 16f / res;
+		this.decorScale = decorScale;
+		this.missingChunks = java.util.Set.copyOf(snap.missingChunks);
+		this.samples = size * res;
 		int n = samples * samples;
 		this.arrival = new float[n];
 		this.shoreDist = new float[n];
@@ -152,15 +174,32 @@ public final class ShoreRegion {
 		float riverSpeed, float riverRock, float riverWake, float riverTrail, float backwater, float approachTexels, float straight) {
 	}
 
+	/**
+	 * A coarser level this one sits inside: within {@code marginBlocks} of this region's edge the
+	 * fields are the parent's, over the next {@code bandBlocks} they blend into this region's own.
+	 */
+	public record Parent(ShoreRegion region, int marginBlocks, int bandBlocks) {
+	}
+
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings) {
 		return build(snap, settings, null);
 	}
 
 	/** {@code memory} keeps rivers running the way they ran before (null: worked out afresh). */
 	public static ShoreRegion build(ShoreSnapshot snap, Settings settings, RiverMemory memory) {
+		return build(snap, settings, memory, RES, 1, null);
+	}
+
+	/**
+	 * Builds at {@code res} field samples per block, with river decor at one texel per
+	 * {@code decorScale} region texels; with a {@code parent}, taking its wider view (its rivers'
+	 * ways replace {@code memory}'s).
+	 */
+	public static ShoreRegion build(ShoreSnapshot snap, Settings settings, RiverMemory memory, int res, int decorScale, Parent parent) {
 		int size = snap.size;
 		int waterY = snap.waterY;
-		ShoreRegion r = new ShoreRegion(snap, waterY);
+		ShoreRegion r = new ShoreRegion(snap, waterY, res, decorScale);
+		ShoreRegion up = parent == null ? null : parent.region();
 
 		boolean[] surfaceWater = new boolean[size * size];
 		for (int i = 0; i < size * size; i++) {
@@ -176,12 +215,144 @@ public final class ShoreRegion {
 		}
 		markBodies(r, surfaceWater, settings.minBodyBlocks());
 		markOpenSea(r);
+		if (up != null) {
+			// Which water is the open sea, as the wider view sees it.
+			for (int i = 0; i < size * size; i++) {
+				int j = up.blockAt(r.originX + i % size, r.originZ + i / size);
+				if (j < 0) continue;
+				r.sea[i] = up.sea[j];
+				r.openSea[i] = up.openSea[j];
+			}
+		}
 		// The rivers only need the water and its kinds, not the waves' fields: both at once.
 		Fields.inParallel(() -> {
-			buildFields(r, settings);
+			buildFields(r, settings, up);
 			markDips(r);
-		}, () -> Rivers.build(r, settings, memory));
+		}, () -> Rivers.build(r, settings, memory, up));
+		if (parent != null) conform(r, parent);
 		return r;
+	}
+
+	/**
+	 * This region's index of the block at world (x, z), or -1 when it lies outside or in a chunk the
+	 * snapshot did not have (taken for open water).
+	 */
+	int blockAt(int x, int z) {
+		int bx = x - originX, bz = z - originZ;
+		if (bx < 0 || bz < 0 || bx >= size || bz >= size) return -1;
+		// The key as ChunkPos.pack makes it (this class stays free of the game's classes for the offline checks).
+		if (!missingChunks.isEmpty() && missingChunks.contains((x >> 4) & 0xFFFFFFFFL | ((z >> 4) & 0xFFFFFFFFL) << 32)) return -1;
+		return bz * size + bx;
+	}
+
+	/**
+	 * A field at world texel (wx, wz), blended between the samples round it (with {@code reach},
+	 * only those where it is not UNREACHABLE, as the bake shader blends); NaN outside the region,
+	 * UNREACHABLE when none round it is reachable.
+	 */
+	float sampleAt(float[] f, double wx, double wz, float[] reach) {
+		double sx = (wx - originX * 16.0) / tps - 0.5, sz = (wz - originZ * 16.0) / tps - 0.5;
+		if (sx < -0.5 || sz < -0.5 || sx > samples - 0.5 || sz > samples - 0.5) return Float.NaN;
+		int S = samples, ix = Math.max(0, Math.min(S - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(S - 2, (int) Math.floor(sz)));
+		double u = Math.max(0, Math.min(1, sx - ix)), v = Math.max(0, Math.min(1, sz - iz));
+		double sum = 0, wsum = 0;
+		for (int k = 0; k < 4; k++) {
+			int p = (iz + (k >> 1)) * S + ix + (k & 1);
+			double w = ((k & 1) == 1 ? u : 1 - u) * ((k >> 1) == 1 ? v : 1 - v);
+			if (reach != null && reach[p] <= UNREACHABLE) continue;
+			sum += f[p] * w;
+			wsum += w;
+		}
+		return wsum > 1e-9 ? (float) (sum / wsum) : UNREACHABLE;
+	}
+
+	private int nearestSample(double wx, double wz) {
+		int sx = (int) Math.floor((wx - originX * 16.0) / tps), sz = (int) Math.floor((wz - originZ * 16.0) / tps);
+		return sx < 0 || sz < 0 || sx >= samples || sz >= samples ? -1 : sz * samples + sx;
+	}
+
+	/**
+	 * Near its edge a region knows less than its parent (water past the edge, a body's true size), so
+	 * there its fields go over to the parent's: the parent's alone within marginBlocks of the edge,
+	 * blending into its own over the next bandBlocks.
+	 */
+	private static void conform(ShoreRegion r, Parent parent) {
+		ShoreRegion up = parent.region();
+		int S = r.samples, n = S * S, US = up.samples;
+		float margin = parent.marginBlocks(), band = Math.max(1, parent.bandBlocks());
+		if (r.riverFx == null && up.riverFx != null) {
+			r.riverFx = new float[n];
+			r.riverFy = new float[n];
+			r.riverBlend = new float[n];
+			r.riverShallow = new float[n];
+		}
+		if (r.fetch == null && up.fetch != null) r.fetch = new byte[n * FETCH_DIRS];
+		Fields.ranges(S, n, (z0, z1) -> {
+			int[] at = new int[4];
+			double[] wt = new double[4];
+			for (int p = z0 * S; p < z1 * S; p++) {
+				float bx = (p % S + 0.5f) / r.res, bz = (p / S + 0.5f) / r.res;
+				float edge = Math.min(Math.min(bx, bz), Math.min(r.size - bx, r.size - bz));
+				if (edge >= margin + band) continue;
+				float t = Math.max(0, Math.min(1, (margin + band - edge) / band)), w = t * t * (3 - 2 * t);
+				double wx = r.originX * 16.0 + (p % S + 0.5) * r.tps, wz = r.originZ * 16.0 + (p / S + 0.5) * r.tps;
+				// The parent's four samples round this point and their weights (as sampleAt finds them).
+				double sx = (wx - up.originX * 16.0) / up.tps - 0.5, sz = (wz - up.originZ * 16.0) / up.tps - 0.5;
+				if (sx < -0.5 || sz < -0.5 || sx > US - 0.5 || sz > US - 0.5) continue;
+				int ix = Math.max(0, Math.min(US - 2, (int) Math.floor(sx))), iz = Math.max(0, Math.min(US - 2, (int) Math.floor(sz)));
+				double u = Math.max(0, Math.min(1, sx - ix)), v = Math.max(0, Math.min(1, sz - iz));
+				for (int k = 0; k < 4; k++) {
+					at[k] = (iz + (k >> 1)) * US + ix + (k & 1);
+					wt[k] = ((k & 1) == 1 ? u : 1 - u) * ((k >> 1) == 1 ? v : 1 - v);
+				}
+				r.arrival[p] = blendReach(r.arrival[p], mix(up.arrival, up.arrival, at, wt), w);
+				r.waterline[p] = blendReach(r.waterline[p], mix(up.waterline, up.waterline, at, wt), w);
+				r.far[p] = blendReach(r.far[p], mix(up.far, up.arrival, at, wt), w);
+				r.cross[p] = blendReach(r.cross[p], mix(up.cross, up.cross, at, wt), w);
+				r.crossWaterline[p] = blendReach(r.crossWaterline[p], mix(up.crossWaterline, up.crossWaterline, at, wt), w);
+				r.dipEntry[p] = blendReach(r.dipEntry[p], mix(up.dipEntry, up.dipEntry, at, wt), w);
+				r.shoreDist[p] = blend(r.shoreDist[p], mix(up.shoreDist, null, at, wt), w);
+				r.exposure[p] = blend(r.exposure[p], mix(up.exposure, null, at, wt), w);
+				if (r.riverFx != null) {
+					boolean has = up.riverFx != null;
+					r.riverFx[p] = blend(r.riverFx[p], has ? mix(up.riverFx, null, at, wt) : 0, w);
+					r.riverFy[p] = blend(r.riverFy[p], has ? mix(up.riverFy, null, at, wt) : 0, w);
+					r.riverBlend[p] = blend(r.riverBlend[p], has ? mix(up.riverBlend, null, at, wt) : 0, w);
+					r.riverShallow[p] = blend(r.riverShallow[p], has ? mix(up.riverShallow, null, at, wt) : 0, w);
+				}
+				if (r.fetch != null && up.fetch != null) {
+					int q = up.nearestSample(wx, wz);
+					if (q < 0) continue;
+					for (int d = 0; d < FETCH_DIRS; d++) {
+						int mine = r.fetch[p * FETCH_DIRS + d] & 255, theirs = up.fetch[q * FETCH_DIRS + d] & 255;
+						r.fetch[p * FETCH_DIRS + d] = (byte) Math.round(mine + (theirs - mine) * w);
+					}
+				}
+			}
+		});
+	}
+
+	/** A field blended over four samples (with {@code reach}, only where it is not UNREACHABLE). */
+	private static float mix(float[] f, float[] reach, int[] at, double[] wt) {
+		double sum = 0, wsum = 0;
+		for (int k = 0; k < 4; k++) {
+			if (reach != null && reach[at[k]] <= UNREACHABLE) continue;
+			sum += f[at[k]] * wt[k];
+			wsum += wt[k];
+		}
+		return wsum > 1e-9 ? (float) (sum / wsum) : UNREACHABLE;
+	}
+
+	private static float blend(float mine, float theirs, float w) {
+		return Float.isNaN(theirs) ? mine : mine + (theirs - mine) * w;
+	}
+
+	/** As {@link #blend}, but where only one side is reachable, that of the side weighing more. */
+	private static float blendReach(float mine, float theirs, float w) {
+		if (Float.isNaN(theirs)) return mine;
+		boolean a = mine > UNREACHABLE, b = theirs > UNREACHABLE;
+		if (a && b) return mine + (theirs - mine) * w;
+		return w < 0.5f ? mine : theirs;
 	}
 
 	/** Water touching the region's edge, or at least minBody blocks of it, gets waves. */
@@ -237,7 +408,7 @@ public final class ShoreRegion {
 	}
 
 	private static void markDips(ShoreRegion r) {
-		int size = r.size, S = r.samples;
+		int size = r.size, S = r.samples, RES = r.res;
 		java.util.Arrays.fill(r.dipId, (short) -1);
 		boolean[] dip = new boolean[size * size];
 		for (int i = 0; i < size * size; i++) dip[i] = !r.water[i] && r.level[i] == -1;
@@ -276,9 +447,9 @@ public final class ShoreRegion {
 		if (water[j] && !seen[j]) { seen[j] = true; queue.add(j); }
 	}
 
-	private static void buildFields(ShoreRegion r, Settings settings) {
-		int S = r.samples, n = S * S, size = r.size;
-		float tps = TEXELS_PER_SAMPLE;
+	private static void buildFields(ShoreRegion r, Settings settings, ShoreRegion wide) {
+		int S = r.samples, n = S * S, size = r.size, RES = r.res;
+		float tps = r.tps;
 		boolean[] seaS = new boolean[n], landS = new boolean[n];
 		byte[] lvl = new byte[n];
 		for (int sz = 0; sz < S; sz++) for (int sx = 0; sx < S; sx++) {
@@ -298,6 +469,13 @@ public final class ShoreRegion {
 		// the coast ignores them, so a wave passes them as a line instead of ringing each one. They
 		// still block the water. Land touching the region's edge may be bigger than it looks: kept.
 		int[] isleSize = smallIslands(r, settings.minIsland());
+		if (wide != null) {
+			for (int i = 0; i < size * size; i++) {
+				int j = wide.blockAt(r.originX + i % size, r.originZ + i / size);
+				if (j >= 0) isleSize[i] = wide.isleBlocks[j];
+			}
+		}
+		r.isleBlocks = isleSize;
 		boolean[] seaW = new boolean[n], landW = new boolean[n];
 		for (int p = 0; p < n; p++) {
 			int bi = ((p / S) / RES) * size + (p % S) / RES;
@@ -321,8 +499,18 @@ public final class ShoreRegion {
 		double[] cost = new double[n];
 		float widest = 0;
 		for (int p = 0; p < n; p++) if (seaS[p]) widest = Math.max(widest, rawW[p]);
-		float sourceAt = Math.min(open, widest * 0.9f);
+		float sourceAt = wide != null ? wide.sourceAt : Math.min(open, widest * 0.9f);
+		r.sourceAt = sourceAt;
 		float[] way = Fields.openWay(rawW, seaS, S, S);
+		if (wide != null) {
+			// Each water's way out as the wider view sees it (a cove's mouth may lie past this edge).
+			for (int p = 0; p < n; p++) {
+				if (!seaS[p]) continue;
+				float v = wide.sampleAt(wide.way, r.originX * 16.0 + (p % S + 0.5) * tps, r.originZ * 16.0 + (p / S + 0.5) * tps, null);
+				if (!Float.isNaN(v) && v > -Fields.FAR / 2) way[p] = v;
+			}
+		}
+		r.way = way;
 		int rrF = Math.max(1, Math.round(settings.farSmoothBlocks() * 16f / 2f / tps));
 		float[] smooth = Fields.boxBlur(Fields.boxBlur(rawW, S, S, rrF), S, S, rrF);
 		// Only in the open sea: waves come in from it and fade travelling up a river or into a lake.
@@ -521,8 +709,8 @@ public final class ShoreRegion {
 	 * front following each up it.
 	 */
 	private static void crossing(ShoreRegion r, Settings settings, boolean[] seaS, byte[] lvl, float[] dirX, float[] dirY) {
-		int S = r.samples, n = S * S;
-		float tps = TEXELS_PER_SAMPLE;
+		int S = r.samples, n = S * S, RES = r.res;
+		float tps = r.tps;
 		float[] arr = r.arrival, dW = r.waterline;
 		float reach = -settings.runupReachTexels();
 		double cos = Math.cos(Math.toRadians(settings.wrapAngle()));

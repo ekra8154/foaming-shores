@@ -4,7 +4,10 @@
 // Bakes shore foam from the stateless wave model (see foaming-shores-playground). Every value is a
 // function of the fields, the wave list and the time: nothing carries over between bakes.
 //
-// Mode 0 bakes block tops: one region texture, 16 texels per block.
+// Mode 0 bakes block tops, a 16x16 block tile at a time (see foam_tile.vsh): 16 texels per block
+// near the eye, and further off 8 or 4, where a texel would be smaller than a pixel on screen. A
+// coarser pixel shows the texel at its middle, as the screen would at that distance, and dithering
+// runs on the pixels, so the same share of them is lit at any density.
 // Mode 1 bakes faces: a texture of 16 x 80 tiles, one per wall or drop face, rows on the world's
 // height grid (row 0 at the tile's top).
 
@@ -27,20 +30,26 @@ uniform sampler2D FaceSampler;
 uniform sampler2D DipSampler;
 // Vanilla's block atlas: the sheet is drawn with the water textures, animated by vanilla.
 uniform sampler2D AtlasSampler;
-// In the face pass, the tops just baked: a ledge or step carries foam on its edge over its top row.
-uniform sampler2D RegionSampler;
 // Per field sample: a river's current (texels per second, x and z), how much river it is (1 in a
 // river, fading into the sea at its mouth, 0 elsewhere) and how shallow (1 a block deep, 0.5 two).
 uniform sampler2D RiverSampler;
-// Per region texel, round rocks in rivers: the wake (r), the foam pillow (g) and foam trails (b);
-// and still water (a): 0 for none, else 1..255 for how much the wind's ripples show there.
+// Per decor texel (Region.w region texels across), round rocks in rivers: the wake (r), the foam
+// pillow (g) and foam trails (b); and still water (a): 0 for none, else 1..255 for how much the
+// wind's ripples show there.
 uniform sampler2D RiverDecorSampler;
 // Still water's fetch, per field sample: four texels side by side hold the 16 wind directions
 // (texel k, channel c is direction 4k + c), as 0..1 of 384 texels of open water upwind.
 uniform sampler2D FetchSampler;
+// In the face pass, where each 16x16 block tile of the region was just baked: (page 1..3 for 16, 8
+// or 4 texels per block, 0 for none; slot corner x, y in pixels), and the pages themselves: a ledge
+// or step carries foam on its edge over its top row.
+uniform sampler2D TileSampler;
+uniform sampler2D Page16Sampler;
+uniform sampler2D Page8Sampler;
+uniform sampler2D Page4Sampler;
 
 layout(std140) uniform FoamBake {
-    vec4 Region;   // region size in texels, field samples per block, field size in samples, -
+    vec4 Region;   // region size in texels, field samples per block, field size in samples, region texels per decor texel
     vec4 Origin;   // region origin in world texels (x, z) mod 256, time in seconds, wave count
     vec4 Shape;    // lip width, raggedness, foam far out at sea, lace density
     vec4 Lace;     // lace half-life under the sheet, on sand, at sea; backwash pull (texels/s)
@@ -52,7 +61,7 @@ layout(std140) uniform FoamBake {
     vec4 Mode;     // mode, face count, face texture width, face texture height
     vec4 Sprites;  // atlas texel origin of water_still (x, y) and of water_flow (x, y)
     vec4 Swell;    // straighter fronts at sea, peel (s), peel scale (blocks), waves differ along the coast
-    vec4 Swell2;   // travel fade (texels), crossing strength, crossing fades within (texels), -
+    vec4 Swell2;   // travel fade (texels), crossing strength, crossing fades within (texels), gone within (texels of the region's edge)
     vec4 SwellOrigin; // region origin on the swell's noise lattice: whole cells (x, z), fraction (x, z)
     vec4 River;    // flow lines, flow line length (texels), lighter shallows, lapping at the banks
     vec4 WindA;    // wind pattern A: the way the wind blows (x, z, unit), its strength, its direction as 0..16 of the fetch's directions
@@ -61,7 +70,7 @@ layout(std140) uniform FoamBake {
     vec4 WindB;    // wind pattern B, as WindA
     vec4 Calm;     // pattern A's weight (0..1), glints, ruffled patches, rises
     vec4 Calm2;    // edge rings, sparkles on flow lines, water recolouring (1 on), edge lines (1..4)
-    vec4 Calm3;    // bug rings, flow line length by speed, flow line count by speed, -
+    vec4 Calm3;    // bug rings, flow line length by speed, flow line count by speed, fading over (texels inward of where it is gone; 0 none)
     vec4 Breeze;   // breeziness (0 steady wind, 1 wind only in breezes), how often, size, strength
     vec4 Waves[24]; // per wave: (t0, amplitude, front noise offset xy), (lace offset xy, lip noise offset xy)
 };
@@ -85,8 +94,17 @@ float hash3(int x, int y, int s) {
     return float(h) / 4294967296.0;
 }
 
+// Texels per baked pixel (1 in the face pass): the dither runs on pixels, not texels.
+float gStep = 1.0;
+
 float bayerAt(ivec2 p) {
-    return (BAYER[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0;
+    ivec2 q = gStep > 1.5 ? ivec2(floor(vec2(p) / gStep)) : p;
+    return (BAYER[(q.y & 3) * 4 + (q.x & 3)] + 0.5) / 16.0;
+}
+
+// The river decor at a region texel.
+vec4 decorAt(vec2 texel) {
+    return texelFetch(RiverDecorSampler, ivec2(floor(texel / Region.w)), 0);
 }
 
 // Field values at a region texel, interpolated between samples. Unreachable samples are left out
@@ -376,7 +394,7 @@ float bugRingAt(vec2 wp, vec2 texel) {
     vec2 at = vec2(c) * 32.0 + 9.0 + vec2(hash3(c.x, c.y, 165 + (k & 1023)), hash3(c.x, c.y, 167 + (k & 1023))) * 14.0;
     ivec2 mid = ivec2(floor(texel + at - wp));
     if (any(lessThan(mid, ivec2(0))) || any(greaterThanEqual(mid, ivec2(Region.x)))) return 0.0;
-    if (texelFetch(RiverDecorSampler, mid, 0).a * 255.0 < 128.0) return 0.0;
+    if (decorAt(vec2(mid)).a * 255.0 < 128.0) return 0.0;
     float rad = 1.0 + age * 4.0, fade = 1.0 - age / 1.8, dd = length(floor(wp) + 0.5 - at);
     if (abs(dd - rad) < 0.6) return fade;
     return rad > 4.0 && abs(dd - rad + 3.0) < 0.6 ? fade * 0.6 : 0.0;
@@ -403,7 +421,7 @@ float riseAt(vec2 wp, vec2 texel) {
         if (dd > lead + 1.0) continue;
         ivec2 mid = ivec2(floor(texel + at - wp));
         if (any(lessThan(mid, ivec2(0))) || any(greaterThanEqual(mid, ivec2(Region.x)))) continue;
-        if (texelFetch(RiverDecorSampler, mid, 0).a * 255.0 < 128.0) continue;
+        if (decorAt(vec2(mid)).a * 255.0 < 128.0) continue;
         if (age < 0.35 && dd < 1.0) return 1.0 - age / 0.35;
         float space = 2.0 + age * 1.5, fade = pow(1.0 - age / 4.0, 1.2) / (1.0 + lead / 24.0);
         for (int i = 0; i < 3; i++) {
@@ -540,7 +558,7 @@ vec4 riverLayer(vec2 texel, ivec2 wt, bool isWater, float bay) {
         if (ring > bay * 0.8) { vec4 sw = waterStill(wt); return vec4(min(sw.rgb * 1.22 + 20.0 / 255.0, vec3(1.0)), sw.a * Look.z); }
         return vec4(0.0);
     }
-    vec4 decor = texelFetch(RiverDecorSampler, ivec2(texel), 0);
+    vec4 decor = decorAt(texel);
     float bank = distanceToBlock(texel, false), sh = rv.w;
     float shq = sh + (bay - 0.5) * 0.5, stp = shq > 0.66 ? 1.0 : shq > 0.33 ? 0.5 : 0.0;
     vec4 w = waterStill(wt);
@@ -1010,6 +1028,15 @@ float fallTime(float r) {
     return (-4.0 + sqrt(16.0 + 2.0 * GRAV * r)) / GRAV;
 }
 
+// The block top just baked at a region texel, as the tile it is in shows it.
+vec4 topAt(vec2 texel) {
+    vec4 e = texelFetch(TileSampler, ivec2(floor(texel / 256.0)), 0);
+    if (e.x < 0.5) return vec4(0.0);
+    float k = e.x < 1.5 ? 1.0 : e.x < 2.5 ? 2.0 : 4.0;
+    ivec2 p = ivec2(e.yz) + ivec2(floor(mod(texel, 256.0) / k));
+    return e.x < 1.5 ? texelFetch(Page16Sampler, p, 0) : e.x < 2.5 ? texelFetch(Page8Sampler, p, 0) : texelFetch(Page4Sampler, p, 0);
+}
+
 vec4 bakeFace(vec2 pixel) {
     int cols = int(Mode.z) / 16;
     int tx = int(pixel.x) / 16, ty = int(pixel.y) / TILE_H;
@@ -1163,13 +1190,25 @@ vec4 bakeFace(vec2 pixel) {
         if (faceLip) color = vec4(foamBright(), 1.0);
     }
     if ((edgeKind || kind == 5) && row == 0) {
-        vec4 top = texelFetch(RegionSampler, ivec2(texel), 0);
+        vec4 top = topAt(texel); // what the top shows at its edge
         if (top.a > 0.99) color = top; // foam is opaque; the sheet and wet sand are not
     }
     return color;
 }
 
 void main() {
-    if (Mode.x < 0.5) fragColor = bakeTop(floor(texCoord * Region.x));
-    else fragColor = bakeFace(floor(texCoord * Mode.zw));
+    vec2 at = texCoord * Region.x;
+    float perPixel = abs(dFdx(at.x));
+    if (Mode.x < 0.5) {
+        gStep = max(1.0, floor(perPixel + 0.5));
+        vec2 texel = floor(at);
+        vec4 c = bakeTop(texel);
+        // The outermost level dissolves toward its edge, pixel by pixel in the dither's order.
+        if (Calm3.w > 0.0) {
+            float edge = min(min(texel.x, texel.y), min(Region.x - 1.0 - texel.x, Region.x - 1.0 - texel.y));
+            float gone = clamp((Swell2.w + Calm3.w - edge) / Calm3.w, 0.0, 1.0);
+            if (gone > 0.0 && bayerAt(ivec2(Origin.xy) + ivec2(texel)) < gone) c = vec4(0.0);
+        }
+        fragColor = c;
+    } else fragColor = bakeFace(floor(texCoord * Mode.zw));
 }

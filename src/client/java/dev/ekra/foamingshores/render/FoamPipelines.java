@@ -18,8 +18,8 @@ import net.minecraft.util.Util;
 import java.util.function.Function;
 
 /**
- * The off-screen pass that bakes a region's foam into a texture (one full-screen triangle), and the
- * pipeline that draws the baked foam onto the world.
+ * The off-screen passes that bake foam (block tops a tile at a time into the atlas pages, faces in
+ * one full-screen triangle), and the pipeline that draws the baked foam onto the world.
  */
 public final class FoamPipelines {
 	private FoamPipelines() {
@@ -36,7 +36,10 @@ public final class FoamPipelines {
 		.withUniform("RiverDecorSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("FetchSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("AtlasSampler", UniformType.COMBINED_IMAGE_SAMPLER)
-		.withUniform("RegionSampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("TileSampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("Page16Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("Page8Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("Page4Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.build();
 
 	// Optional: if the shader fails to compile, vanilla logs a warning instead of failing the reload.
@@ -44,6 +47,18 @@ public final class FoamPipelines {
 		RenderPipeline.builder()
 			.withLocation(Identifier.fromNamespaceAndPath("foamingshores", "pipeline/foam_bake"))
 			.withVertexShader("core/screenquad")
+			.withFragmentShader(Identifier.fromNamespaceAndPath("foamingshores", "core/foam_bake"))
+			.withBindGroupLayout(BAKE_LAYOUT)
+			.withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
+			.withColorTargetState(ColorTargetState.DEFAULT)
+			.build()
+	);
+
+	/** Block tops: the same bake, placed a tile at a time by foam_tile.vsh. */
+	public static final RenderPipeline BAKE_TILES = RenderPipelines.registerOptional(
+		RenderPipeline.builder()
+			.withLocation(Identifier.fromNamespaceAndPath("foamingshores", "pipeline/foam_bake_tiles"))
+			.withVertexShader(Identifier.fromNamespaceAndPath("foamingshores", "core/foam_tile"))
 			.withFragmentShader(Identifier.fromNamespaceAndPath("foamingshores", "core/foam_bake"))
 			.withBindGroupLayout(BAKE_LAYOUT)
 			.withPrimitiveTopology(PrimitiveTopology.TRIANGLES)

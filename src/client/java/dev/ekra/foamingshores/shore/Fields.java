@@ -5,6 +5,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Grid algorithms behind the shore fields, all on row-major float grids of {@code w * h}.
@@ -21,12 +22,36 @@ final class Fields {
 	 * fields, the fetch, the blurs at each scale). Every part writes its own arrays, so the result is
 	 * the same as one after the other.
 	 */
-	private static final ForkJoinPool POOL = new ForkJoinPool(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)), pool -> {
+	private static final AtomicInteger THREADS = new AtomicInteger();
+	private static final ForkJoinPool POOL = new ForkJoinPool(Math.max(2, Math.min(6, Runtime.getRuntime().availableProcessors() / 2)), pool -> {
 		ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
-		t.setName("Foaming Shores fields " + t.getPoolIndex());
+		t.setName("Foaming Shores fields " + THREADS.getAndIncrement());
 		t.setDaemon(true);
 		return t;
 	}, null, false);
+
+	/** A range of rows or columns [from, to) of one pass. */
+	interface Range {
+		void run(int from, int to);
+	}
+
+	/**
+	 * Runs {@code body} over 0..n in a few ranges at once when there is enough to share (rows or
+	 * columns of a pass are independent, each worked exactly as on its own).
+	 */
+	static void ranges(int n, int cells, Range body) {
+		int parts = cells < 1 << 16 ? 1 : Math.min(n, POOL.getParallelism());
+		if (parts <= 1) {
+			body.run(0, n);
+			return;
+		}
+		Runnable[] jobs = new Runnable[parts];
+		for (int i = 0; i < parts; i++) {
+			int from = (int) ((long) n * i / parts), to = (int) ((long) n * (i + 1) / parts);
+			jobs[i] = () -> body.run(from, to);
+		}
+		inParallel(jobs);
+	}
 
 	/** Runs the jobs on the shore threads at once and waits for all of them. */
 	static void inParallel(Runnable... jobs) {
@@ -49,20 +74,25 @@ final class Fields {
 		double[] g = new double[w * h];
 		for (int i = 0; i < g.length; i++) g[i] = feature[i] ? 0 : FAR;
 		int n = Math.max(w, h);
-		double[] f = new double[n], d = new double[n], z = new double[n + 1];
-		int[] v = new int[n];
-		for (int x = 0; x < w; x++) {
-			for (int y = 0; y < h; y++) f[y] = g[y * w + x];
-			transform1d(f, h, d, v, z);
-			for (int y = 0; y < h; y++) g[y * w + x] = d[y];
-		}
-		for (int y = 0; y < h; y++) {
-			System.arraycopy(g, y * w, f, 0, w);
-			transform1d(f, w, d, v, z);
-			System.arraycopy(d, 0, g, y * w, w);
-		}
+		ranges(w, w * h, (x0, x1) -> {
+			double[] f = new double[n], d = new double[n], z = new double[n + 1];
+			int[] v = new int[n];
+			for (int x = x0; x < x1; x++) {
+				for (int y = 0; y < h; y++) f[y] = g[y * w + x];
+				transform1d(f, h, d, v, z);
+				for (int y = 0; y < h; y++) g[y * w + x] = d[y];
+			}
+		});
 		float[] out = new float[w * h];
-		for (int i = 0; i < out.length; i++) out[i] = (float) Math.sqrt(g[i]);
+		ranges(h, w * h, (y0, y1) -> {
+			double[] f = new double[n], d = new double[n], z = new double[n + 1];
+			int[] v = new int[n];
+			for (int y = y0; y < y1; y++) {
+				System.arraycopy(g, y * w, f, 0, w);
+				transform1d(f, w, d, v, z);
+				for (int x = 0; x < w; x++) out[y * w + x] = (float) Math.sqrt(d[x]);
+			}
+		});
 		return out;
 	}
 
@@ -94,28 +124,32 @@ final class Fields {
 		if (r <= 0) return src.clone();
 		float[] tmp = new float[w * h], out = new float[w * h];
 		float norm = 1f / (2 * r + 1);
-		for (int y = 0; y < h; y++) {
-			int o = y * w;
-			float acc = 0;
-			for (int x = -r; x <= r; x++) acc += src[o + clamp(x, 0, w - 1)];
-			for (int x = 0; x < w; x++) {
-				tmp[o + x] = acc * norm;
-				acc += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+		ranges(h, w * h, (y0, y1) -> {
+			for (int y = y0; y < y1; y++) {
+				int o = y * w;
+				float acc = 0;
+				for (int x = -r; x <= r; x++) acc += src[o + clamp(x, 0, w - 1)];
+				for (int x = 0; x < w; x++) {
+					tmp[o + x] = acc * norm;
+					acc += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+				}
 			}
-		}
+		});
 		// Columns side by side, a row at a time (the same sums per column, read along memory).
-		float[] acc = new float[w];
-		for (int y = -r; y <= r; y++) {
-			int o = clamp(y, 0, h - 1) * w;
-			for (int x = 0; x < w; x++) acc[x] += tmp[o + x];
-		}
-		for (int y = 0; y < h; y++) {
-			int o = y * w, in = Math.min(h - 1, y + r + 1) * w, off = Math.max(0, y - r) * w;
-			for (int x = 0; x < w; x++) {
-				out[o + x] = acc[x] * norm;
-				acc[x] += tmp[in + x] - tmp[off + x];
+		ranges(w, w * h, (x0, x1) -> {
+			float[] acc = new float[w];
+			for (int y = -r; y <= r; y++) {
+				int o = clamp(y, 0, h - 1) * w;
+				for (int x = x0; x < x1; x++) acc[x] += tmp[o + x];
 			}
-		}
+			for (int y = 0; y < h; y++) {
+				int o = y * w, in = Math.min(h - 1, y + r + 1) * w, off = Math.max(0, y - r) * w;
+				for (int x = x0; x < x1; x++) {
+					out[o + x] = acc[x] * norm;
+					acc[x] += tmp[in + x] - tmp[off + x];
+				}
+			}
+		});
 		return out;
 	}
 
@@ -123,9 +157,14 @@ final class Fields {
 	static float[] maxFilter(float[] src, int w, int h, int r) {
 		float[] tmp = new float[w * h], out = new float[w * h];
 		int n = Math.max(w, h), k = 2 * r + 1;
-		float[] g = new float[n], hh = new float[n];
-		for (int y = 0; y < h; y++) maxPass(src, tmp, w, y * w, 1, r, k, g, hh);
-		for (int x = 0; x < w; x++) maxPass(tmp, out, h, x, w, r, k, g, hh);
+		ranges(h, w * h, (y0, y1) -> {
+			float[] g = new float[n], hh = new float[n];
+			for (int y = y0; y < y1; y++) maxPass(src, tmp, w, y * w, 1, r, k, g, hh);
+		});
+		ranges(w, w * h, (x0, x1) -> {
+			float[] g = new float[n], hh = new float[n];
+			for (int x = x0; x < x1; x++) maxPass(tmp, out, h, x, w, r, k, g, hh);
+		});
 		return out;
 	}
 
