@@ -112,6 +112,9 @@ public final class FoamSettings {
 	public float wetDark = 0.28f;
 	public float dryTime = 7f;
 
+	/** Off, the mod does nothing at all: no fields, no baking, no drawing, no sound (F9 by default). */
+	public boolean enabled = true;
+
 	// Look
 	public int ticks = 2;           // animation step, in game ticks
 	public float sheetAlpha = 1f;    // times vanilla water's own opacity

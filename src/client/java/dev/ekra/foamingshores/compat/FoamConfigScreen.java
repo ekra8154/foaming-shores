@@ -204,6 +204,13 @@ public final class FoamConfigScreen {
 		ConfigEntryBuilder entries = builder.entryBuilder();
 		for (Group group : GROUPS) {
 			ConfigCategory category = builder.getOrCreateCategory(Component.translatable("category.foamingshores." + group.key()));
+			if (group.key().equals("waves")) {
+				category.addEntry(entries.startBooleanToggle(Component.translatable("option.foamingshores.enabled"), settings.enabled)
+					.setDefaultValue(defaults.enabled)
+					.setTooltip(Component.translatable("tooltip.foamingshores.enabled"))
+					.setSaveConsumer(v -> settings.enabled = v)
+					.build());
+			}
 			if (group.key().equals("look")) {
 				category.addEntry(entries.startBooleanToggle(Component.translatable("option.foamingshores.recolorWater"), settings.recolorWater)
 					.setDefaultValue(defaults.recolorWater)

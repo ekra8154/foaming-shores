@@ -299,6 +299,7 @@ final class Rivers {
 		}
 		r.riverFx = fx;
 		r.riverFy = fy;
+		long decorStart = System.nanoTime();
 		int T = size * 16 / r.decorScale, k = r.decorScale;
 		byte[] decor = anyRiver ? decor(r, settings, dom, rivS, fx, fy, hx, hy, bank, smallLand) : new byte[T * T * 4];
 		// Still water in the decor's last channel: 0 for none, else 1..255 for how much the wind's
@@ -313,6 +314,7 @@ final class Rivers {
 			}
 		}
 		r.riverDecor = decor;
+		r.decorMs = (System.nanoTime() - decorStart) / 1_000_000;
 		r.fetch = fetching.join();
 	}
 
@@ -648,14 +650,14 @@ final class Rivers {
 		}
 		// The pillow (on water within 6 texels of land, as hard as the current hits it there) and the
 		// wakes behind small land standing in the river, both at once.
-		float[] pillow = new float[T * T], wake = new float[T * T];
+		float[] pillow = scratch(T * T, 0), wake = scratch(T * T, 1);
 		boolean[] foamy = new boolean[size * size];
 		Fields.inParallel(() -> pillow(r, k, T, per, tps, dom, hit, rockFoam, pillow, foamy),
 			() -> wakes(r, s, k, T, tps, dom, rivS, fx, fy, small, rockFoam, wake));
 		// Foam trails: what piles up drifts downstream, thinning as it goes. Only texels near foam can
 		// carry any.
 		float trail = s.riverTrail() * 16;
-		float[] foam = new float[T * T];
+		float[] foam = scratch(T * T, 2);
 		if (trail > 0) {
 			int[] cells = new int[1024];
 			int count = 0;
@@ -686,7 +688,7 @@ final class Rivers {
 					covered[tz] = addStretch(iv, nIv, x0, x1, coveredCount, tz);
 				}
 			}
-			System.arraycopy(pillow, 0, foam, 0, foam.length);
+			System.arraycopy(pillow, 0, foam, 0, T * T);
 			// Each step carries foam two texels downstream (a decor texel at least).
 			double step = Math.max(2, k);
 			double decay = Math.exp(-step / trail);
@@ -727,7 +729,7 @@ final class Rivers {
 				}
 				if (!changed) break;
 			}
-			for (int i = 0; i < foam.length; i++) foam[i] = Math.max(0, foam[i] - pillow[i] * 0.5f);
+			for (int i = 0; i < T * T; i++) foam[i] = Math.max(0, foam[i] - pillow[i] * 0.5f);
 		}
 		for (int i = 0; i < T * T; i++) {
 			if (wake[i] == 0 && pillow[i] == 0 && foam[i] == 0) continue; // most of the region: already 0
@@ -736,6 +738,20 @@ final class Rivers {
 			out[i * 4 + 2] = (byte) Math.round(Math.min(1, foam[i]) * 255);
 		}
 		return out;
+	}
+
+	/**
+	 * The decor's three texel-sized maps, kept from one build to the next (the first n cleared),
+	 * instead of three new arrays of millions of floats each time; builds run one at a time, and a
+	 * smaller level uses the start of the larger level's. Only the first n of each is ever read.
+	 */
+	private static final float[][] SCRATCH = new float[3][];
+
+	private static synchronized float[] scratch(int n, int which) {
+		float[] a = SCRATCH[which];
+		if (a == null || a.length < n) SCRATCH[which] = a = new float[n];
+		else java.util.Arrays.fill(a, 0, n, 0);
+		return a;
 	}
 
 	/**

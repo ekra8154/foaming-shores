@@ -16,7 +16,9 @@ import java.util.BitSet;
  * Where baked block tops live: one page per density (16, 8 or 4 texels per block), each a square
  * texture of equal slots, one 16x16 block tile per slot. A tile far enough off that a texel is
  * smaller than a pixel on screen goes to a coarser page: fewer pixels to bake, and nothing to see
- * where it changes.
+ * where it changes. Every page is held twice: the world draws from one buffer while the next
+ * animation step is baked into the other a share at a time, and the two swap when that step comes.
+ * Each buffer keeps its own slots.
  */
 final class FoamAtlas {
 	/** Texels per block of each page, finest first. */
@@ -31,41 +33,39 @@ final class FoamAtlas {
 
 	static final class Page {
 		final int index, density, slotPx, perRow;
-		final Identifier id;
-		final GpuTexture texture;
-		final GpuTextureView view;
-		private final BitSet used = new BitSet();
+		final Identifier[] ids = new Identifier[2];
+		final GpuTexture[] textures = new GpuTexture[2];
+		final GpuTextureView[] views = new GpuTextureView[2];
+		private final BitSet[] used = {new BitSet(), new BitSet()};
 
 		Page(GpuDevice device, int index, int density) {
 			this.index = index;
 			this.density = density;
 			this.slotPx = density * 16;
 			this.perRow = PAGE / slotPx;
-			this.id = Identifier.fromNamespaceAndPath("foamingshores", "foam_tiles_" + density);
-			this.texture = device.createTexture("Foaming Shores tiles at " + density, GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING
-				| GpuTexture.USAGE_COPY_DST, GpuFormat.RGBA8_UNORM, PAGE, PAGE, 1, 1);
-			this.view = device.createTextureView(texture);
-			Minecraft.getInstance().getTextureManager().register(id, new PageTexture(texture, view));
+			for (int b = 0; b < 2; b++) {
+				ids[b] = Identifier.fromNamespaceAndPath("foamingshores", "foam_tiles_" + density + "_" + b);
+				textures[b] = device.createTexture("Foaming Shores tiles at " + density + " (" + b + ")", GpuTexture.USAGE_RENDER_ATTACHMENT
+					| GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST, GpuFormat.RGBA8_UNORM, PAGE, PAGE, 1, 1);
+				views[b] = device.createTextureView(textures[b]);
+				Minecraft.getInstance().getTextureManager().register(ids[b], new PageTexture(textures[b], views[b]));
+			}
 		}
 
 		int slots() {
 			return perRow * perRow;
 		}
 
-		/** A free slot, or -1 when the page is full. */
-		int alloc() {
-			int s = used.nextClearBit(0);
+		/** A free slot in buffer {@code b}, or -1 when that buffer's page is full. */
+		int alloc(int b) {
+			int s = used[b].nextClearBit(0);
 			if (s >= slots()) return -1;
-			used.set(s);
+			used[b].set(s);
 			return s;
 		}
 
-		void free(int slot) {
-			if (slot >= 0) used.clear(slot);
-		}
-
-		int usedSlots() {
-			return used.cardinality();
+		void free(int b, int slot) {
+			if (slot >= 0) used[b].clear(slot);
 		}
 
 		int slotX(int slot) {
@@ -77,7 +77,7 @@ final class FoamAtlas {
 		}
 	}
 
-	/** A page, registered so vanilla render types can sample it. */
+	/** A page buffer, registered so vanilla render types can sample it. */
 	private static final class PageTexture extends AbstractTexture {
 		PageTexture(GpuTexture texture, GpuTextureView view) {
 			this.texture = texture;

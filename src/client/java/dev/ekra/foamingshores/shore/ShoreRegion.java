@@ -124,6 +124,9 @@ public final class ShoreRegion {
 	 */
 	float sourceAt;
 	float[] way;
+	/** How long the build took, in ms: the waves' fields, the rivers (and of that the river decor), conform. */
+	public long[] phaseMs;
+	volatile long decorMs;
 	int[] isleBlocks;
 	boolean[] smallLand;
 
@@ -225,11 +228,22 @@ public final class ShoreRegion {
 			}
 		}
 		// The rivers only need the water and its kinds, not the waves' fields: both at once.
+		long[] ms = new long[4];
 		Fields.inParallel(() -> {
+			long t0 = System.nanoTime();
 			buildFields(r, settings, up);
 			markDips(r);
-		}, () -> Rivers.build(r, settings, memory, up));
+			ms[0] = (System.nanoTime() - t0) / 1_000_000;
+		}, () -> {
+			long t0 = System.nanoTime();
+			Rivers.build(r, settings, memory, up);
+			ms[1] = (System.nanoTime() - t0) / 1_000_000;
+		});
+		long t0 = System.nanoTime();
 		if (parent != null) conform(r, parent);
+		ms[2] = r.decorMs;
+		ms[3] = (System.nanoTime() - t0) / 1_000_000;
+		r.phaseMs = ms;
 		return r;
 	}
 

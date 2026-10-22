@@ -1,5 +1,11 @@
 {
 	"title.foamingshores.config": "Foaming Shores",
+	"key.category.foamingshores.controls": "Foaming Shores",
+	"key.foamingshores.toggle": "Turn Foaming Shores on or off",
+	"message.foamingshores.enabled": "Foaming Shores on",
+	"message.foamingshores.disabled": "Foaming Shores off (nothing is computed)",
+	"option.foamingshores.enabled": "Mod enabled",
+	"tooltip.foamingshores.enabled": "Off, Foaming Shores does nothing at all: no shore fields are built, nothing is baked or drawn, and the sound stops. The key to switch it (F9 by default) is under Controls.",
 
 	"category.foamingshores.waves": "Waves",
 	"category.foamingshores.swell": "Swell",

@@ -38,15 +38,24 @@ final class FoamLevel {
 	 * is within keepLo..keepHi (each way), and is laid with the player's tile at keepLo or keepHi
 	 * (ahead of where it is going) when it moves, or at {@code home} when first laid. {@code fades}:
 	 * the outermost drawn tiles dissolve toward the edge (the furthest level, where foam ends).
+	 * {@code maxFaces}: wall and drop faces it can draw (nearest first), a multiple of FACE_COLS.
 	 */
-	record Spec(String name, int size, int res, int decorScale, int keepLo, int keepHi, int home, boolean fades) {
+	record Spec(String name, int size, int res, int decorScale, int keepLo, int keepHi, int home, boolean fades, int maxFaces) {
 		int tiles() {
 			return size / TILE;
 		}
+
+		int faceRows() {
+			return maxFaces / FoamRenderer.FACE_COLS;
+		}
+
+		int faceTexH() {
+			return faceRows() * FoamRenderer.TILE_H;
+		}
 	}
 
-	static final Spec NEAR = new Spec("near", 160, ShoreRegion.RES, 1, 4, 5, 4, false);
-	static final Spec FAR = new Spec("far", 384, 2, 4, 9, 14, 11, true);
+	static final Spec NEAR = new Spec("near", 160, ShoreRegion.RES, 1, 4, 5, 4, false, 2048);
+	static final Spec FAR = new Spec("far", 384, 2, 4, 9, 14, 11, true, 4096);
 
 	/** Blocks at the region's edge where its fields are its parent's, and over which they blend in. */
 	static final int MARGIN = 16, BAND = 16;
@@ -61,6 +70,8 @@ final class FoamLevel {
 	final List<Tile> drawn = new ArrayList<>();
 	List<FoamRenderer.Quad> faceQuads = List.of();
 	int faceCount;
+	/** Whether each face buffer holds a bake of the current faces. */
+	final boolean[] faceBaked = new boolean[2];
 	long buildMs;
 
 	GpuTexture fieldTexture, field2Texture, dipTexture, riverTexture, riverDecorTexture, fetchTexture, faceDataTexture, indexTexture;
@@ -68,9 +79,14 @@ final class FoamLevel {
 	/** Per atlas page, the tile table the tile pass reads (see foam_tile.vsh). */
 	final GpuTexture[] tableTextures = new GpuTexture[FoamAtlas.DENSITIES.length];
 	final GpuTextureView[] tableViews = new GpuTextureView[FoamAtlas.DENSITIES.length];
-	FaceTexture faceOutput;
-	final Identifier faceId;
-	MappableRingBuffer ubo, faceUbo;
+	/** The faces, baked into two buffers like the atlas pages. */
+	final FaceTexture[] faceOutputs = new FaceTexture[2];
+	final Identifier[] faceIds = new Identifier[2];
+	/**
+	 * Bake uniforms for tops and faces, a ring for each step's parity: the step being finished and the
+	 * next one can both be baked in one frame, and each ring may turn only once a frame.
+	 */
+	final MappableRingBuffer[] ubo = new MappableRingBuffer[2], faceUbo = new MappableRingBuffer[2];
 
 	/** Tiles a table holds (its first texel is the header). */
 	static final int TABLE = 1023;
@@ -78,17 +94,21 @@ final class FoamLevel {
 	FoamLevel(int index, Spec spec) {
 		this.index = index;
 		this.spec = spec;
-		this.faceId = Identifier.fromNamespaceAndPath("foamingshores", "foam_faces_" + spec.name());
+		for (int b = 0; b < 2; b++) faceIds[b] = Identifier.fromNamespaceAndPath("foamingshores", "foam_faces_" + spec.name() + "_" + b);
 	}
 
-	/** A 16x16 block tile: its blocks with foam, their quads (uv over the tile, 0..1), and where it is baked. */
+	/**
+	 * A 16x16 block tile: its blocks with foam, their quads (uv over the tile, 0..1), and in each atlas
+	 * buffer its page and slot, and whether it has been baked there (a tile out of view keeps its last
+	 * bake until it comes back into view).
+	 */
 	static final class Tile {
 		final int tx, tz;
 		final List<int[]> blocks = new ArrayList<>();
 		final List<FoamRenderer.Quad> quads = new ArrayList<>();
-		/** The page and slot it was last baked into (drawn from), and those it is being baked into. */
-		FoamAtlas.Page page, nextPage;
-		int slot = -1, nextSlot = -1;
+		final FoamAtlas.Page[] pages = new FoamAtlas.Page[2];
+		final int[] slots = {-1, -1};
+		final boolean[] baked = new boolean[2];
 
 		Tile(int tx, int tz) {
 			this.tx = tx;
@@ -146,14 +166,19 @@ final class FoamLevel {
 			spec.tiles(), spec.tiles(), 1, 1);
 		indexView = device.createTextureView(indexTexture);
 		faceDataTexture = device.createTexture(n + "face table", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT,
-			FoamRenderer.FACE_COLS * 2, FoamRenderer.MAX_FACES / FoamRenderer.FACE_COLS, 1, 1);
+			FoamRenderer.FACE_COLS * 2, spec.faceRows(), 1, 1);
 		faceDataView = device.createTextureView(faceDataTexture);
-		GpuTexture faces = device.createTexture(n + "face foam", GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST,
-			GpuFormat.RGBA8_UNORM, FoamRenderer.FACE_TEX_W, FoamRenderer.FACE_TEX_H, 1, 1);
-		faceOutput = new FaceTexture(faces, device.createTextureView(faces));
-		Minecraft.getInstance().getTextureManager().register(faceId, faceOutput);
-		ubo = new MappableRingBuffer(() -> n + "bake UBO", 130, FoamRenderer.UBO_SIZE);
-		faceUbo = new MappableRingBuffer(() -> n + "face bake UBO", 130, FoamRenderer.UBO_SIZE);
+		for (int b = 0; b < 2; b++) {
+			GpuTexture faces = device.createTexture(n + "face foam " + b, GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST,
+				GpuFormat.RGBA8_UNORM, FoamRenderer.FACE_TEX_W, spec.faceTexH(), 1, 1);
+			faceOutputs[b] = new FaceTexture(faces, device.createTextureView(faces));
+			Minecraft.getInstance().getTextureManager().register(faceIds[b], faceOutputs[b]);
+		}
+		for (int b = 0; b < 2; b++) {
+			int bb = b;
+			ubo[b] = new MappableRingBuffer(() -> n + "bake UBO " + bb, 130, FoamRenderer.UBO_SIZE);
+			faceUbo[b] = new MappableRingBuffer(() -> n + "face bake UBO " + bb, 130, FoamRenderer.UBO_SIZE);
+		}
 	}
 
 	/** Uploads a region's fields for the bake. */

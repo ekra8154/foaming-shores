@@ -104,9 +104,13 @@ public final class FoamRenderer {
 			.withTexture("Sampler0", PIXEL_ID)
 			.useLightmap()
 			.createRenderSetup());
-	/** Face texture: tiles of 16 x TILE_H texels, FACE_COLS per row. */
-	static final int FACE_COLS = 128, TILE_H = 80, MAX_FACES = 2048;
-	static final int FACE_TEX_W = FACE_COLS * 16, FACE_TEX_H = (MAX_FACES / FACE_COLS) * TILE_H;
+	/** Face textures: tiles of 16 x TILE_H texels, FACE_COLS per row (rows per level: see FoamLevel.Spec). */
+	static final int FACE_COLS = 128, TILE_H = 80;
+	static final int FACE_TEX_W = FACE_COLS * 16;
+	/** Within this many blocks a tile is baked whichever way the camera faces (it can be underfoot). */
+	private static final double ALWAYS_BAKE = 24;
+	/** Radians past the screen's edge a tile is still baked, so turning shows no stale tiles. */
+	private static final double VIEW_MARGIN = Math.toRadians(25);
 	static final int UBO_SIZE = new Std140SizeCalculator()
 		.putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4().putVec4()
 		.putVec4().putVec4().putVec4().putVec4()
@@ -145,7 +149,14 @@ public final class FoamRenderer {
 	private byte[] noiseBytes;
 	private final Splashes splashes = new Splashes();
 	private final ShoreAudio audio = new ShoreAudio();
-	private long lastBakeStep = Long.MIN_VALUE;
+	/** The atlas and face buffer the world draws from; the other is baked for the next step. */
+	private int front;
+	/** The step the front buffer shows, and the step the back buffer is being baked for (MIN_VALUE: none). */
+	private long shownStep = Long.MIN_VALUE, cycleStep = Long.MIN_VALUE;
+	/** What is left to bake for cycleStep: tiles first, then (tile null) each level's faces. */
+	private final java.util.ArrayDeque<Job> jobs = new java.util.ArrayDeque<>();
+	/** Whether the mod was running at the last tick (turning it off drops everything). */
+	private boolean active = true;
 	/** Client ticks so far, the tick a chunk round the player last arrived, and since when a level has been stale. */
 	private long ticks, chunkArrivedAt = -1000, staleSince = -1;
 	private int playerX, playerZ;
@@ -161,11 +172,15 @@ public final class FoamRenderer {
 	// For the F3 readout: GPU time of the bakes (a ring of timestamp pairs read a few frames late),
 	// the drawing's CPU time per frame, what the last bake did.
 	private GpuQueryPool[] timers;
+	/** Which pools have had their timestamps written (reading one never written is a GL error). */
+	private boolean[] timerWritten;
 	private int timer;
 	private boolean timersFailed;
-	private double bakeGpuMs, submitMs, installMs, farCaptureMs;
+	private double bakeGpuMs, submitMs, installMs, farCaptureMs, pixelsPerTick;
 	private final int[] tilesAt = new int[FoamAtlas.DENSITIES.length];
-	private long pixelsBaked;
+	private int tilesOutOfView;
+	/** Time spent writing the foam's vertices this frame (the geometry is written after submit returns). */
+	private long drawNanos;
 
 	/**
 	 * A quad sampling a baked texture: four corners (x, y, z) with their (u, v), a normal and a
@@ -178,10 +193,14 @@ public final class FoamRenderer {
 	private record Built(FoamLevel level, ShoreRegion region, List<int[]> bandBlocks, long ms) {
 	}
 
+	/** One piece of a step's bake: a tile of a level, or (tile null) the level's faces. */
+	private record Job(FoamLevel level, FoamLevel.Tile tile) {
+	}
+
 	public FoamRenderer() {
 		// Build a made-up shore a few times while the game starts, so the first build in a world runs
 		// compiled code (the first, interpreted builds take several times as long).
-		worker.execute(() -> {
+		if (settings.enabled) worker.execute(() -> {
 			try {
 				ShoreSnapshot snap = ShoreSnapshot.warmUp(96);
 				for (int i = 0; i < 3; i++) bandBlocks(ShoreRegion.build(snap, regionSettings()));
@@ -210,7 +229,23 @@ public final class FoamRenderer {
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
 		audio.settingsChanged();
 		applied = settings.copy();
-		lastBakeStep = Long.MIN_VALUE;
+		resetCycle();
+	}
+
+	/** Bakes the current step afresh at the next tick (after an install, or new settings). */
+	private void resetCycle() {
+		shownStep = cycleStep = Long.MIN_VALUE;
+		jobs.clear();
+	}
+
+	/** The toggle key: turns the whole mod on or off, saying so above the hotbar. */
+	public void toggle(Minecraft mc) {
+		settings.enabled = !settings.enabled;
+		settings.save();
+		if (mc.player != null) {
+			mc.gui.hud.setOverlayMessage(net.minecraft.network.chat.Component.translatable(
+				settings.enabled ? "message.foamingshores.enabled" : "message.foamingshores.disabled"), false);
+		}
 	}
 
 	/**
@@ -218,7 +253,7 @@ public final class FoamRenderer {
 	 * later so a burst of changes (an explosion, a fill) costs one rebuild; the far level later still.
 	 */
 	public void blockChanged(ClientLevel lvl, BlockPos pos) {
-		if (lvl != level) return;
+		if (lvl != level || !settings.enabled) return;
 		long now = lvl.getGameTime();
 		if (inside(near.region, pos)) nearAt = Math.min(nearAt, now + 5);
 		if (inside(far.region, pos) && farAt == Long.MAX_VALUE) farAt = now + 40;
@@ -231,7 +266,7 @@ public final class FoamRenderer {
 
 	/** A chunk a level (current or being built) had to treat as open water has arrived: rebuild with it. */
 	public void chunkLoaded(ClientLevel lvl, ChunkPos pos) {
-		if (lvl != level) return;
+		if (lvl != level || !settings.enabled) return;
 		long key = pos.pack();
 		if (near.missing.contains(key) || near.buildingMissing.contains(key)) wantNear = true;
 		if (far.missing.contains(key) || far.buildingMissing.contains(key)) wantFar = true;
@@ -241,6 +276,25 @@ public final class FoamRenderer {
 
 	public void tick(Minecraft mc) {
 		ClientLevel lvl = mc.level;
+		if (!settings.enabled) {
+			// Off: drop everything once (the sound stops at this tick), then do nothing at all.
+			if (active) {
+				active = false;
+				for (FoamLevel l : levels) clearLevel(l);
+				building = null;
+				pendingFar = null;
+				farCapture = null;
+				resetCycle();
+				splashes.clear();
+				audio.clear();
+				audio.tick(mc, lvl == null ? 0 : lvl.getGameTime() / 20.0);
+			}
+			return;
+		}
+		if (!active) {
+			active = true;
+			lastFarStart = -1000;
+		}
 		if (lvl != level) {
 			level = lvl;
 			RiverMemory old = rivers;
@@ -251,6 +305,7 @@ public final class FoamRenderer {
 			pendingFar = null;
 			farCapture = null;
 			lastFarStart = -1000;
+			resetCycle();
 			splashes.clear();
 			audio.clear();
 		}
@@ -342,15 +397,7 @@ public final class FoamRenderer {
 			splashes.tick(now, recent, settings);
 		}
 
-		// The animation moves in steps of `ticks` game ticks (vanilla water uses 2).
-		int every = Math.max(1, settings.ticks);
-		long step = lvl.getGameTime() / every;
-		// Several ticks can run in one frame (catching up after a join or a hitch); bake once per frame.
-		if ((near.region != null || far.region != null) && step != lastBakeStep && frames != lastBakeFrame) {
-			lastBakeStep = step;
-			lastBakeFrame = frames;
-			bake(mc, step * every);
-		}
+		bakeTick(mc, lvl);
 	}
 
 	/** Whether the player has left a level's window, so it needs laying again. */
@@ -486,10 +533,12 @@ public final class FoamRenderer {
 	}
 
 	private static void freeSlots(FoamLevel.Tile t) {
-		if (t.page != null) t.page.free(t.slot);
-		if (t.nextPage != null) t.nextPage.free(t.nextSlot);
-		t.page = t.nextPage = null;
-		t.slot = t.nextSlot = -1;
+		for (int b = 0; b < 2; b++) {
+			if (t.pages[b] != null) t.pages[b].free(b, t.slots[b]);
+			t.pages[b] = null;
+			t.slots[b] = -1;
+			t.baked[b] = false;
+		}
 	}
 
 	/** Puts a built level in place: its fields on the GPU, its tiles and their quads. */
@@ -512,10 +561,11 @@ public final class FoamRenderer {
 			// A tile drawn before keeps its last bake until it is baked again (the next bake).
 			FoamLevel.Tile was = old.remove(e.getKey());
 			if (was != null) {
-				t.page = was.page;
-				t.slot = was.slot;
-				t.nextPage = was.nextPage;
-				t.nextSlot = was.nextSlot;
+				for (int b = 0; b < 2; b++) {
+					t.pages[b] = was.pages[b];
+					t.slots[b] = was.slots[b];
+					t.baked[b] = was.baked[b];
+				}
 			}
 			for (int[] b : t.blocks) {
 				Quad q = topQuad(lvl, r, b[0], b[1], t, pos);
@@ -523,7 +573,7 @@ public final class FoamRenderer {
 			}
 		}
 		for (FoamLevel.Tile t : old.values()) freeSlots(t);
-		lastBakeStep = Long.MIN_VALUE;
+		resetCycle();
 	}
 
 	/** The quad over a shore block's top, uv over its tile; null for blocks whose tops get no foam. */
@@ -579,6 +629,7 @@ public final class FoamRenderer {
 			}
 			int ptx = Math.floorDiv(playerX, FoamLevel.TILE), ptz = Math.floorDiv(playerZ, FoamLevel.TILE);
 			l.drawn.sort(Comparator.comparingInt(t -> Math.max(Math.abs(t.tx - ptx), Math.abs(t.tz - ptz))));
+			l.faceBaked[0] = l.faceBaked[1] = false;
 			if (l.region == null) continue;
 			List<int[]> band = new ArrayList<>();
 			for (FoamLevel.Tile t : l.drawn) band.addAll(t.blocks);
@@ -602,18 +653,19 @@ public final class FoamRenderer {
 		List<Splashes.Foot> feet = new ArrayList<>();
 		// For the sound: each wall and drop face as (edge texel x, z, step x, z, out x, z, top in texels).
 		List<int[]> wallRows = new ArrayList<>(), dropRows = new ArrayList<>();
-		ByteBuffer data = MemoryUtil.memAlloc(FACE_COLS * 2 * (MAX_FACES / FACE_COLS) * 16);
+		int maxFaces = l.spec.maxFaces(), texH = l.spec.faceTexH();
+		ByteBuffer data = MemoryUtil.memAlloc(FACE_COLS * 2 * l.spec.faceRows() * 16);
 		try {
 			MemoryUtil.memSet(data, 0);
 			BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 			int n = 0;
 			for (int[] b : band) {
-				if (n >= MAX_FACES) break;
+				if (n >= maxFaces) break;
 				int bx = b[0], bz = b[1], bi = bz * r.size + bx;
 				boolean water = isWaterColumn(r, bi);
 				if ((!water && r.level[bi] > 0) || r.low[bi]) continue;
 				float top = water ? r.waterY + 8f / 9f : r.topY[bi] + 1;
-				for (int dir = 0; dir < 4 && n < MAX_FACES; dir++) {
+				for (int dir = 0; dir < 4 && n < maxFaces; dir++) {
 					int dx = dir == 2 ? -1 : dir == 3 ? 1 : 0, dz = dir == 0 ? -1 : dir == 1 ? 1 : 0;
 					int nx = bx + dx, nz = bz + dz;
 					if (nx < 0 || nz < 0 || nx >= r.size || nz >= r.size) continue;
@@ -664,7 +716,7 @@ public final class FoamRenderer {
 					float nudge = kind == 2 ? -SIDE_NUDGE : SIDE_NUDGE;
 					float yBot = yTop - h / 16f;
 					float u0 = col * 16f / FACE_TEX_W, u1 = (col + 1) * 16f / FACE_TEX_W;
-					float vT = row * (float) TILE_H / FACE_TEX_H, vB = (row * TILE_H + h) / (float) FACE_TEX_H;
+					float vT = row * (float) TILE_H / texH, vB = (row * TILE_H + h) / (float) texH;
 					// A wall rising out of the water, or a waterfall, starts where vanilla's surface meets
 					// this side, which slopes where the water flows: the two surface corners on this side,
 					// at its west/north end (a) and its east/south end (b).
@@ -692,7 +744,7 @@ public final class FoamRenderer {
 				}
 			}
 			data.position(0);
-			RenderSystem.getDevice().createCommandEncoder().writeToTexture(l.faceDataTexture, data, 0, 0, 0, 0, FACE_COLS * 2, MAX_FACES / FACE_COLS);
+			RenderSystem.getDevice().createCommandEncoder().writeToTexture(l.faceDataTexture, data, 0, 0, 0, 0, FACE_COLS * 2, l.spec.faceRows());
 			l.faceCount = n;
 			l.faceQuads = qs;
 			if (l == near) {
@@ -739,6 +791,7 @@ public final class FoamRenderer {
 		Minecraft.getInstance().getTextureManager().register(PIXEL_ID, pixel);
 		try {
 			timers = new GpuQueryPool[3];
+			timerWritten = new boolean[timers.length];
 			for (int i = 0; i < timers.length; i++) timers[i] = device.createTimestampQueryPool(2);
 		} catch (RuntimeException e) {
 			timersFailed = true;
@@ -777,8 +830,14 @@ public final class FoamRenderer {
 		return want;
 	}
 
-	/** Bakes every drawn tile and face of both levels at the given game tick. */
-	private void bake(Minecraft mc, long tick) {
+	/**
+	 * Each tick: when a new step is due, finish its bake (normally done already) and show it by
+	 * swapping buffers; then bake a share of the next step into the other buffer, so that each tick
+	 * of the step carries about the same load instead of one frame carrying all of it.
+	 */
+	private void bakeTick(Minecraft mc, ClientLevel lvl) {
+		// Several ticks can run in one frame (catching up after a join or a hitch); bake once per frame.
+		if ((near.region == null && far.region == null) || frames == lastBakeFrame) return;
 		CompiledRenderPipeline tilesPipeline = bakeFailed ? null : RenderSystem.getCompiledPipelineNullable(FoamPipelines.BAKE_TILES);
 		CompiledRenderPipeline facesPipeline = bakeFailed ? null : RenderSystem.getCompiledPipelineNullable(FoamPipelines.BAKE);
 		if (tilesPipeline == null || facesPipeline == null) {
@@ -786,60 +845,137 @@ public final class FoamRenderer {
 			bakeFailed = true;
 			return;
 		}
+		lastBakeFrame = frames;
 		GpuDevice device = RenderSystem.getDevice();
 		ensureShared(device);
+		WaterSprites water = waterSprites();
+		// The animation moves in steps of `ticks` game ticks (vanilla water uses 2).
+		int every = Math.max(1, settings.ticks);
+		long gt = lvl.getGameTime(), step = gt / every;
+		CommandEncoder encoder = device.createCommandEncoder();
+		GpuQueryPool pool = timers != null && !timersFailed ? timers[timer] : null;
+		if (pool != null) {
+			if (timerWritten[timer]) readTimer(pool);
+			encoder.writeTimestamp(pool, 0);
+		}
+		long pixels = 0;
+		if (shownStep != step) {
+			// This step is due: the back buffer must hold it (whatever is left of it is baked now).
+			if (cycleStep != step) plan(mc, step);
+			pixels += runJobs(encoder, Integer.MAX_VALUE, step, every, water, tilesPipeline, facesPipeline);
+			front ^= 1;
+			shownStep = step;
+		}
+		if (cycleStep != step + 1) plan(mc, step + 1);
+		long ticksLeft = Math.max(1, (step + 1) * every - gt);
+		int share = (int) Math.ceil(jobs.size() / (double) ticksLeft);
+		pixels += runJobs(encoder, share, step + 1, every, water, tilesPipeline, facesPipeline);
+		if (pool != null) {
+			encoder.writeTimestamp(pool, 1);
+			timerWritten[timer] = true;
+			timer = (timer + 1) % timers.length;
+		}
+		pixelsPerTick = pixelsPerTick * 0.9 + pixels * 0.1;
+	}
+
+	/**
+	 * Lines up the bake of step {@code s} into the back buffer: every drawn tile in view (or close by)
+	 * at the density its distance needs, in a slot of that page, then each level's faces.
+	 */
+	private void plan(Minecraft mc, long s) {
+		jobs.clear();
+		cycleStep = s;
+		int back = front ^ 1;
+		var camera = mc.gameRenderer.mainCamera();
+		Vec3 eye = camera.position();
+		double yaw = Math.toRadians(camera.yRot()), lookX = -Math.sin(yaw), lookZ = Math.cos(yaw);
+		boolean steep = Math.abs(camera.xRot()) > 60;
+		double fov = Math.toRadians(mc.options.fov().get());
+		double aspect = mc.getWindow().getWidth() / (double) Math.max(1, mc.getWindow().getHeight());
+		double halfWidth = Math.atan(Math.tan(fov / 2) * aspect) + VIEW_MARGIN;
+		double pixelsAtOne = mc.getWindow().getHeight() / (2 * Math.tan(fov / 2));
+		java.util.Arrays.fill(tilesAt, 0);
+		tilesOutOfView = 0;
+		for (FoamLevel l : levels) {
+			if (l.region == null) continue;
+			for (FoamLevel.Tile t : l.drawn) {
+				if (!inView(t, eye, lookX, lookZ, halfWidth, steep)) {
+					tilesOutOfView++;
+					continue;
+				}
+				int current = t.pages[front] != null ? t.pages[front].index : -1;
+				int want = pageFor(t, current, eye.x, eye.y, eye.z, l.region.waterY + 1, pixelsAtOne);
+				if (t.pages[back] == null || t.pages[back].index != want) {
+					if (t.pages[back] != null) t.pages[back].free(back, t.slots[back]);
+					t.pages[back] = null;
+					t.slots[back] = -1;
+					t.baked[back] = false;
+					for (int p = want; p < FoamAtlas.DENSITIES.length && t.pages[back] == null; p++) {
+						int slot = atlas.pages[p].alloc(back);
+						if (slot >= 0) {
+							t.pages[back] = atlas.pages[p];
+							t.slots[back] = slot;
+						}
+					}
+				}
+				if (t.pages[back] == null) continue;
+				jobs.add(new Job(l, t));
+				tilesAt[t.pages[back].index]++;
+			}
+		}
+		for (FoamLevel l : levels) if (l.region != null && l.faceCount > 0) jobs.add(new Job(l, null));
+	}
+
+	/**
+	 * Whether a tile can be on screen soon: close by, or within the screen's width (and a margin) of
+	 * where the camera looks. Looking steeply down, everything near enough to see.
+	 */
+	private static boolean inView(FoamLevel.Tile t, Vec3 eye, double lookX, double lookZ, double halfWidth, boolean steep) {
+		double cx = t.tx * FoamLevel.TILE + FoamLevel.TILE / 2.0 - eye.x, cz = t.tz * FoamLevel.TILE + FoamLevel.TILE / 2.0 - eye.z;
+		double d = Math.sqrt(cx * cx + cz * cz);
+		if (d < ALWAYS_BAKE || (steep && d < 64)) return true;
+		double cos = (cx * lookX + cz * lookZ) / d;
+		double off = Math.acos(Math.max(-1, Math.min(1, cos))), radius = Math.asin(Math.min(1, FoamLevel.TILE * 0.71 / d));
+		return off <= halfWidth + radius;
+	}
+
+	/**
+	 * Bakes up to {@code max} jobs of step {@code s} into the back buffer (the faces only once every
+	 * tile before them is done); returns the pixels baked.
+	 */
+	private long runJobs(CommandEncoder encoder, int max, long s, int every, WaterSprites water,
+		CompiledRenderPipeline tilesPipeline, CompiledRenderPipeline facesPipeline) {
+		if (max <= 0 || jobs.isEmpty() || s != cycleStep) return 0;
+		int back = front ^ 1, parity = (int) (s & 1);
+		long tick = s * every;
 		// Keep times small for float precision: seconds since a recent round epoch.
 		long epochTicks = (tick / 24000) * 24000;
 		double now = tick / 20.0, epoch = epochTicks / 20.0;
 		List<WaveSchedule.Wave> waves = WaveSchedule.recent(now, settings, MAX_WAVES);
-		WaterSprites water = waterSprites();
-
-		// Each tile's density, and a slot for it where that changed.
-		Vec3 eye = mc.player.getEyePosition();
-		double fov = Math.toRadians(mc.options.fov().get());
-		double pixelsAtOne = mc.getWindow().getHeight() / (2 * Math.tan(fov / 2));
-		java.util.Arrays.fill(tilesAt, 0);
-		for (FoamLevel l : levels) {
-			if (l.region == null) continue;
-			for (FoamLevel.Tile t : l.drawn) {
-				int current = t.page != null ? t.page.index : -1;
-				int want = pageFor(t, current, eye.x, eye.y, eye.z, l.region.waterY + 1, pixelsAtOne);
-				if (t.nextPage == null && current != want) {
-					for (int p = want; p < FoamAtlas.DENSITIES.length && t.nextPage == null; p++) {
-						int slot = atlas.pages[p].alloc();
-						if (slot >= 0) {
-							t.nextPage = atlas.pages[p];
-							t.nextSlot = slot;
-						}
-					}
-				}
-				FoamAtlas.Page target = t.nextPage != null ? t.nextPage : t.page;
-				if (target != null) tilesAt[target.index]++;
-			}
-		}
-
-		CommandEncoder encoder = device.createCommandEncoder();
-		GpuQueryPool pool = timers != null && !timersFailed ? timers[timer] : null;
-		if (pool != null) {
-			readTimer(pool);
-			encoder.writeTimestamp(pool, 0);
+		Map<FoamLevel, List<FoamLevel.Tile>> tiles = new HashMap<>();
+		List<FoamLevel> faces = new ArrayList<>();
+		for (int i = 0; i < max && !jobs.isEmpty(); i++) {
+			Job j = jobs.poll();
+			if (j.tile() != null) tiles.computeIfAbsent(j.level(), k -> new ArrayList<>()).add(j.tile());
+			else faces.add(j.level());
 		}
 		long pixels = 0;
 		GpuSampler nearest = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST);
 		for (FoamLevel l : levels) {
-			if (l.region == null) continue;
-			writeUbo(l, l.ubo, waves, now, epoch, 0, water);
-			if (l.faceCount > 0) writeUbo(l, l.faceUbo, waves, now, epoch, 1, water);
+			List<FoamLevel.Tile> mine = tiles.get(l);
+			if (mine == null || l.region == null) continue;
+			MappableRingBuffer ubo = l.ubo[parity];
+			writeUbo(l, ubo, waves, now, epoch, 0, water);
 			// The tile tables, a page at a time.
 			for (FoamAtlas.Page page : atlas.pages) {
 				List<FoamLevel.Tile> onPage = new ArrayList<>();
-				for (FoamLevel.Tile t : l.drawn) if ((t.nextPage != null ? t.nextPage : t.page) == page && onPage.size() < FoamLevel.TABLE) onPage.add(t);
+				for (FoamLevel.Tile t : mine) if (t.pages[back] == page && onPage.size() < FoamLevel.TABLE) onPage.add(t);
 				if (onPage.isEmpty()) continue;
 				ByteBuffer table = MemoryUtil.memCalloc((FoamLevel.TABLE + 1) * 16);
 				try {
 					table.putFloat(FoamAtlas.PAGE).putFloat(page.slotPx).putFloat(l.region.size * 16).putFloat(0);
 					for (FoamLevel.Tile t : onPage) {
-						int slot = t.nextPage != null ? t.nextSlot : t.slot;
+						int slot = t.slots[back];
 						table.putFloat(page.slotX(slot)).putFloat(page.slotY(slot))
 							.putFloat((t.tx * FoamLevel.TILE - l.region.originX) * 16f).putFloat((t.tz * FoamLevel.TILE - l.region.originZ) * 16f);
 					}
@@ -848,56 +984,46 @@ public final class FoamRenderer {
 				} finally {
 					MemoryUtil.memFree(table);
 				}
-				try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores bake " + l.spec.name() + " at " + page.density, page.view, Optional.empty())) {
+				try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores bake " + l.spec.name() + " at " + page.density, page.views[back], Optional.empty())) {
 					pass.setPipeline(tilesPipeline);
-					bindLevel(pass, l, l.ubo, l.tableViews[page.index], water, nearest, false);
+					bindLevel(pass, l, ubo, l.tableViews[page.index], water, nearest, -1);
 					pass.draw(6 * onPage.size(), 1, 0, 0);
 				}
+				for (FoamLevel.Tile t : onPage) t.baked[back] = true;
 				pixels += (long) onPage.size() * page.slotPx * page.slotPx;
 			}
-			if (l.faceCount > 0) {
-				writeTileIndex(encoder, l);
-				try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores face bake " + l.spec.name(), l.faceOutput.getTextureView(), Optional.empty())) {
-					pass.setPipeline(facesPipeline);
-					bindLevel(pass, l, l.faceUbo, l.indexView, water, nearest, true);
-					pass.draw(3, 1, 0, 0);
-				}
-				l.faceUbo.rotate();
+			ubo.rotate();
+		}
+		for (FoamLevel l : faces) {
+			if (l.region == null || l.faceCount == 0) continue;
+			MappableRingBuffer ubo = l.faceUbo[parity];
+			writeUbo(l, ubo, waves, now, epoch, 1, water);
+			writeTileIndex(encoder, l, back);
+			try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores face bake " + l.spec.name(), l.faceOutputs[back].getTextureView(), Optional.empty())) {
+				pass.setPipeline(facesPipeline);
+				bindLevel(pass, l, ubo, l.indexView, water, nearest, back);
+				pass.draw(3, 1, 0, 0);
 			}
-			l.ubo.rotate();
+			ubo.rotate();
+			l.faceBaked[back] = true;
 		}
-		if (pool != null) {
-			encoder.writeTimestamp(pool, 1);
-			timer = (timer + 1) % timers.length;
-		}
-		pixelsBaked = pixels;
-		// Baked: tiles that moved draw from their new slots now.
-		for (FoamLevel l : levels) {
-			for (FoamLevel.Tile t : l.drawn) {
-				if (t.nextPage == null) continue;
-				if (t.page != null) t.page.free(t.slot);
-				t.page = t.nextPage;
-				t.slot = t.nextSlot;
-				t.nextPage = null;
-				t.nextSlot = -1;
-			}
-		}
+		return pixels;
 	}
 
 	private void readTimer(GpuQueryPool pool) {
 		OptionalLong[] v = pool.getValues(0, 2);
 		if (v[0].isPresent() && v[1].isPresent()) {
 			double ms = (v[1].getAsLong() - v[0].getAsLong()) * RenderSystem.getDevice().getDeviceInfo().timestampPeriod() / 1e6;
-			bakeGpuMs = bakeGpuMs * 0.9 + ms * 0.1;
+			bakeGpuMs = bakeGpuMs * 0.95 + ms * 0.05;
 		}
 	}
 
 	/**
 	 * A level's textures for a bake pass; {@code table} goes to TileSampler (the tile table in the tile
-	 * passes, the tile index in the face pass). Only the face pass reads the atlas pages: a tile pass
-	 * draws into one, so there they are bound to something else.
+	 * passes, the tile index in the face pass). Only the face pass reads the atlas pages (of buffer
+	 * {@code pages}, -1 for none): a tile pass draws into one, so there they are bound to something else.
 	 */
-	private void bindLevel(RenderPass pass, FoamLevel l, MappableRingBuffer ubo, GpuTextureView table, WaterSprites water, GpuSampler nearest, boolean pages) {
+	private void bindLevel(RenderPass pass, FoamLevel l, MappableRingBuffer ubo, GpuTextureView table, WaterSprites water, GpuSampler nearest, int pages) {
 		pass.setUniform("FoamBake", ubo.currentBuffer());
 		pass.setUniform("FieldSampler", l.fieldView, nearest);
 		pass.setUniform("Field2Sampler", l.field2View, nearest);
@@ -910,17 +1036,17 @@ public final class FoamRenderer {
 		pass.setUniform("AtlasSampler", water.atlas(), nearest);
 		pass.setUniform("TileSampler", table, nearest);
 		for (int i = 0; i < FoamAtlas.DENSITIES.length; i++)
-			pass.setUniform("Page" + FoamAtlas.DENSITIES[i] + "Sampler", pages ? atlas.pages[i].view : noiseView, nearest);
+			pass.setUniform("Page" + FoamAtlas.DENSITIES[i] + "Sampler", pages >= 0 ? atlas.pages[i].views[pages] : noiseView, nearest);
 	}
 
-	/** Where each of a level's tiles is being baked this time (page 1..3, slot corner), 0 for none. */
-	private static void writeTileIndex(CommandEncoder encoder, FoamLevel l) {
+	/** Where each of a level's tiles is baked in buffer {@code b} (page 1..3, slot corner), 0 for none. */
+	private static void writeTileIndex(CommandEncoder encoder, FoamLevel l, int b) {
 		int n = l.spec.tiles(), ox = l.region.originX / FoamLevel.TILE, oz = l.region.originZ / FoamLevel.TILE;
 		ByteBuffer index = MemoryUtil.memCalloc(n * n * 16);
 		try {
 			for (FoamLevel.Tile t : l.drawn) {
-				FoamAtlas.Page page = t.nextPage != null ? t.nextPage : t.page;
-				int slot = t.nextPage != null ? t.nextSlot : t.slot, i = t.tx - ox, j = t.tz - oz;
+				FoamAtlas.Page page = t.baked[b] ? t.pages[b] : null;
+				int slot = t.slots[b], i = t.tx - ox, j = t.tz - oz;
 				if (page == null || i < 0 || j < 0 || i >= n || j >= n) continue;
 				index.position((j * n + i) * 16);
 				index.putFloat(page.index + 1).putFloat(page.slotX(slot)).putFloat(page.slotY(slot)).putFloat(0);
@@ -982,7 +1108,7 @@ public final class FoamRenderer {
 				.putVec4(s.backwash, s.foamTint, s.soak, s.puddleSpread)
 				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1)
 				.putVec4(s.spill, s.fallFade, s.splashHeight, s.pile)
-				.putVec4(mode, l.faceCount, FACE_TEX_W, FACE_TEX_H)
+				.putVec4(mode, l.faceCount, FACE_TEX_W, l.spec.faceTexH())
 				.putVec4(water.stillX, water.stillY, water.flowX, water.flowY)
 				.putVec4(s.straight, s.peel, s.peelScale, s.waveVary)
 				.putVec4(s.travelFade * 16, s.wrap, s.wrapLag * 16, goneAt);
@@ -1025,8 +1151,12 @@ public final class FoamRenderer {
 
 	public void submit(LevelRenderContext context) {
 		frames++;
-		if (atlas == null || bakeFailed) return;
+		// What writing last frame's vertices cost (it happens after this method returns).
+		submitMs = submitMs * 0.95 + drawNanos / 1e6 * 0.05;
+		drawNanos = 0;
+		if (atlas == null || bakeFailed || !settings.enabled) return;
 		long t0 = System.nanoTime();
+		int show = front;
 		Vec3 cam = context.levelState().cameraRenderState.pos;
 		PoseStack poseStack = context.poseStack();
 		poseStack.pushPose();
@@ -1038,25 +1168,29 @@ public final class FoamRenderer {
 			List<FoamLevel.Tile> tiles = new ArrayList<>();
 			for (FoamLevel l : levels) {
 				for (FoamLevel.Tile t : l.drawn) {
-					if (t.page != page || t.quads.isEmpty()) continue;
+					if (t.pages[show] != page || !t.baked[show] || t.quads.isEmpty()) continue;
 					tiles.add(t);
-					slots.add(new int[] {page.slotX(t.slot), page.slotY(t.slot)});
+					slots.add(new int[] {page.slotX(t.slots[show]), page.slotY(t.slots[show])});
 				}
 			}
 			if (tiles.isEmpty()) continue;
 			float scale = page.slotPx / (float) FoamAtlas.PAGE, inv = 1f / FoamAtlas.PAGE;
-			context.submitNodeCollector().submitCustomGeometry(poseStack, FoamPipelines.surface(page.id), (pose, buffer) -> {
+			context.submitNodeCollector().submitCustomGeometry(poseStack, FoamPipelines.surface(page.ids[show]), (pose, buffer) -> {
+				long d0 = System.nanoTime();
 				for (int i = 0; i < tiles.size(); i++) {
 					float ou = slots.get(i)[0] * inv, ov = slots.get(i)[1] * inv;
 					for (Quad q : tiles.get(i).quads) emit(buffer, pose, q, cam, ou, ov, scale);
 				}
+				drawNanos += System.nanoTime() - d0;
 			});
 		}
 		for (FoamLevel l : levels) {
-			if (!l.faceQuads.isEmpty() && l.faceOutput != null) {
+			if (!l.faceQuads.isEmpty() && l.faceOutputs[show] != null && l.faceBaked[show]) {
 				List<Quad> qs = l.faceQuads;
-				context.submitNodeCollector().submitCustomGeometry(poseStack, FoamPipelines.surface(l.faceId), (pose, buffer) -> {
+				context.submitNodeCollector().submitCustomGeometry(poseStack, FoamPipelines.surface(l.faceIds[show]), (pose, buffer) -> {
+					long d0 = System.nanoTime();
 					for (Quad q : qs) emit(buffer, pose, q, cam, 0, 0, 1);
+					drawNanos += System.nanoTime() - d0;
 				});
 			}
 		}
@@ -1071,7 +1205,7 @@ public final class FoamRenderer {
 				(pose, buffer) -> splashes.render(pose, buffer, lvl, camState.orientation, camState.cameraEntityPartialTicks, foam));
 		}
 		poseStack.popPose();
-		submitMs = submitMs * 0.95 + (System.nanoTime() - t0) / 1e6 * 0.05;
+		drawNanos += System.nanoTime() - t0;
 	}
 
 	/**
@@ -1110,9 +1244,13 @@ public final class FoamRenderer {
 			lv.append(String.format(" %s %d@%d %d ms (%d tiles, %d faces)", l.spec.name(), l.spec.size(), l.spec.res(), l.buildMs, l.drawn.size(), l.faceCount));
 		}
 		out.add(lv.toString());
-		out.add(String.format("FS bake: tiles %d/%d/%d at 16/8/4, %.2f Mpx, GPU %s; draw %.2f ms/frame; install %.0f ms, far read %.0f ms",
-			tilesAt[0], tilesAt[1], tilesAt[2], pixelsBaked / 1e6, timersFailed || timers == null ? "n/a" : String.format("%.2f ms", bakeGpuMs),
+		out.add(String.format("FS bake: tiles %d/%d/%d at 16/8/4 (%d out of view), %.2f Mpx/tick, GPU %s/tick; draw %.2f ms/frame; install %.0f ms, far read %.0f ms",
+			tilesAt[0], tilesAt[1], tilesAt[2], tilesOutOfView, pixelsPerTick / 1e6, timersFailed || timers == null ? "n/a" : String.format("%.2f ms", bakeGpuMs),
 			submitMs, installMs, farCaptureMs));
+		ShoreRegion nr = near.region;
+		if (nr != null && nr.phaseMs != null) {
+			out.add(String.format("FS near build: fields %d, rivers %d (decor %d), conform %d ms", nr.phaseMs[0], nr.phaseMs[1], nr.phaseMs[2], nr.phaseMs[3]));
+		}
 		return out;
 	}
 }
