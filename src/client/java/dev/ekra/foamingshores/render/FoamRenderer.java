@@ -88,7 +88,9 @@ public final class FoamRenderer {
 	 * Ticks between far rebuilds for chunks arriving at its edge or blocks changing in it (chunks keep
 	 * arriving there as the player travels); moving out of its window rebuilds it at once.
 	 */
-	private static final int FAR_COOLDOWN = 60;
+	private static final int FAR_COOLDOWN = 200;
+	/** Ticks between rebuilds of the near and the far level for the player moving on. */
+	private static final int NEAR_MOVE_COOLDOWN = 60, FAR_MOVE_COOLDOWN = 80;
 	/** Nanoseconds of world reading per tick for the far level's snapshot. */
 	private static final long FAR_CAPTURE_BUDGET = 3_000_000;
 	/** A single white texel: droplets and flecks are coloured per vertex. */
@@ -107,6 +109,8 @@ public final class FoamRenderer {
 	/** Face textures: tiles of 16 x TILE_H texels, FACE_COLS per row (rows per level: see FoamLevel.Spec). */
 	static final int FACE_COLS = 128, TILE_H = 80;
 	static final int FACE_TEX_W = FACE_COLS * 16;
+	/** Ticks a tile takes to dissolve in after it is first shown. */
+	private static final int FADE_TICKS = 20;
 	/** Within this many blocks a tile is baked whichever way the camera faces (it can be underfoot). */
 	private static final double ALWAYS_BAKE = 24;
 	/** Radians past the screen's edge a tile is still baked, so turning shows no stale tiles. */
@@ -129,6 +133,10 @@ public final class FoamRenderer {
 	/** The settings as of the last apply, to tell what a save changed. */
 	private FoamSettings applied = settings.copy();
 	private boolean noiseDirty, wantNear, wantFar;
+	/** Whether new chunks arrived close to the near level (a far rebuild for them then builds the near level again too). */
+	private boolean farNeedsNear;
+	/** Whether the far level being built must have the near level built inside it before both go in. */
+	private boolean farChainsNear, farSettings;
 	/** Game time at which a block-change rebuild of each level is due, or MAX_VALUE for none. */
 	private long nearAt = Long.MAX_VALUE, farAt = Long.MAX_VALUE;
 
@@ -140,7 +148,7 @@ public final class FoamRenderer {
 	private Built pendingFar;
 	/** The far level's snapshot while it is being read, a few rows a tick. */
 	private ShoreSnapshot.Capture farCapture;
-	private long farCaptureNanos, lastFarStart = -1000;
+	private long farCaptureNanos, lastFarStart = -1000, lastNearStart = -1000;
 
 	private FoamAtlas atlas;
 	private GpuTexture noiseTexture;
@@ -158,6 +166,11 @@ public final class FoamRenderer {
 	private final java.util.ArrayDeque<Job> jobs = new java.util.ArrayDeque<>();
 	/** Whether the mod was running at the last tick (turning it off drops everything). */
 	private boolean active = true;
+	/**
+	 * The tick each world tile was first baked by either level, while some level draws it: it fades
+	 * in from then (a tile going over from one level to the other keeps its time and does not fade).
+	 */
+	private final Map<Long, Long> shownSince = new HashMap<>();
 	/** Client ticks so far, the tick a chunk round the player last arrived, and since when a level has been stale. */
 	private long ticks, chunkArrivedAt = -1000, staleSince = -1;
 	private int playerX, playerZ;
@@ -192,7 +205,17 @@ public final class FoamRenderer {
 	record Quad(float[] xyz, float[] uv, float nx, float ny, float nz, int light) {
 	}
 
-	private record Built(FoamLevel level, ShoreRegion region, List<int[]> bandBlocks, long ms) {
+	private record Built(FoamLevel level, ShoreRegion region, List<int[]> bandBlocks, long ms, FoamLevel.Uploads uploads) {
+	}
+
+	/** Drops the build in progress (and a far level waiting for its near one), freeing their packed fields. */
+	private void dropBuilds() {
+		if (building != null) building.thenAccept(b -> {
+			if (b != null) b.uploads().free();
+		});
+		building = null;
+		if (pendingFar != null) pendingFar.uploads().free();
+		pendingFar = null;
 	}
 
 	/** One piece of a step's bake: a tile of a level, or (tile null) the level's faces. */
@@ -226,11 +249,32 @@ public final class FoamRenderer {
 			"riverSpeed", "riverRock", "riverWake", "riverTrail", "backwater", "straight")) {
 			wantNear = true; // rebuilt on the next ticks, keeping the current ones until then
 			wantFar = true;
+			farSettings = true;
 			lastFarStart = -1000;
 		}
 		if (settings.differs(applied, "jagScale", "laceCell")) noiseDirty = true;
 		audio.settingsChanged();
 		applied = settings.copy();
+		resetCycle();
+	}
+
+	/** The detail the levels are shaped for. */
+	private int appliedQuality = -1;
+
+	/**
+	 * Shapes the levels for the Detail setting (Light: the near level alone, smaller, fading at its
+	 * edge; Balanced: a smaller far level; Full), dropping what was built so it is built again.
+	 */
+	private void applyQuality() {
+		int q = Math.max(0, Math.min(2, settings.quality));
+		if (q == appliedQuality) return;
+		appliedQuality = q;
+		near.spec = q == 0 ? FoamLevel.NEAR_LIGHT : FoamLevel.NEAR;
+		far.spec = q == 2 ? FoamLevel.FAR : FoamLevel.FAR_BALANCED;
+		for (FoamLevel l : levels) clearLevel(l);
+		dropBuilds();
+		farCapture = null;
+		lastFarStart = -1000;
 		resetCycle();
 	}
 
@@ -261,6 +305,12 @@ public final class FoamRenderer {
 		if (inside(far.region, pos) && farAt == Long.MAX_VALUE) farAt = now + 40;
 	}
 
+	/** Whether a chunk lies within {@code margin} blocks of a region. */
+	private static boolean closeTo(ShoreRegion r, ChunkPos pos, int margin) {
+		int x0 = pos.x() * 16, z0 = pos.z() * 16;
+		return x0 + 16 > r.originX - margin && z0 + 16 > r.originZ - margin && x0 < r.originX + r.size + margin && z0 < r.originZ + r.size + margin;
+	}
+
 	private static boolean inside(ShoreRegion r, BlockPos pos) {
 		if (r == null || Math.abs(pos.getY() - r.waterY) > 6) return false;
 		return pos.getX() >= r.originX && pos.getZ() >= r.originZ && pos.getX() < r.originX + r.size && pos.getZ() < r.originZ + r.size;
@@ -271,7 +321,14 @@ public final class FoamRenderer {
 		if (lvl != level || !settings.enabled) return;
 		long key = pos.pack();
 		if (near.missing.contains(key) || near.buildingMissing.contains(key)) wantNear = true;
-		if (far.missing.contains(key) || far.buildingMissing.contains(key)) wantFar = true;
+		if (far.missing.contains(key) || far.buildingMissing.contains(key)) {
+			// Only chunks the far level draws (its outer ring is never drawn), and the near level is only
+			// built again with it when the new land lies close to it.
+			if (far.region == null || far.covers(pos.x(), pos.z())) {
+				wantFar = true;
+				if (near.region == null || closeTo(near.region, pos, 48)) farNeedsNear = true;
+			}
+		}
 		int reach = FoamLevel.NEAR.size();
 		if (Math.abs(pos.getMiddleBlockX() - playerX) <= reach && Math.abs(pos.getMiddleBlockZ() - playerZ) <= reach) chunkArrivedAt = ticks;
 	}
@@ -291,8 +348,7 @@ public final class FoamRenderer {
 			if (active) {
 				active = false;
 				for (FoamLevel l : levels) clearLevel(l);
-				building = null;
-				pendingFar = null;
+				dropBuilds();
 				farCapture = null;
 				resetCycle();
 				splashes.clear();
@@ -305,14 +361,14 @@ public final class FoamRenderer {
 			active = true;
 			lastFarStart = -1000;
 		}
+		applyQuality();
 		if (lvl != level) {
 			level = lvl;
 			RiverMemory old = rivers;
 			worker.execute(old::save);
 			rivers = new RiverMemory(lvl == null ? null : riverFile(mc, lvl));
 			for (FoamLevel l : levels) clearLevel(l);
-			building = null;
-			pendingFar = null;
+			dropBuilds();
 			farCapture = null;
 			lastFarStart = -1000;
 			resetCycle();
@@ -332,23 +388,31 @@ public final class FoamRenderer {
 			building = null;
 			if (built != null) perf.built(built.level() == far, built.ms());
 			long t0 = System.nanoTime();
-			if (built == null) pendingFar = null;
+			if (built == null) {
+				if (pendingFar != null) pendingFar.uploads().free();
+				pendingFar = null;
+			}
 			else if (built.level() == far && (near.region == null || !near.covers(ptx, ptz))) {
 				// Nothing near the player to keep agreeing with (just joined, or teleported): the far
 				// level draws everything at once, at the density each tile needs, and the near level
 				// built inside it next takes over its own tiles without a change.
 				install(lvl, built);
-				assign(lvl);
+				assign(lvl, true);
 				startNear(lvl, built.region());
-			} else if (built.level() == far) {
+			} else if (built.level() == far && farChainsNear) {
 				// The near level again, inside the new far one, so both go in agreeing.
 				pendingFar = built;
 				startNear(lvl, built.region());
+			} else if (built.level() == far) {
+				// Only new land well away from the near level: the far level goes in on its own.
+				install(lvl, built);
+				assign(lvl, true);
 			} else {
-				if (pendingFar != null) install(lvl, pendingFar);
+				boolean farToo = pendingFar != null;
+				if (farToo) install(lvl, pendingFar);
 				pendingFar = null;
 				install(lvl, built);
-				assign(lvl);
+				assign(lvl, farToo || far.faceQuads.isEmpty());
 			}
 			installMs = (System.nanoTime() - t0) / 1e6;
 			perf.installNanos += System.nanoTime() - t0;
@@ -362,10 +426,15 @@ public final class FoamRenderer {
 			wantFar = true;
 		}
 		boolean nearMoved = moved(near, ptx, ptz), farMoved = moved(far, ptx, ptz);
+		// Near a level's edge the throttle gives way, or a fast flyer would outrun the foam.
+		boolean nearUrgent = near.region != null && near.nearEdge(ptx, ptz), farUrgent = far.region != null && far.nearEdge(ptx, ptz);
 		// No far level round the player (joining, a teleport): it comes first, read in one go.
-		boolean farLost = far.region == null || !far.covers(ptx, ptz);
-		boolean nearStale = near.region == null || wantNear || nearMoved;
-		boolean farStale = farLost || farMoved || (wantFar && ticks - lastFarStart >= FAR_COOLDOWN);
+		boolean farOn = settings.quality >= 1;
+		boolean farLost = farOn && (far.region == null || !far.covers(ptx, ptz));
+		// Moving on lays a level again only now and then: in between the far level covers the near
+		// level's ground, and the far level reaches well past where the player can see detail.
+		boolean nearStale = near.region == null || wantNear || (nearMoved && (nearUrgent || ticks - lastNearStart >= NEAR_MOVE_COOLDOWN));
+		boolean farStale = farOn && (farLost || (farMoved && (farUrgent || ticks - lastFarStart >= FAR_MOVE_COOLDOWN)) || (wantFar && ticks - lastFarStart >= FAR_COOLDOWN));
 		if (!nearStale && !farStale) staleSince = -1;
 		else if (staleSince < 0) staleSince = ticks;
 		boolean settling = ticks - chunkArrivedAt < SETTLE_TICKS && ticks - staleSince < MAX_SETTLE;
@@ -426,6 +495,7 @@ public final class FoamRenderer {
 	/** Snapshots the near level now and builds it, inside {@code parent} when there is one. */
 	private void startNear(ClientLevel lvl, ShoreRegion parent) {
 		wantNear = false;
+		lastNearStart = ticks;
 		staleSince = -1;
 		int[] o = near.place(Math.floorDiv(playerX, FoamLevel.TILE), Math.floorDiv(playerZ, FoamLevel.TILE));
 		ShoreSnapshot.Capture c = new ShoreSnapshot.Capture(o[0] * FoamLevel.TILE, o[1] * FoamLevel.TILE, FoamLevel.NEAR.size(),
@@ -444,7 +514,7 @@ public final class FoamRenderer {
 				// Inside a far level the rivers run its way; on its own the near level keeps its memory.
 				ShoreRegion r = ShoreRegion.build(snap, rs, up == null ? memory : null, FoamLevel.NEAR.res(), FoamLevel.NEAR.decorScale(), up);
 				if (up == null) memory.save();
-				return new Built(near, r, bandBlocks(r), (System.nanoTime() - t0) / 1_000_000);
+				return new Built(near, r, bandBlocks(r), (System.nanoTime() - t0) / 1_000_000, new FoamLevel.Uploads(r));
 			} catch (Throwable t) {
 				FoamingShoresClient.LOGGER.error("Building shore fields failed", t);
 				return null;
@@ -454,6 +524,10 @@ public final class FoamRenderer {
 
 	/** Starts reading the far level's snapshot round the player's tile. */
 	private void startFar(int ptx, int ptz) {
+		// Laid somewhere new, or new settings, or new land by the near level: the near level follows.
+		farChainsNear = far.region == null || moved(far, ptx, ptz) || farNeedsNear || near.region == null || farSettings;
+		farNeedsNear = false;
+		farSettings = false;
 		wantFar = false;
 		staleSince = -1;
 		lastFarStart = ticks;
@@ -471,7 +545,7 @@ public final class FoamRenderer {
 				long t0 = System.nanoTime();
 				ShoreRegion r = ShoreRegion.build(snap, rs, memory, FoamLevel.FAR.res(), FoamLevel.FAR.decorScale(), null);
 				memory.save();
-				return new Built(far, r, bandBlocks(r), (System.nanoTime() - t0) / 1_000_000);
+				return new Built(far, r, bandBlocks(r), (System.nanoTime() - t0) / 1_000_000, new FoamLevel.Uploads(r));
 			} catch (Throwable t) {
 				FoamingShoresClient.LOGGER.error("Building far shore fields failed", t);
 				return null;
@@ -540,6 +614,7 @@ public final class FoamRenderer {
 	}
 
 	private void clearLevel(FoamLevel l) {
+		shownSince.clear();
 		for (FoamLevel.Tile t : l.tiles.values()) freeSlots(t);
 		l.tiles.clear();
 		l.drawn.clear();
@@ -566,7 +641,7 @@ public final class FoamRenderer {
 		l.region = r;
 		l.missing = l.buildingMissing;
 		l.buildMs = built.ms();
-		l.upload(r);
+		l.upload(built.uploads());
 		Map<Long, FoamLevel.Tile> old = new HashMap<>(l.tiles);
 		l.tiles.clear();
 		for (int[] b : built.bandBlocks()) {
@@ -585,13 +660,97 @@ public final class FoamRenderer {
 					t.baked[b] = was.baked[b];
 				}
 			}
+			Quad[] flat = new Quad[FoamLevel.TILE * FoamLevel.TILE];
 			for (int[] b : t.blocks) {
 				Quad q = topQuad(lvl, r, b[0], b[1], t, pos);
-				if (q != null) t.quads.add(q);
+				if (q == null) continue;
+				int wx = r.originX + b[0], wz = r.originZ + b[1];
+				if (isFlatSquare(q, wx, wz)) flat[(wz - t.tz * FoamLevel.TILE) * FoamLevel.TILE + wx - t.tx * FoamLevel.TILE] = q;
+				else t.quads.add(q);
 			}
+			mergeFlat(flat, t);
 		}
 		for (FoamLevel.Tile t : old.values()) freeSlots(t);
 		resetCycle();
+	}
+
+	/** Drops the fade-in times of tiles neither level covers any more (seen again later, they fade in again). */
+	private void forgetUndrawn() {
+		shownSince.keySet().removeIf(k -> !near.covers((int) (k >> 32), (int) (long) k) && !far.covers((int) (k >> 32), (int) (long) k));
+	}
+
+	/**
+	 * How far each of a level's tiles has faded in, for the bake: 0 where no level draws, 1 where a level
+	 * draws but has no foam (so nothing thins out beside it), else how far it is since it was first shown.
+	 * The texture is the level's largest shape; the shader reads the part its current shape uses.
+	 */
+	private void writeFades(CommandEncoder encoder, FoamLevel l) {
+		l.fadeView(RenderSystem.getDevice());
+		int n = l.spec.tiles(), ox = l.region.originX / FoamLevel.TILE, oz = l.region.originZ / FoamLevel.TILE;
+		ByteBuffer fade = MemoryUtil.memCalloc(n * n * 16);
+		try {
+			for (int j = 0; j < n; j++) for (int i = 0; i < n; i++) {
+				int tx = ox + i, tz = oz + j;
+				FoamLevel by = near.covers(tx, tz) ? near : far.covers(tx, tz) ? far : null;
+				float f;
+				if (by == null) f = 0;
+				else if (!by.tiles.containsKey(FoamLevel.key(tx, tz))) f = 1;
+				else {
+					Long since = shownSince.get(FoamLevel.key(tx, tz));
+					f = since == null ? 0 : Math.min(1, (ticks - since) / (float) FADE_TICKS);
+				}
+				fade.position((j * n + i) * 16);
+				fade.putFloat(f).putFloat(f).putFloat(f).putFloat(f);
+			}
+			fade.position(0);
+			encoder.writeToTexture(l.fadeTexture, fade, 0, 0, 0, 0, n, n);
+		} finally {
+			MemoryUtil.memFree(fade);
+		}
+	}
+
+	/** Whether a top quad covers exactly its block's square (no side reaches over) and lies flat. */
+	private static boolean isFlatSquare(Quad q, int wx, int wz) {
+		float[] p = q.xyz();
+		return p[0] == wx && p[2] == wz && p[6] == wx + 1 && p[8] == wz + 1 && p[1] == p[4] && p[1] == p[7] && p[1] == p[10];
+	}
+
+	/**
+	 * Joins a tile's flat block tops at the same height and light into rectangles (greedily, row by
+	 * row): open water and a beach become a few quads instead of one per block. The tile's texture is
+	 * laid over a rectangle exactly as over its blocks one by one, so nothing changes on screen; there
+	 * is just far less geometry to write every frame.
+	 */
+	private static void mergeFlat(Quad[] flat, FoamLevel.Tile t) {
+		int n = FoamLevel.TILE;
+		boolean[] used = new boolean[n * n];
+		for (int z = 0; z < n; z++) {
+			for (int x = 0; x < n; x++) {
+				Quad k = flat[z * n + x];
+				if (k == null || used[z * n + x]) continue;
+				int w = 1;
+				while (x + w < n && !used[z * n + x + w] && sameTop(flat[z * n + x + w], k)) w++;
+				int h = 1;
+				grow:
+				while (z + h < n) {
+					for (int dx = 0; dx < w; dx++) {
+						int i = (z + h) * n + x + dx;
+						if (used[i] || !sameTop(flat[i], k)) break grow;
+					}
+					h++;
+				}
+				for (int dz = 0; dz < h; dz++) for (int dx = 0; dx < w; dx++) used[(z + dz) * n + x + dx] = true;
+				float x0 = t.tx * n + x, z0 = t.tz * n + z, x1 = x0 + w, z1 = z0 + h, y = k.xyz()[1];
+				float u0 = x / 16f, v0 = z / 16f, u1 = (x + w) / 16f, v1 = (z + h) / 16f;
+				// The same corner order as a single block's quad (north-west, south-west, south-east, north-east).
+				t.quads.add(new Quad(new float[] {x0, y, z0, x0, y, z1, x1, y, z1, x1, y, z0},
+					new float[] {u0, v0, u0, v1, u1, v1, u1, v0}, 0, 1, 0, k.light()));
+			}
+		}
+	}
+
+	private static boolean sameTop(Quad q, Quad k) {
+		return q != null && q.xyz()[1] == k.xyz()[1] && q.light() == k.light();
 	}
 
 	/** The quad over a shore block's top, uv over its tile; null for blocks whose tops get no foam. */
@@ -634,10 +793,15 @@ public final class FoamRenderer {
 
 	/**
 	 * Which level draws which tile: the near level its own area, the far level the rest of its own;
-	 * then each level's faces for the tiles it draws (nearest first while the face table has room).
-	 * Tiles no longer drawn give their slots back.
+	 * tiles no longer drawn give their slots back. Then the faces, nearest first while the face table
+	 * has room: the near level's for the tiles it draws; the far level's (only when {@code farFaces},
+	 * that is when the far level itself changed) for its whole area, those under the near level
+	 * skipped when drawing, so a new near level never has the far level's faces built again.
 	 */
-	private void assign(ClientLevel lvl) {
+	private void assign(ClientLevel lvl, boolean farFaces) {
+		forgetUndrawn();
+		int ptx = Math.floorDiv(playerX, FoamLevel.TILE), ptz = Math.floorDiv(playerZ, FoamLevel.TILE);
+		Comparator<FoamLevel.Tile> nearest = Comparator.comparingInt(t -> Math.max(Math.abs(t.tx - ptx), Math.abs(t.tz - ptz)));
 		for (FoamLevel l : levels) {
 			l.drawn.clear();
 			for (FoamLevel.Tile t : l.tiles.values()) {
@@ -645,12 +809,14 @@ public final class FoamRenderer {
 				if (mine) l.drawn.add(t);
 				else freeSlots(t);
 			}
-			int ptx = Math.floorDiv(playerX, FoamLevel.TILE), ptz = Math.floorDiv(playerZ, FoamLevel.TILE);
-			l.drawn.sort(Comparator.comparingInt(t -> Math.max(Math.abs(t.tx - ptx), Math.abs(t.tz - ptz))));
+			l.drawn.sort(nearest);
+			if (l.region == null || (l == far && !farFaces)) continue;
 			l.faceBaked[0] = l.faceBaked[1] = false;
-			if (l.region == null) continue;
+			List<FoamLevel.Tile> withFaces = new ArrayList<>();
+			for (FoamLevel.Tile t : l.tiles.values()) if (l.covers(t.tx, t.tz)) withFaces.add(t);
+			withFaces.sort(nearest);
 			List<int[]> band = new ArrayList<>();
-			for (FoamLevel.Tile t : l.drawn) band.addAll(t.blocks);
+			for (FoamLevel.Tile t : withFaces) band.addAll(t.blocks);
 			buildFaces(lvl, l, band);
 		}
 	}
@@ -668,10 +834,11 @@ public final class FoamRenderer {
 		int washPx = Math.min(TILE_H, Math.round(settings.splashHeight * 0.6f) + 1);
 		int fallPx = Math.min(TILE_H, (int) Math.ceil(settings.fallFade * 1.65f) + 1);
 		List<Quad> qs = new ArrayList<>();
+		List<Long> tileKeys = new ArrayList<>();
 		List<Splashes.Foot> feet = new ArrayList<>();
 		// For the sound: each wall and drop face as (edge texel x, z, step x, z, out x, z, top in texels).
 		List<int[]> wallRows = new ArrayList<>(), dropRows = new ArrayList<>();
-		int maxFaces = l.spec.maxFaces(), texH = l.spec.faceTexH();
+		int maxFaces = l.spec.maxFaces(), texH = l.max.faceTexH();
 		ByteBuffer data = MemoryUtil.memAlloc(FACE_COLS * 2 * l.spec.faceRows() * 16);
 		try {
 			MemoryUtil.memSet(data, 0);
@@ -758,6 +925,7 @@ public final class FoamRenderer {
 					pos.set(lx, (int) Math.floor(yTop - 0.5f), lz);
 					float sign = kind != 2 ? 1 : -1;
 					qs.add(new Quad(xyz, uv, dx * sign, 0, dz * sign, LightCoordsUtil.getLightCoords(lvl, pos)));
+					tileKeys.add(FoamLevel.key(Math.floorDiv(wx, FoamLevel.TILE), Math.floorDiv(wz, FoamLevel.TILE)));
 					n++;
 				}
 			}
@@ -765,6 +933,7 @@ public final class FoamRenderer {
 			RenderSystem.getDevice().createCommandEncoder().writeToTexture(l.faceDataTexture, data, 0, 0, 0, 0, FACE_COLS * 2, l.spec.faceRows());
 			l.faceCount = n;
 			l.faceQuads = qs;
+			l.faceTiles = tileKeys.stream().mapToLong(Long::longValue).toArray();
 			if (l == near) {
 				splashes.setRegion(r, feet);
 				audio.setSounds(ShoreSounds.build(r, wallRows, dropRows, settings));
@@ -911,7 +1080,9 @@ public final class FoamRenderer {
 		double fov = Math.toRadians(mc.options.fov().get());
 		double aspect = mc.getWindow().getWidth() / (double) Math.max(1, mc.getWindow().getHeight());
 		double halfWidth = Math.atan(Math.tan(fov / 2) * aspect) + VIEW_MARGIN;
-		double pixelsAtOne = mc.getWindow().getHeight() / (2 * Math.tan(fov / 2));
+		// Lighter detail lets a texel grow a little past a pixel before going coarser.
+		double texelPixels = settings.quality >= 2 ? 1 : settings.quality == 1 ? 1.5 : 2;
+		double pixelsAtOne = mc.getWindow().getHeight() / (2 * Math.tan(fov / 2)) / texelPixels;
 		java.util.Arrays.fill(tilesAt, 0);
 		tilesOutOfView = 0;
 		for (FoamLevel l : levels) {
@@ -984,6 +1155,8 @@ public final class FoamRenderer {
 			if (mine == null || l.region == null) continue;
 			MappableRingBuffer ubo = l.ubo[parity];
 			writeUbo(l, ubo, waves, now, epoch, 0, water);
+			for (FoamLevel.Tile t : mine) shownSince.putIfAbsent(FoamLevel.key(t.tx, t.tz), ticks);
+			writeFades(encoder, l);
 			// The tile tables, a page at a time.
 			for (FoamAtlas.Page page : atlas.pages) {
 				List<FoamLevel.Tile> onPage = new ArrayList<>();
@@ -1016,6 +1189,7 @@ public final class FoamRenderer {
 			if (l.region == null || l.faceCount == 0) continue;
 			MappableRingBuffer ubo = l.faceUbo[parity];
 			writeUbo(l, ubo, waves, now, epoch, 1, water);
+			writeFades(encoder, l);
 			writeTileIndex(encoder, l, back);
 			try (RenderPass pass = encoder.createRenderPass(() -> "Foaming Shores face bake " + l.spec.name(), l.faceOutputs[back].getTextureView(), Optional.empty())) {
 				pass.setPipeline(facesPipeline);
@@ -1054,6 +1228,7 @@ public final class FoamRenderer {
 		pass.setUniform("FetchSampler", l.fetchView, nearest);
 		pass.setUniform("AtlasSampler", water.atlas(), nearest);
 		pass.setUniform("TileSampler", table, nearest);
+		pass.setUniform("FadeSampler", l.fadeView, nearest);
 		for (int i = 0; i < FoamAtlas.DENSITIES.length; i++)
 			pass.setUniform("Page" + FoamAtlas.DENSITIES[i] + "Sampler", pages >= 0 ? atlas.pages[i].views[pages] : noiseView, nearest);
 	}
@@ -1127,7 +1302,7 @@ public final class FoamRenderer {
 				.putVec4(s.backwash, s.foamTint, s.soak, s.puddleSpread)
 				.putVec4(((waterColor >> 16) & 255) / 255f, ((waterColor >> 8) & 255) / 255f, (waterColor & 255) / 255f, 1)
 				.putVec4(s.spill, s.fallFade, s.splashHeight, s.pile)
-				.putVec4(mode, l.faceCount, FACE_TEX_W, l.spec.faceTexH())
+				.putVec4(mode, l.faceCount, FACE_TEX_W, l.max.faceTexH())
 				.putVec4(water.stillX, water.stillY, water.flowX, water.flowY)
 				.putVec4(s.straight, s.peel, s.peelScale, s.waveVary)
 				.putVec4(s.travelFade * 16, s.wrap, s.wrapLag * 16, goneAt);
@@ -1219,7 +1394,12 @@ public final class FoamRenderer {
 		for (FoamLevel l : levels) {
 			if (!l.faceQuads.isEmpty() && l.faceOutputs[show] != null && l.faceBaked[show]) {
 				List<Quad> qs = new ArrayList<>();
-				for (Quad q : l.faceQuads) if (inView(q, eye, lookX, lookZ, halfWidth, steep)) qs.add(q);
+				for (int i = 0; i < l.faceQuads.size(); i++) {
+					Quad q = l.faceQuads.get(i);
+					long key = l.faceTiles[i];
+					if (l == far && near.covers((int) (key >> 32), (int) key)) continue; // the near level's own
+					if (inView(q, eye, lookX, lookZ, halfWidth, steep)) qs.add(q);
+				}
 				if (qs.isEmpty()) continue;
 				context.submitNodeCollector().submitCustomGeometry(poseStack, FoamPipelines.surface(l.faceIds[show]), (pose, buffer) -> {
 					long d0 = System.nanoTime();

@@ -56,11 +56,16 @@ final class FoamLevel {
 
 	static final Spec NEAR = new Spec("near", 160, ShoreRegion.RES, 1, 4, 5, 4, false, 2048);
 	static final Spec FAR = new Spec("far", 384, 2, 4, 9, 14, 11, true, 4096);
+	/** The shapes for lighter detail: the near level alone (it is then the outermost, so it fades), a smaller far level. */
+	static final Spec NEAR_LIGHT = new Spec("near", 128, ShoreRegion.RES, 1, 3, 4, 3, true, 2048);
+	static final Spec FAR_BALANCED = new Spec("far", 256, 2, 4, 6, 9, 7, true, 4096);
 
 	/** Blocks at the region's edge where its fields are its parent's, and over which they blend in. */
 	static final int MARGIN = 16, BAND = 16;
 
-	final Spec spec;
+	/** The level's largest shape, which its textures are made for, and its shape at the current detail. */
+	final Spec max;
+	Spec spec;
 	final int index;
 	ShoreRegion region;
 	/** Chunks missing from the snapshot behind the current region, and behind the one being built. */
@@ -69,13 +74,15 @@ final class FoamLevel {
 	final Map<Long, Tile> tiles = new HashMap<>();
 	final List<Tile> drawn = new ArrayList<>();
 	List<FoamRenderer.Quad> faceQuads = List.of();
+	/** Each face's shore block's tile (as key()), side by side with faceQuads. */
+	long[] faceTiles = new long[0];
 	int faceCount;
 	/** Whether each face buffer holds a bake of the current faces. */
 	final boolean[] faceBaked = new boolean[2];
 	long buildMs;
 
-	GpuTexture fieldTexture, field2Texture, dipTexture, riverTexture, riverDecorTexture, fetchTexture, faceDataTexture, indexTexture;
-	GpuTextureView fieldView, field2View, dipView, riverView, riverDecorView, fetchView, faceDataView, indexView;
+	GpuTexture fieldTexture, field2Texture, dipTexture, riverTexture, riverDecorTexture, fetchTexture, faceDataTexture, indexTexture, fadeTexture;
+	GpuTextureView fieldView, field2View, dipView, riverView, riverDecorView, fetchView, faceDataView, indexView, fadeView;
 	/** Per atlas page, the tile table the tile pass reads (see foam_tile.vsh). */
 	final GpuTexture[] tableTextures = new GpuTexture[FoamAtlas.DENSITIES.length];
 	final GpuTextureView[] tableViews = new GpuTextureView[FoamAtlas.DENSITIES.length];
@@ -91,9 +98,11 @@ final class FoamLevel {
 	/** Tiles a table holds (its first texel is the header). */
 	static final int TABLE = 1023;
 
-	FoamLevel(int index, Spec spec) {
+	FoamLevel(int index, Spec max) {
 		this.index = index;
-		this.spec = spec;
+		this.max = max;
+		this.spec = max;
+		Spec spec = max;
 		for (int b = 0; b < 2; b++) faceIds[b] = Identifier.fromNamespaceAndPath("foamingshores", "foam_faces_" + spec.name() + "_" + b);
 	}
 
@@ -134,6 +143,12 @@ final class FoamLevel {
 		return origin;
 	}
 
+	/** Whether the player's tile is two tiles or more past the window it is kept in, either way: time to lay it again whatever the throttle says. */
+	boolean nearEdge(int ptx, int ptz) {
+		int i = ptx - region.originX / TILE, j = ptz - region.originZ / TILE;
+		return i < spec.keepLo() - 1 || j < spec.keepLo() - 1 || i > spec.keepHi() + 1 || j > spec.keepHi() + 1;
+	}
+
 	/** Whether world tile (tx, tz) is one this level could draw: inside its region, not its outermost ring. */
 	boolean covers(int tx, int tz) {
 		if (region == null) return false;
@@ -143,6 +158,7 @@ final class FoamLevel {
 
 	void ensureTextures(GpuDevice device) {
 		if (fieldTexture != null) return;
+		Spec spec = max;
 		int S = spec.size() * spec.res(), T = spec.size() * 16 / spec.decorScale();
 		String n = "Foaming Shores " + spec.name() + " ";
 		fieldTexture = device.createTexture(n + "fields", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA32_FLOAT, S, S, 1, 1);
@@ -181,62 +197,87 @@ final class FoamLevel {
 		}
 	}
 
-	/** Uploads a region's fields for the bake. */
-	void upload(ShoreRegion r) {
-		GpuDevice device = RenderSystem.getDevice();
-		ensureTextures(device);
-		// Fields: RGBA32F per sample = arrival, shore distance, exposure, block level (8 pool, 9 sea).
-		int S = r.samples, res = r.res;
-		ByteBuffer buf = MemoryUtil.memAlloc(S * S * 16);
-		try {
+	/**
+	 * The fade texture, sized to the current shape (the shader takes its size for the region's tiles).
+	 */
+	GpuTextureView fadeView(GpuDevice device) {
+		int n = spec.tiles();
+		if (fadeTexture == null || fadeTexture.getWidth(0) != n) {
+			if (fadeTexture != null) fadeTexture.close();
+			fadeTexture = device.createTexture("Foaming Shores " + spec.name() + " tile fade", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
+				GpuFormat.RGBA32_FLOAT, n, n, 1, 1);
+			fadeView = device.createTextureView(fadeTexture);
+		}
+		return fadeView;
+	}
+
+	/**
+	 * A region's fields packed for the GPU, made on the worker so the render thread only hands them
+	 * over. Off-heap: freed once uploaded, or by whoever drops the build.
+	 */
+	static final class Uploads {
+		final int S, T;
+		final ByteBuffer field, field2, dip, river, fetch, decor;
+
+		/** Packs {@code r}; runs off the render thread. */
+		Uploads(ShoreRegion r) {
+			S = r.samples;
+			T = r.size * 16 / r.decorScale;
+			int res = r.res;
+			// Fields: RGBA32F per sample = arrival, shore distance, exposure, block level (8 pool, 9 sea).
+			field = MemoryUtil.memAlloc(S * S * 16);
 			for (int sz = 0; sz < S; sz++) for (int sx = 0; sx < S; sx++) {
 				int p = sz * S + sx, bi = (sz / res) * r.size + sx / res;
 				boolean water = r.level[bi] == 0 && r.water[bi];
-				buf.putFloat(r.arrival[p]).putFloat(r.shoreDist[p]).putFloat(r.exposure[p])
+				field.putFloat(r.arrival[p]).putFloat(r.shoreDist[p]).putFloat(r.exposure[p])
 					.putFloat(water ? (r.sea[bi] ? 9 : 8) : r.level[bi]);
 			}
-			buf.flip();
-			device.createCommandEncoder().writeToTexture(fieldTexture, buf, 0, 0, 0, 0, S, S);
+			field.flip();
 			// Fields 2: waterline, far field, crossing front, crossing front's waterline.
-			buf.clear();
-			for (int p = 0; p < S * S; p++) buf.putFloat(r.waterline[p]).putFloat(r.far[p]).putFloat(r.cross[p]).putFloat(r.crossWaterline[p]);
-			buf.flip();
-			device.createCommandEncoder().writeToTexture(field2Texture, buf, 0, 0, 0, 0, S, S);
+			field2 = MemoryUtil.memAlloc(S * S * 16);
+			for (int p = 0; p < S * S; p++) field2.putFloat(r.waterline[p]).putFloat(r.far[p]).putFloat(r.cross[p]).putFloat(r.crossWaterline[p]);
+			field2.flip();
 			// Dips: where each dip's water enters, and whether a sample is in a dip.
-			buf.clear();
+			dip = MemoryUtil.memAlloc(S * S * 16);
 			for (int sz = 0; sz < S; sz++) for (int sx = 0; sx < S; sx++) {
 				int bi = (sz / res) * r.size + sx / res;
-				buf.putFloat(r.dipEntry[sz * S + sx]).putFloat(r.dipId[bi] >= 0 ? 1 : 0).putFloat(r.isle[sz * S + sx] ? 1 : 0).putFloat(0);
+				dip.putFloat(r.dipEntry[sz * S + sx]).putFloat(r.dipId[bi] >= 0 ? 1 : 0).putFloat(r.isle[sz * S + sx] ? 1 : 0).putFloat(0);
 			}
-			buf.flip();
-			device.createCommandEncoder().writeToTexture(dipTexture, buf, 0, 0, 0, 0, S, S);
+			dip.flip();
 			// Rivers: current (texels per second), how much river, how shallow.
-			buf.clear();
+			river = MemoryUtil.memAlloc(S * S * 16);
 			for (int p = 0; p < S * S; p++) {
-				if (r.riverFx == null) buf.putFloat(0).putFloat(0).putFloat(0).putFloat(0);
-				else buf.putFloat(r.riverFx[p]).putFloat(r.riverFy[p]).putFloat(r.riverBlend[p]).putFloat(r.riverShallow[p]);
+				if (r.riverFx == null) river.putFloat(0).putFloat(0).putFloat(0).putFloat(0);
+				else river.putFloat(r.riverFx[p]).putFloat(r.riverFy[p]).putFloat(r.riverBlend[p]).putFloat(r.riverShallow[p]);
 			}
-			buf.flip();
-			device.createCommandEncoder().writeToTexture(riverTexture, buf, 0, 0, 0, 0, S, S);
-		} finally {
-			MemoryUtil.memFree(buf);
-		}
-		// Still water's fetch: per field sample, 16 directions, as four RGBA texels side by side.
-		ByteBuffer fetch = MemoryUtil.memCalloc(S * S * ShoreRegion.FETCH_DIRS);
-		try {
+			river.flip();
+			// Still water's fetch: per field sample, 16 directions, as four RGBA texels side by side.
+			fetch = MemoryUtil.memCalloc(S * S * ShoreRegion.FETCH_DIRS);
 			if (r.fetch != null) fetch.put(r.fetch).flip();
-			device.createCommandEncoder().writeToTexture(fetchTexture, fetch, 0, 0, 0, 0, S * 4, S);
-		} finally {
-			MemoryUtil.memFree(fetch);
-		}
-		// Rocks' wake, pillow and foam trails, and still water, per decor texel.
-		int T = r.size * 16 / r.decorScale;
-		ByteBuffer decor = MemoryUtil.memCalloc(T * T * 4);
-		try {
+			// Rocks' wake, pillow and foam trails, and still water, per decor texel.
+			decor = MemoryUtil.memCalloc(T * T * 4);
 			if (r.riverDecor != null) decor.put(r.riverDecor).flip();
-			device.createCommandEncoder().writeToTexture(riverDecorTexture, decor, 0, 0, 0, 0, T, T);
+		}
+
+		void free() {
+			for (ByteBuffer b : new ByteBuffer[] {field, field2, dip, river, fetch, decor}) MemoryUtil.memFree(b);
+		}
+	}
+
+	/** Uploads a region's packed fields for the bake, and frees them. */
+	void upload(Uploads u) {
+		GpuDevice device = RenderSystem.getDevice();
+		ensureTextures(device);
+		try {
+			var encoder = device.createCommandEncoder();
+			encoder.writeToTexture(fieldTexture, u.field, 0, 0, 0, 0, u.S, u.S);
+			encoder.writeToTexture(field2Texture, u.field2, 0, 0, 0, 0, u.S, u.S);
+			encoder.writeToTexture(dipTexture, u.dip, 0, 0, 0, 0, u.S, u.S);
+			encoder.writeToTexture(riverTexture, u.river, 0, 0, 0, 0, u.S, u.S);
+			encoder.writeToTexture(fetchTexture, u.fetch, 0, 0, 0, 0, u.S * 4, u.S);
+			encoder.writeToTexture(riverDecorTexture, u.decor, 0, 0, 0, 0, u.T, u.T);
 		} finally {
-			MemoryUtil.memFree(decor);
+			u.free();
 		}
 	}
 

@@ -210,6 +210,12 @@ public final class FoamConfigScreen {
 					.setTooltip(Component.translatable("tooltip.foamingshores.enabled"))
 					.setSaveConsumer(v -> settings.enabled = v)
 					.build());
+				category.addEntry(entries.startIntSlider(Component.translatable("option.foamingshores.quality"), settings.quality, 0, 2)
+					.setDefaultValue(defaults.quality)
+					.setTextGetter(v -> Component.translatable("option.foamingshores.quality." + v))
+					.setTooltip(Component.translatable("tooltip.foamingshores.quality"))
+					.setSaveConsumer(v -> settings.quality = v)
+					.build());
 				category.addEntry(entries.startBooleanToggle(Component.translatable("option.foamingshores.perfLog"), settings.perfLog)
 					.setDefaultValue(defaults.perfLog)
 					.setTooltip(Component.translatable("tooltip.foamingshores.perfLog"))

@@ -116,6 +116,12 @@ public final class FoamSettings {
 	public boolean enabled = true;
 	/** Writes what the mod costs (frame time by stage, GPU, builds, GC) to the log every 5 seconds. */
 	public boolean perfLog = false;
+	/**
+	 * How much the mod draws: 0 light (only the near level, foam to about 50 blocks), 1 balanced (a
+	 * smaller far level, coarser texels a little nearer), 2 full (the far level out to about 190 blocks,
+	 * every texel at most a pixel).
+	 */
+	public int quality = 1;
 
 	// Look
 	public int ticks = 2;           // animation step, in game ticks

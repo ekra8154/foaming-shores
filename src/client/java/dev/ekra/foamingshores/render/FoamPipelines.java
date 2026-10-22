@@ -40,6 +40,7 @@ public final class FoamPipelines {
 		.withUniform("Page16Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("Page8Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.withUniform("Page4Sampler", UniformType.COMBINED_IMAGE_SAMPLER)
+		.withUniform("FadeSampler", UniformType.COMBINED_IMAGE_SAMPLER)
 		.build();
 
 	// Optional: if the shader fails to compile, vanilla logs a warning instead of failing the reload.

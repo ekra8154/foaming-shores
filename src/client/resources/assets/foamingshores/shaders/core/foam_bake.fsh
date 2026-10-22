@@ -47,6 +47,10 @@ uniform sampler2D TileSampler;
 uniform sampler2D Page16Sampler;
 uniform sampler2D Page8Sampler;
 uniform sampler2D Page4Sampler;
+// Per 16x16 block tile of the region, how far it has faded in since it was first shown (r, 0..1; 0
+// where nothing is drawn): a tile coming into sight dissolves in over a second instead of appearing
+// all at once, and the foam thins out toward the edge of what is drawn.
+uniform sampler2D FadeSampler;
 
 layout(std140) uniform FoamBake {
     vec4 Region;   // region size in texels, field samples per block, field size in samples, region texels per decor texel
@@ -1028,6 +1032,24 @@ float fallTime(float r) {
     return (-4.0 + sqrt(16.0 + 2.0 * GRAV * r)) / GRAV;
 }
 
+float fadeOf(ivec2 tile, ivec2 n) {
+    return any(lessThan(tile, ivec2(0))) || any(greaterThanEqual(tile, n)) ? 0.0 : texelFetch(FadeSampler, tile, 0).r;
+}
+
+// Whether a pixel shows yet while its tile fades in: each pixel (on the baked pixel grid, in the
+// world) has its own moment, scattered like noise rather than in a pattern.
+bool fadedIn(vec2 texel, ivec2 wt) {
+    // Blended between the tiles' middles, so neither a tile fading in nor the edge of the drawing
+    // shows as a square.
+    vec2 t = (texel + 0.5) / 256.0 - 0.5, f = t - floor(t);
+    ivec2 i = ivec2(floor(t)), n = textureSize(FadeSampler, 0);
+    float a = fadeOf(i, n), b = fadeOf(i + ivec2(1, 0), n), c = fadeOf(i + ivec2(0, 1), n), d = fadeOf(i + ivec2(1, 1), n);
+    float shown = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    if (shown >= 1.0) return true;
+    ivec2 px = ivec2(floor(vec2(wt) / gStep));
+    return hash3(px.x, px.y, 211) < shown;
+}
+
 // The block top just baked at a region texel, as the tile it is in shows it.
 vec4 topAt(vec2 texel) {
     vec4 e = texelFetch(TileSampler, ivec2(floor(texel / 256.0)), 0);
@@ -1193,6 +1215,7 @@ vec4 bakeFace(vec2 pixel) {
         vec4 top = topAt(texel); // what the top shows at its edge
         if (top.a > 0.99) color = top; // foam is opaque; the sheet and wet sand are not
     }
+    if (!fadedIn(texel, wt + ivec2(0, row))) return vec4(0.0);
     return color;
 }
 
@@ -1209,6 +1232,7 @@ void main() {
             float gone = clamp((Swell2.w + Calm3.w - edge) / Calm3.w, 0.0, 1.0);
             if (gone > 0.0 && bayerAt(ivec2(Origin.xy) + ivec2(texel)) < gone) c = vec4(0.0);
         }
+        if (!fadedIn(texel, ivec2(Origin.xy) + ivec2(texel))) c = vec4(0.0);
         fragColor = c;
     } else fragColor = bakeFace(floor(texCoord * Mode.zw));
 }
