@@ -27,6 +27,9 @@ final class Fields {
 		ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
 		t.setName("Foaming Shores fields " + THREADS.getAndIncrement());
 		t.setDaemon(true);
+		// Below the render thread and the game's own workers: a build may take a little longer, frames
+		// stay smooth.
+		t.setPriority(Thread.NORM_PRIORITY - 2);
 		return t;
 	}, null, false);
 

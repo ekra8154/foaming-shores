@@ -114,6 +114,8 @@ public final class FoamSettings {
 
 	/** Off, the mod does nothing at all: no fields, no baking, no drawing, no sound (F9 by default). */
 	public boolean enabled = true;
+	/** Writes what the mod costs (frame time by stage, GPU, builds, GC) to the log every 5 seconds. */
+	public boolean perfLog = false;
 
 	// Look
 	public int ticks = 2;           // animation step, in game ticks

@@ -210,6 +210,11 @@ public final class FoamConfigScreen {
 					.setTooltip(Component.translatable("tooltip.foamingshores.enabled"))
 					.setSaveConsumer(v -> settings.enabled = v)
 					.build());
+				category.addEntry(entries.startBooleanToggle(Component.translatable("option.foamingshores.perfLog"), settings.perfLog)
+					.setDefaultValue(defaults.perfLog)
+					.setTooltip(Component.translatable("tooltip.foamingshores.perfLog"))
+					.setSaveConsumer(v -> settings.perfLog = v)
+					.build());
 			}
 			if (group.key().equals("look")) {
 				category.addEntry(entries.startBooleanToggle(Component.translatable("option.foamingshores.recolorWater"), settings.recolorWater)

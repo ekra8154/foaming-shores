@@ -87,7 +87,8 @@ public final class FoamPipelines {
 			.withTexture("Sampler0", texture)
 			.useLightmap()
 			.useOverlay()
-			.sortOnUpload()
+			// No sortOnUpload: sorting every foam quad by distance each frame cost more than it gave
+			// (foam quads hardly overlap one another).
 			.createRenderSetup()));
 
 	/** The render type for foam drawn from {@code texture} onto blocks. */

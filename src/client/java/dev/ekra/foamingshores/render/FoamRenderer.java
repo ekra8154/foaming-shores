@@ -122,6 +122,7 @@ public final class FoamRenderer {
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "Foaming Shores fields");
 		t.setDaemon(true);
+		t.setPriority(Thread.NORM_PRIORITY - 2);
 		return t;
 	});
 	private final FoamSettings settings = FoamSettings.INSTANCE;
@@ -179,8 +180,9 @@ public final class FoamRenderer {
 	private double bakeGpuMs, submitMs, installMs, farCaptureMs, pixelsPerTick;
 	private final int[] tilesAt = new int[FoamAtlas.DENSITIES.length];
 	private int tilesOutOfView;
-	/** Time spent writing the foam's vertices this frame (the geometry is written after submit returns). */
-	private long drawNanos;
+	/** Time spent writing the foam's vertices this frame (the geometry is written after submit returns), and the quads. */
+	private long drawNanos, drawQuads;
+	private final PerfTrace perf = new PerfTrace();
 
 	/**
 	 * A quad sampling a baked texture: four corners (x, y, z) with their (u, v), a normal and a
@@ -275,6 +277,14 @@ public final class FoamRenderer {
 	}
 
 	public void tick(Minecraft mc) {
+		long t0 = System.nanoTime();
+		tickLevels(mc);
+		perf.tickNanos += System.nanoTime() - t0;
+		perf.tick();
+		perf.maybeReport(settings.perfLog && settings.enabled);
+	}
+
+	private void tickLevels(Minecraft mc) {
 		ClientLevel lvl = mc.level;
 		if (!settings.enabled) {
 			// Off: drop everything once (the sound stops at this tick), then do nothing at all.
@@ -320,6 +330,7 @@ public final class FoamRenderer {
 		if (building != null && building.isDone()) {
 			Built built = building.join();
 			building = null;
+			if (built != null) perf.built(built.level() == far, built.ms());
 			long t0 = System.nanoTime();
 			if (built == null) pendingFar = null;
 			else if (built.level() == far && (near.region == null || !near.covers(ptx, ptz))) {
@@ -340,6 +351,7 @@ public final class FoamRenderer {
 				assign(lvl);
 			}
 			installMs = (System.nanoTime() - t0) / 1e6;
+			perf.installNanos += System.nanoTime() - t0;
 		}
 		if (lvl.getGameTime() >= nearAt) {
 			nearAt = Long.MAX_VALUE;
@@ -366,6 +378,7 @@ public final class FoamRenderer {
 				// a few rows at a time until this tick's share is spent
 			}
 			farCaptureNanos += System.nanoTime() - t0;
+			perf.captureNanos += System.nanoTime() - t0;
 			ShoreSnapshot snap = farCapture.snapshot();
 			if (snap != null && building == null && !(nearStale && !settling)) {
 				farCapture = null;
@@ -381,6 +394,7 @@ public final class FoamRenderer {
 				ShoreSnapshot snap = farCapture.snapshot();
 				farCapture = null;
 				farCaptureMs = (System.nanoTime() - t0) / 1e6;
+				perf.captureNanos += System.nanoTime() - t0;
 				startFarBuild(snap);
 			} else if (nearStale) startNear(lvl, far.region);
 			else if (farCapture == null && farStale) startFar(ptx, ptz);
@@ -397,7 +411,9 @@ public final class FoamRenderer {
 			splashes.tick(now, recent, settings);
 		}
 
+		long tb = System.nanoTime();
 		bakeTick(mc, lvl);
+		perf.bakeNanos += System.nanoTime() - tb;
 	}
 
 	/** Whether the player has left a level's window, so it needs laying again. */
@@ -414,7 +430,9 @@ public final class FoamRenderer {
 		int[] o = near.place(Math.floorDiv(playerX, FoamLevel.TILE), Math.floorDiv(playerZ, FoamLevel.TILE));
 		ShoreSnapshot.Capture c = new ShoreSnapshot.Capture(o[0] * FoamLevel.TILE, o[1] * FoamLevel.TILE, FoamLevel.NEAR.size(),
 			parent != null ? parent.waterY : Integer.MIN_VALUE);
+		long tc = System.nanoTime();
 		c.step(lvl, Integer.MAX_VALUE);
+		perf.captureNanos += System.nanoTime() - tc;
 		ShoreSnapshot snap = c.snapshot();
 		near.buildingMissing = snap.missingChunks;
 		ShoreRegion.Settings rs = regionSettings();
@@ -1015,6 +1033,7 @@ public final class FoamRenderer {
 		if (v[0].isPresent() && v[1].isPresent()) {
 			double ms = (v[1].getAsLong() - v[0].getAsLong()) * RenderSystem.getDevice().getDeviceInfo().timestampPeriod() / 1e6;
 			bakeGpuMs = bakeGpuMs * 0.95 + ms * 0.05;
+			perf.gpu(ms);
 		}
 	}
 
@@ -1151,12 +1170,24 @@ public final class FoamRenderer {
 
 	public void submit(LevelRenderContext context) {
 		frames++;
+		perf.frame();
 		// What writing last frame's vertices cost (it happens after this method returns).
 		submitMs = submitMs * 0.95 + drawNanos / 1e6 * 0.05;
-		drawNanos = 0;
+		perf.drawNanos += drawNanos;
+		perf.quads += drawQuads;
+		drawNanos = drawQuads = 0;
 		if (atlas == null || bakeFailed || !settings.enabled) return;
 		long t0 = System.nanoTime();
 		int show = front;
+		// Only what is in front of the camera: geometry behind it costs as much to write and upload.
+		Minecraft mc = Minecraft.getInstance();
+		var camera = mc.gameRenderer.mainCamera();
+		Vec3 eye = camera.position();
+		double yaw = Math.toRadians(camera.yRot()), lookX = -Math.sin(yaw), lookZ = Math.cos(yaw);
+		boolean steep = Math.abs(camera.xRot()) > 60;
+		double fov = Math.toRadians(mc.options.fov().get()) * 1.2; // a little wider: sprinting widens the view
+		double aspect = mc.getWindow().getWidth() / (double) Math.max(1, mc.getWindow().getHeight());
+		double halfWidth = Math.atan(Math.tan(fov / 2) * aspect) + Math.toRadians(8);
 		Vec3 cam = context.levelState().cameraRenderState.pos;
 		PoseStack poseStack = context.poseStack();
 		poseStack.pushPose();
@@ -1168,7 +1199,7 @@ public final class FoamRenderer {
 			List<FoamLevel.Tile> tiles = new ArrayList<>();
 			for (FoamLevel l : levels) {
 				for (FoamLevel.Tile t : l.drawn) {
-					if (t.pages[show] != page || !t.baked[show] || t.quads.isEmpty()) continue;
+					if (t.pages[show] != page || !t.baked[show] || t.quads.isEmpty() || !inView(t, eye, lookX, lookZ, halfWidth, steep)) continue;
 					tiles.add(t);
 					slots.add(new int[] {page.slotX(t.slots[show]), page.slotY(t.slots[show])});
 				}
@@ -1180,17 +1211,21 @@ public final class FoamRenderer {
 				for (int i = 0; i < tiles.size(); i++) {
 					float ou = slots.get(i)[0] * inv, ov = slots.get(i)[1] * inv;
 					for (Quad q : tiles.get(i).quads) emit(buffer, pose, q, cam, ou, ov, scale);
+					drawQuads += tiles.get(i).quads.size();
 				}
 				drawNanos += System.nanoTime() - d0;
 			});
 		}
 		for (FoamLevel l : levels) {
 			if (!l.faceQuads.isEmpty() && l.faceOutputs[show] != null && l.faceBaked[show]) {
-				List<Quad> qs = l.faceQuads;
+				List<Quad> qs = new ArrayList<>();
+				for (Quad q : l.faceQuads) if (inView(q, eye, lookX, lookZ, halfWidth, steep)) qs.add(q);
+				if (qs.isEmpty()) continue;
 				context.submitNodeCollector().submitCustomGeometry(poseStack, FoamPipelines.surface(l.faceIds[show]), (pose, buffer) -> {
 					long d0 = System.nanoTime();
 					for (Quad q : qs) emit(buffer, pose, q, cam, 0, 0, 1);
 					drawNanos += System.nanoTime() - d0;
+					drawQuads += qs.size();
 				});
 			}
 		}
@@ -1205,7 +1240,15 @@ public final class FoamRenderer {
 				(pose, buffer) -> splashes.render(pose, buffer, lvl, camState.orientation, camState.cameraEntityPartialTicks, foam));
 		}
 		poseStack.popPose();
-		drawNanos += System.nanoTime() - t0;
+		perf.collectNanos += System.nanoTime() - t0;
+	}
+
+	/** Whether a face quad can be on screen (as inView, for its first corner). */
+	private static boolean inView(Quad q, Vec3 eye, double lookX, double lookZ, double halfWidth, boolean steep) {
+		double cx = q.xyz()[0] - eye.x, cz = q.xyz()[2] - eye.z, d = Math.sqrt(cx * cx + cz * cz);
+		if (d < ALWAYS_BAKE || (steep && d < 64)) return true;
+		double cos = (cx * lookX + cz * lookZ) / d;
+		return Math.acos(Math.max(-1, Math.min(1, cos))) <= halfWidth + Math.asin(Math.min(1, 1.5 / d));
 	}
 
 	/**
