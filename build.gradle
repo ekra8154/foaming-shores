@@ -3,11 +3,15 @@ plugins {
 	id "maven-publish"
 }
 
+// foaming-shores-fabric-26.3.X-v0.1.0.jar: loader, the Minecraft versions it serves, then the
+// mod's own version (the naming publish.py and the other mods use).
+def supportLabel = project.minecraft_support_range.trim().replaceAll(/(?i)\.x\b/, '.X')
+
 version = project.mod_version
 group = project.maven_group
 
 base {
-	archivesName = project.archives_base_name
+	archivesName = "${project.archives_base_name}-fabric-${supportLabel}"
 }
 
 loom {
@@ -56,6 +60,19 @@ processResources {
 		expand "version": inputs.properties.version,
 			"minecraft_support_range": inputs.properties.minecraft_support_range
 	}
+}
+
+jar {
+	inputs.property "archivesName", project.base.archivesName
+	archiveVersion = "v${project.version}"
+
+	from("LICENSE") {
+		rename { "${it}_${inputs.properties.archivesName}" }
+	}
+}
+
+tasks.matching { it.name == "sourcesJar" }.configureEach {
+	archiveVersion = "v${project.version}"
 }
 
 tasks.withType(JavaCompile).configureEach {

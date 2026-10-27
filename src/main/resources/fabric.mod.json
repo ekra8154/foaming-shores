@@ -4,7 +4,14 @@
 	"version": "${version}",
 	"name": "Foaming Shores",
 	"description": "Pixel-art waves that wash up from oceans, lakes and rivers onto the shore, then recede and dissolve, drawn to look like vanilla water.",
+	"authors": ["ekra8154"],
+	"contact": {
+		"homepage": "https://modrinth.com/mod/foaming-shores",
+		"sources": "https://github.com/ekra8154/foaming-shores",
+		"issues": "https://github.com/ekra8154/foaming-shores/issues"
+	},
 	"license": "MIT",
+	"icon": "assets/foamingshores/icon.png",
 	"environment": "client",
 	"entrypoints": {
 		"client": [
